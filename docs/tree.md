@@ -1,6 +1,6 @@
 # aviation-weather-mcp-server - Directory Structure
 
-Generated on: 2026-06-05 09:41:29
+Generated on: 2026-06-05 11:58:03
 
 ```text
 aviation-weather-mcp-server/
@@ -19,6 +19,7 @@ aviation-weather-mcp-server/
 │   ├── extensions.json
 │   └── settings.json
 ├── changelog/
+│   ├── 0.1.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -157,6 +158,7 @@ aviation-weather-mcp-server/
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml
+├── CHANGELOG.md
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
