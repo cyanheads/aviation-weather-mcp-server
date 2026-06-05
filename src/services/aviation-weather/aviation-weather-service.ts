@@ -211,7 +211,8 @@ function normalizeMetar(raw: RawMetar): NormalizedMetar {
     clouds,
     temp_c: raw.temp ?? 0,
     dewpoint_c: raw.dewp ?? 0,
-    altimeter_inhg: raw.altim ?? 0,
+    // AWC API returns altim in hPa — convert to inHg (1 hPa = 0.02953 inHg)
+    altimeter_inhg: raw.altim != null ? Math.round(raw.altim * 0.02953 * 100) / 100 : 0,
     raw_metar: raw.rawOb,
   };
 }
@@ -251,44 +252,50 @@ function normalizeTaf(raw: RawTaf): NormalizedTaf {
   };
 }
 
+/** Coerce an empty string or nullish value to null. */
+function strOrNull(v: string | null | undefined): string | null {
+  return v?.trim() ? v.trim() : null;
+}
+
 function normalizePirep(raw: RawPirep): NormalizedPirep {
   // Build turbulence layers — omit entries with empty intensity
   const turbulence: NormalizedTurbulenceLayer[] = [];
-  if (raw.tbInt1 && raw.tbInt1.trim()) {
+
+  if (raw.tbInt1?.trim()) {
     turbulence.push({
       base_ft: typeof raw.tbBas1 === 'number' ? raw.tbBas1 * 100 : null,
       top_ft: typeof raw.tbTop1 === 'number' ? raw.tbTop1 * 100 : null,
       intensity: raw.tbInt1,
-      type: raw.tbType1 ?? null,
-      frequency: raw.tbFreq1 ?? null,
+      type: strOrNull(raw.tbType1),
+      frequency: strOrNull(raw.tbFreq1),
     });
   }
-  if (raw.tbInt2 && raw.tbInt2.trim()) {
+  if (raw.tbInt2?.trim()) {
     turbulence.push({
       base_ft: typeof raw.tbBas2 === 'number' ? raw.tbBas2 * 100 : null,
       top_ft: typeof raw.tbTop2 === 'number' ? raw.tbTop2 * 100 : null,
       intensity: raw.tbInt2,
-      type: raw.tbType2 ?? null,
-      frequency: raw.tbFreq2 ?? null,
+      type: strOrNull(raw.tbType2),
+      frequency: strOrNull(raw.tbFreq2),
     });
   }
 
   // Build icing layers — omit entries with empty intensity
   const icing: NormalizedIcingLayer[] = [];
-  if (raw.icgInt1 && raw.icgInt1.trim()) {
+  if (raw.icgInt1?.trim()) {
     icing.push({
       base_ft: typeof raw.icgBas1 === 'number' ? raw.icgBas1 * 100 : null,
       top_ft: typeof raw.icgTop1 === 'number' ? raw.icgTop1 * 100 : null,
       intensity: raw.icgInt1,
-      type: raw.icgType1 ?? null,
+      type: strOrNull(raw.icgType1),
     });
   }
-  if (raw.icgInt2 && raw.icgInt2.trim()) {
+  if (raw.icgInt2?.trim()) {
     icing.push({
       base_ft: typeof raw.icgBas2 === 'number' ? raw.icgBas2 * 100 : null,
       top_ft: typeof raw.icgTop2 === 'number' ? raw.icgTop2 * 100 : null,
       intensity: raw.icgInt2,
-      type: raw.icgType2 ?? null,
+      type: strOrNull(raw.icgType2),
     });
   }
 
@@ -325,7 +332,7 @@ function normalizePirep(raw: RawPirep): NormalizedPirep {
     icing,
     clouds: clouds && clouds.length > 0 ? clouds : null,
     visibility_sm: visib,
-    remarks: raw.wxString ?? null,
+    remarks: strOrNull(raw.wxString),
     raw_pirep: raw.rawOb,
   };
 }
@@ -416,6 +423,9 @@ export class AviationWeatherService {
           { requestId: ctx.requestId, timestamp: ctx.timestamp },
           { signal: ctx.signal },
         );
+        // AWC returns HTTP 204 with empty body when no data matches the query.
+        // Treat this as an empty result — callers guard with `if (!Array.isArray(raw)) return []`.
+        if (response.status === 204) return [] as T;
         const text = await response.text();
         // Detect HTML error pages from upstream
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
@@ -423,6 +433,8 @@ export class AviationWeatherService {
             'AWC API returned HTML instead of JSON — service may be degraded.',
           );
         }
+        // Empty body on non-204 responses — also treat as empty result
+        if (!text.trim()) return [] as T;
         let parsed: unknown;
         try {
           parsed = JSON.parse(text);
@@ -434,9 +446,9 @@ export class AviationWeatherService {
           typeof parsed === 'object' &&
           parsed !== null &&
           'status' in parsed &&
-          (parsed as Record<string, unknown>)['status'] === 'error'
+          (parsed as Record<string, unknown>).status === 'error'
         ) {
-          const errMsg = (parsed as Record<string, unknown>)['error'];
+          const errMsg = (parsed as Record<string, unknown>).error;
           throw serviceUnavailable(
             `AWC API error: ${typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg)}`,
           );
