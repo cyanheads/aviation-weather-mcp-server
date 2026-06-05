@@ -5,17 +5,32 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
-import { echoPrompt } from './mcp-server/prompts/definitions/echo.prompt.js';
-import { echoResource } from './mcp-server/resources/definitions/echo.resource.js';
-import { echoAppUiResource } from './mcp-server/resources/definitions/echo-app-ui.app-resource.js';
-import { echoTool } from './mcp-server/tools/definitions/echo.tool.js';
-import { echoAppTool } from './mcp-server/tools/definitions/echo-app.app-tool.js';
+import { aviationPreflightBrief } from './mcp-server/prompts/definitions/aviation-preflight-brief.prompt.js';
+import { aviationFindStations } from './mcp-server/tools/definitions/aviation-find-stations.tool.js';
+import { aviationGetAdvisories } from './mcp-server/tools/definitions/aviation-get-advisories.tool.js';
+import { aviationGetMetar } from './mcp-server/tools/definitions/aviation-get-metar.tool.js';
+import { aviationGetPireps } from './mcp-server/tools/definitions/aviation-get-pireps.tool.js';
+import { aviationGetTaf } from './mcp-server/tools/definitions/aviation-get-taf.tool.js';
+import { initAviationWeatherService } from './services/aviation-weather/aviation-weather-service.js';
 
 await createApp({
-  tools: [echoTool, echoAppTool],
-  resources: [echoResource, echoAppUiResource],
-  prompts: [echoPrompt],
-  // instructions: 'Server-level orientation forwarded to the model on every initialize.\n' +
-  //   '- Use shortcut `X` for the most common case\n' +
-  //   '- Tools require auth via the `inventory:read` scope',
+  tools: [
+    aviationFindStations,
+    aviationGetMetar,
+    aviationGetTaf,
+    aviationGetPireps,
+    aviationGetAdvisories,
+  ],
+  resources: [],
+  prompts: [aviationPreflightBrief],
+  instructions:
+    'Aviation weather from the NWS Aviation Weather Center (aviationweather.gov). ' +
+    'Keyless, no API key required. Covers METARs, TAFs, PIREPs, and SIGMETs/AIRMETs.\n' +
+    'IMPORTANT: This data is for informational purposes only. ' +
+    'Flight operations in IMC or controlled airspace require an official preflight briefing from an authorized source (e.g., 1800wxbrief.com).\n' +
+    'Station IDs are ICAO format (4 letters, e.g. KSEA, KJFK). ' +
+    'Use aviation_find_stations to resolve unknown IDs or discover stations in a region.',
+  setup(core) {
+    initAviationWeatherService(core.config, core.storage);
+  },
 });

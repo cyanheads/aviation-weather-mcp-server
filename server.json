@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "aviation-weather-mcp-server",
-  "description": "",
+  "name": "cyanheads/aviation-weather-mcp-server",
+  "description": "Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, SIGMETs/AIRMETs. Keyless, no API key required.",
   "repository": {
-    "url": "",
+    "url": "https://github.com/cyanheads/aviation-weather-mcp-server",
     "source": "github"
   },
   "version": "0.1.0",
