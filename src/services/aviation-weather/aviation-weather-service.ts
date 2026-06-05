@@ -414,7 +414,7 @@ export class AviationWeatherService {
   }
 
   /** Fetch and parse JSON from the AWC API with retry and timeout. */
-  private async fetchJson<T>(url: string, ctx: Context): Promise<T> {
+  private fetchJson<T>(url: string, ctx: Context): Promise<T> {
     return withRetry(
       async () => {
         const response = await fetchWithTimeout(
@@ -535,8 +535,9 @@ export class AviationWeatherService {
     }
 
     // Client-side bbox overlap filter
-    if (params.bbox) {
-      advisories = advisories.filter((a) => bboxOverlapsPolygon(params.bbox!, a.polygon));
+    const { bbox } = params;
+    if (bbox) {
+      advisories = advisories.filter((a) => bboxOverlapsPolygon(bbox, a.polygon));
     }
 
     return advisories;

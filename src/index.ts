@@ -23,13 +23,9 @@ await createApp({
   ],
   resources: [],
   prompts: [aviationPreflightBrief],
-  instructions:
-    'Aviation weather from the NWS Aviation Weather Center (aviationweather.gov). ' +
-    'Keyless, no API key required. Covers METARs, TAFs, PIREPs, and SIGMETs/AIRMETs.\n' +
-    'IMPORTANT: This data is for informational purposes only. ' +
-    'Flight operations in IMC or controlled airspace require an official preflight briefing from an authorized source (e.g., 1800wxbrief.com).\n' +
-    'Station IDs are ICAO format (4 letters, e.g. KSEA, KJFK). ' +
-    'Use aviation_find_stations to resolve unknown IDs or discover stations in a region.',
+  instructions: `Aviation weather from the NWS Aviation Weather Center (aviationweather.gov). Keyless, no API key required. Covers METARs, TAFs, PIREPs, and SIGMETs/AIRMETs.
+IMPORTANT: This data is for informational purposes only. Flight operations in IMC or controlled airspace require an official preflight briefing from an authorized source (e.g., 1800wxbrief.com).
+Station IDs are ICAO format (4 letters, e.g. KSEA, KJFK). Use aviation_find_stations to resolve unknown IDs or discover stations in a region.`,
   setup(core) {
     initAviationWeatherService(core.config, core.storage);
   },

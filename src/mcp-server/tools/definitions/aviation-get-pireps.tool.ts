@@ -209,13 +209,11 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       ctx,
     );
 
-    // Client-side altitude filter
-    if (input.altitude_min_ft != null) {
-      pireps = pireps.filter((p) => p.altitude_ft >= (input.altitude_min_ft as number));
-    }
-    if (input.altitude_max_ft != null) {
-      pireps = pireps.filter((p) => p.altitude_ft <= (input.altitude_max_ft as number));
-    }
+    // Client-side altitude filter (capture to const so TypeScript narrows inside the callback)
+    const altMin = input.altitude_min_ft;
+    const altMax = input.altitude_max_ft;
+    if (altMin != null) pireps = pireps.filter((p) => p.altitude_ft >= altMin);
+    if (altMax != null) pireps = pireps.filter((p) => p.altitude_ft <= altMax);
 
     // Sort by observation time descending
     pireps.sort((a, b) => new Date(b.observed_at).getTime() - new Date(a.observed_at).getTime());
