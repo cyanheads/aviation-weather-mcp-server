@@ -439,7 +439,9 @@ export class AviationWeatherService {
         try {
           parsed = JSON.parse(text);
         } catch {
-          throw serviceUnavailable(`AWC API returned invalid JSON: ${text.slice(0, 200)}`);
+          // Log the raw body at debug level for diagnostics; don't surface it to the caller
+          ctx.log.debug('AWC API returned invalid JSON', { preview: text.slice(0, 200) });
+          throw serviceUnavailable('AWC API returned invalid JSON — service may be degraded.');
         }
         // Check for AWC error shape: { "status": "error", "error": "..." }
         if (
@@ -503,7 +505,12 @@ export class AviationWeatherService {
     } else {
       throw serviceUnavailable('Either stationId or bbox is required for PIREPs');
     }
-    ctx.log.debug('Fetching PIREPs', { url });
+    ctx.log.debug('Fetching PIREPs', {
+      stationId: params.stationId,
+      hasBbox: !!params.bbox,
+      distanceNm: params.distanceNm,
+      hours: params.hours,
+    });
     const raw = await this.fetchJson<RawPirep[]>(url, ctx);
     if (!Array.isArray(raw)) return [];
     return raw.map(normalizePirep);
