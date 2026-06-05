@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "cyanheads/aviation-weather-mcp-server",
-  "description": "Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, SIGMETs/AIRMETs. Keyless, no API key required.",
+  "name": "io.github.cyanheads/aviation-weather-mcp-server",
+  "description": "Fetch METARs, TAFs, PIREPs, and SIGMETs/AIRMETs from the NWS Aviation Weather Center.",
   "repository": {
     "url": "https://github.com/cyanheads/aviation-weather-mcp-server",
     "source": "github"
@@ -11,8 +11,8 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "aviation-weather-mcp-server",
-      "runtimeHint": "node",
+      "identifier": "@cyanheads/aviation-weather-mcp-server",
+      "runtimeHint": "bun",
       "version": "0.1.0",
       "packageArguments": [
         {
@@ -31,6 +31,20 @@
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "AWC_BASE_URL",
+          "description": "Base URL for the AWC Data API. Useful for testing against a mock or staging instance.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://aviationweather.gov/api/data"
+        },
+        {
+          "name": "AWC_TIMEOUT_MS",
+          "description": "Per-request timeout in milliseconds (1000–60000).",
+          "format": "string",
+          "isRequired": false,
+          "default": "10000"
         }
       ],
       "transport": {
@@ -40,8 +54,8 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "aviation-weather-mcp-server",
-      "runtimeHint": "node",
+      "identifier": "@cyanheads/aviation-weather-mcp-server",
+      "runtimeHint": "bun",
       "version": "0.1.0",
       "packageArguments": [
         {
@@ -88,6 +102,20 @@
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "AWC_BASE_URL",
+          "description": "Base URL for the AWC Data API. Useful for testing against a mock or staging instance.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://aviationweather.gov/api/data"
+        },
+        {
+          "name": "AWC_TIMEOUT_MS",
+          "description": "Per-request timeout in milliseconds (1000–60000).",
+          "format": "string",
+          "isRequired": false,
+          "default": "10000"
         }
       ],
       "transport": {

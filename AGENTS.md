@@ -1,6 +1,6 @@
 # Developer Protocol
 
-**Server:** aviation-weather-mcp-server
+**Server:** `@cyanheads/aviation-weather-mcp-server`
 **Version:** 0.1.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.9.21`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
@@ -8,19 +8,6 @@
 **Zod:** ^4.4.3
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
-
----
-
-## First Session
-
-This project was just scaffolded with `bunx @cyanheads/mcp-ts-core init`. You're holding a production-grade MCP framework with the hard parts already solved — error handling, telemetry, auth, transport, validation, lifecycle. What's missing is the **domain**. Your job: design the tool, resource, and service surface with the user, then implement it as small pure handlers that throw — the framework catches, classifies, and instruments the rest. Design before code; the user's first messages set direction, so wait for them before scaffolding definitions.
-
-> **Remove this section** from CLAUDE.md / AGENTS.md after completing these steps. The skills and conventions below remain — this block is one-time onboarding only.
-
-1. **Get your bearings.** Take stock of the project tree, the skills in `skills/`, and the tools/MCP servers available. Light tool use is fine for context-building — you're mapping the territory, not committing yet.
-2. **Read the framework docs** — `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` (builders, Context, errors, exports, conventions)
-3. **Run the `setup` skill** — read `skills/setup/SKILL.md` and follow its checklist (project orientation, agent protocol file selection, echo definition cleanup, skill sync)
-4. **Design the server** — read `skills/design-mcp-server/SKILL.md` and work through it with the user to map the domain into tools, resources, and services before scaffolding
 
 ---
 
@@ -60,54 +47,46 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 
-export const searchItems = tool('search_items', {
-  description: 'Search inventory items by query.',
-  annotations: { readOnlyHint: true },
+export const aviationGetMetar = tool('aviation_get_metar', {
+  description: 'Get current weather observations (METARs) for one or more airports.',
+  annotations: { readOnlyHint: true, idempotentHint: true },
   input: z.object({
-    query: z.string().describe('Search terms'),
-    limit: z.number().default(10).describe('Max results'),
+    station_ids: z
+      .array(z.string().regex(/^[A-Z]{4}$/).describe('4-letter ICAO station ID.'))
+      .min(1).max(10)
+      .describe('ICAO station IDs to query. 1–10 stations per call.'),
+    hours: z.number().int().min(1).max(12).default(1)
+      .describe('Hours of observation history to return (1–12).'),
   }),
   output: z.object({
-    items: z.array(z.object({
-      id: z.string().describe('Item ID'),
-      name: z.string().describe('Item name'),
-    })).describe('Matching items'),
+    observations: z.array(z.object({
+      station_id: z.string().describe('ICAO station identifier.'),
+      flight_category: z.string().describe('VFR, MVFR, IFR, or LIFR.'),
+      raw_metar: z.string().describe('Raw METAR string.'),
+    })).describe('Decoded METAR observations.'),
   }),
-  auth: ['inventory:read'],
-
+  errors: [
+    {
+      reason: 'no_stations_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'None of the requested station IDs returned data.',
+      recovery: 'Verify ICAO IDs with aviation_find_stations.',
+    },
+  ],
   async handler(input, ctx) {
-    const items = await findItems(input.query, input.limit);
-    ctx.log.info('Search completed', { query: input.query, count: items.length });
-    return { items };
+    const svc = getAviationWeatherService();
+    const raw = await svc.fetchMetar(input.station_ids, input.hours);
+    if (!raw.length) throw ctx.fail('no_stations_found', `No METARs found for ${input.station_ids.join(', ')}`);
+    ctx.log.info('METARs fetched', { count: raw.length });
+    return { observations: raw };
   },
-
-  // format() populates content[] — the markdown twin of structuredContent.
-  // Different clients read different surfaces (Claude Code → structuredContent,
-  // Claude Desktop → content[]); both must carry the same data.
-  // Enforced at lint time: every field in `output` must appear in the rendered text.
   format: (result) => [{
     type: 'text',
-    text: result.items.map(i => `**${i.id}**: ${i.name}`).join('\n'),
+    text: result.observations.map(o => `**${o.station_id}** (${o.flight_category}): ${o.raw_metar}`).join('\n'),
   }],
-});
-```
-
-### Resource
-
-```ts
-import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
-
-export const itemData = resource('inventory://{itemId}', {
-  description: 'Fetch an inventory item by ID.',
-  params: z.object({ itemId: z.string().describe('Item identifier') }),
-  auth: ['inventory:read'],
-  async handler(params, ctx) {
-    const item = await ctx.state.get(`item:${params.itemId}`);
-    if (!item) throw notFound(`Item ${params.itemId} not found`, { itemId: params.itemId });
-    return item;
-  },
 });
 ```
 
@@ -116,14 +95,19 @@ export const itemData = resource('inventory://{itemId}', {
 ```ts
 import { prompt, z } from '@cyanheads/mcp-ts-core';
 
-export const reviewCode = prompt('review_code', {
-  description: 'Review code for issues and best practices.',
+export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
+  description: 'Structure a preflight weather briefing for one or more airports.',
   args: z.object({
-    code: z.string().describe('Code to review'),
-    language: z.string().optional().describe('Programming language'),
+    departure_icao: z.string().describe('Departure airport ICAO ID (e.g., KSEA).'),
+    destination_icao: z.string().describe('Destination airport ICAO ID (e.g., KJFK).'),
+    alternates: z.string().optional().describe('Comma-separated alternate airport ICAO IDs.'),
   }),
   generate: (args) => [
-    { role: 'user', content: { type: 'text', text: `Review this ${args.language ?? ''} code:\n${args.code}` } },
+    { role: 'user', content: { type: 'text', text:
+      `Provide a preflight weather briefing for ${args.departure_icao} → ${args.destination_icao}` +
+      (args.alternates ? ` (alternates: ${args.alternates})` : '') + '.\n' +
+      'Call aviation_get_metar, aviation_get_taf, and aviation_get_advisories in sequence, then synthesize a go/no-go picture.'
+    }},
   ],
 });
 ```
@@ -131,20 +115,22 @@ export const reviewCode = prompt('review_code', {
 ### Server config
 
 ```ts
-// src/config/server-config.ts — lazy-parsed, separate from framework config
+// src/config/server-config.ts
 import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
-  apiKey: z.string().describe('External API key'),
-  maxResults: z.coerce.number().default(100),
+  awcBaseUrl: z.string().url().default('https://aviationweather.gov/api/data')
+    .describe('Base URL for the AWC Data API'),
+  awcTimeoutMs: z.coerce.number().int().min(1000).max(60000).default(10000)
+    .describe('Request timeout in milliseconds'),
 });
 
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
 export function getServerConfig() {
   _config ??= parseEnvConfig(ServerConfigSchema, {
-    apiKey: 'MY_API_KEY',
-    maxResults: 'MY_MAX_RESULTS',
+    awcBaseUrl: 'AWC_BASE_URL',
+    awcTimeoutMs: 'AWC_TIMEOUT_MS',
   });
   return _config;
 }
@@ -225,18 +211,19 @@ See framework CLAUDE.md and the `api-errors` skill for the full auto-classificat
 src/
   index.ts                              # createApp() entry point
   config/
-    server-config.ts                    # Server-specific env vars (Zod schema)
+    server-config.ts                    # AWC_BASE_URL and AWC_TIMEOUT_MS (Zod schema)
   services/
-    [domain]/
-      [domain]-service.ts               # Domain service (init/accessor pattern)
-      types.ts                          # Domain types
+    aviation-weather/
+      aviation-weather-service.ts       # AWC Data API client (fetch, retry, normalize)
+      types.ts                          # Raw API response shapes + normalized output types
   mcp-server/
     tools/definitions/
-      [tool-name].tool.ts               # Tool definitions
-    resources/definitions/
-      [resource-name].resource.ts       # Resource definitions
-    prompts/definitions/
-      [prompt-name].prompt.ts           # Prompt definitions
+      aviation-find-stations.tool.ts    # aviation_find_stations
+      aviation-get-advisories.tool.ts   # aviation_get_advisories
+      aviation-get-metar.tool.ts        # aviation_get_metar
+      aviation-get-pireps.tool.ts       # aviation_get_pireps
+      aviation-get-taf.tool.ts          # aviation_get_taf
+      aviation-preflight-brief.prompt.ts # aviation_preflight_brief
 ```
 
 ---
