@@ -119,6 +119,23 @@ describe('aviationFindStations', () => {
     });
   });
 
+  it('station_not_found recovery hint does not mention IATA support', async () => {
+    mockFetchStations.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: ['SEA'] });
+
+    let thrown: unknown;
+    try {
+      await aviationFindStations.handler(input, ctx);
+    } catch (e) {
+      thrown = e;
+    }
+    const err = thrown as { data?: { recovery?: { hint?: string } } };
+    // Recovery should say ICAO format, not mislead about IATA support
+    expect(err.data?.recovery?.hint).toContain('ICAO');
+    expect(err.data?.recovery?.hint).not.toMatch(/IATA IDs.*may not map/);
+  });
+
   it('handles station with null IATA and FAA IDs (sparse)', async () => {
     const sparse: NormalizedStation = { ...ksea, iata_id: null, faa_id: null };
     mockFetchStations.mockResolvedValue([sparse]);

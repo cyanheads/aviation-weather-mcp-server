@@ -28,15 +28,17 @@ const BboxSchema = z
 export const aviationFindStations = tool('aviation_find_stations', {
   title: 'Find Aviation Weather Stations',
   description:
-    'Resolve an airport or weather reporting station by ICAO, IATA, or FAA identifier, or discover stations within a bounding box or US state. Returns all identifier variants (ICAO/IATA/FAA), coordinates, elevation, and available data types (METAR, TAF, SYNOP, etc.). At least one of station_ids, bbox, or state is required. Use this tool to translate a human-readable airport name or 3-letter IATA code to its 4-letter ICAO ID (e.g., SEA → KSEA) before calling aviation_get_metar, aviation_get_taf, or aviation_get_pireps.',
+    'Resolve an airport or weather reporting station by ICAO identifier, or discover stations within a bounding box or US state. Returns all identifier variants (ICAO/IATA/FAA), coordinates, elevation, and available data types (METAR, TAF, SYNOP, etc.). Station IDs must be 4-letter ICAO format (e.g., KSEA, KJFK). At least one of station_ids, bbox, or state is required.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     station_ids: z
-      .array(z.string().describe('An ICAO, IATA, or FAA station identifier.'))
+      .array(z.string().describe('A 4-letter ICAO station identifier (e.g., KSEA).'))
       .min(1)
       .max(20)
       .optional()
-      .describe('One or more station IDs (ICAO preferred, e.g. KSEA; IATA and FAA also accepted).'),
+      .describe(
+        'One or more 4-letter ICAO station IDs (e.g., KSEA, KJFK). The upstream API only accepts ICAO format — 3-letter IATA codes (e.g., SEA) will return no results. Use bbox or state to discover ICAO IDs by location.',
+      ),
     bbox: BboxSchema.optional(),
     state: z
       .string()
@@ -79,7 +81,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
       code: JsonRpcErrorCode.NotFound,
       when: 'None of the requested IDs match any known station.',
       recovery:
-        'ICAO IDs are 4 letters (e.g., KSEA). IATA IDs (3-letter like SEA) may not map 1:1. Try a bbox search around the airport coordinates.',
+        'Station IDs must be 4-letter ICAO format (e.g., KSEA, not SEA). Use bbox or state to discover ICAO IDs by location.',
     },
     {
       reason: 'missing_search_criteria',

@@ -141,6 +141,31 @@ describe('aviationGetAdvisories', () => {
     expect(result.advisories).toHaveLength(0);
   });
 
+  it('accepts SURFACE WIND hazard filter', async () => {
+    mockFetchAdvisories.mockResolvedValue([]);
+    const ctx = createMockContext();
+    // Validates that the enum still accepts SURFACE WIND after the description fix
+    const input = aviationGetAdvisories.input.parse({ hazard: 'SURFACE WIND' });
+    expect(input.hazard).toBe('SURFACE WIND');
+    await aviationGetAdvisories.handler(input, ctx);
+    expect(mockFetchAdvisories).toHaveBeenCalledWith(
+      expect.objectContaining({ hazard: 'SURFACE WIND' }),
+      ctx,
+    );
+  });
+
+  it('accepts LLWS hazard filter', async () => {
+    mockFetchAdvisories.mockResolvedValue([]);
+    const ctx = createMockContext();
+    const input = aviationGetAdvisories.input.parse({ hazard: 'LLWS' });
+    expect(input.hazard).toBe('LLWS');
+    await aviationGetAdvisories.handler(input, ctx);
+    expect(mockFetchAdvisories).toHaveBeenCalledWith(
+      expect.objectContaining({ hazard: 'LLWS' }),
+      ctx,
+    );
+  });
+
   it('handles advisory with null altitude and movement (sparse)', async () => {
     mockFetchAdvisories.mockResolvedValue([airmet]);
     const ctx = createMockContext();

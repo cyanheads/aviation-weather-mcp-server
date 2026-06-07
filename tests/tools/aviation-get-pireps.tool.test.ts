@@ -182,6 +182,47 @@ describe('aviationGetPireps', () => {
     });
   });
 
+  it('includes altitude filter context in error when filter empties results', async () => {
+    mockFetchPireps.mockResolvedValue([minimalPirep]); // FL080
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      station_id: 'KSEA',
+      altitude_min_ft: 30000,
+    });
+
+    let thrown: unknown;
+    try {
+      await aviationGetPireps.handler(input, ctx);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeDefined();
+    const err = thrown as { message: string; data?: { recovery?: { hint?: string } } };
+    // Message should mention the altitude filter, not just "no PIREPs found"
+    expect(err.message).toContain('altitude filter');
+    // Recovery hint should guide the caller to adjust altitude params
+    expect(err.data?.recovery?.hint).toContain('altitude_min_ft');
+  });
+
+  it('uses generic recovery hint when no altitude filter was applied', async () => {
+    mockFetchPireps.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KSEA' });
+
+    let thrown: unknown;
+    try {
+      await aviationGetPireps.handler(input, ctx);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeDefined();
+    const err = thrown as { message: string; data?: { recovery?: { hint?: string } } };
+    // Message should be the generic "no PIREPs found" text
+    expect(err.message).toContain('No PIREPs found in the search area');
+    // Recovery should mention distance/hours, not altitude
+    expect(err.data?.recovery?.hint).toContain('distance_nm');
+  });
+
   it('handles multi-layer turbulence and icing arrays', async () => {
     mockFetchPireps.mockResolvedValue([pirep]);
     const ctx = createMockContext({ errors: aviationGetPireps.errors });

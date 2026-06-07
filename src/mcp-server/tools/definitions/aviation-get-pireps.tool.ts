@@ -209,6 +209,8 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       ctx,
     );
 
+    const rawCount = pireps.length;
+
     // Client-side altitude filter (capture to const so TypeScript narrows inside the callback)
     const altMin = input.altitude_min_ft;
     const altMax = input.altitude_max_ft;
@@ -219,11 +221,25 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     pireps.sort((a, b) => new Date(b.observed_at).getTime() - new Date(a.observed_at).getTime());
 
     if (pireps.length === 0) {
-      throw ctx.fail(
-        'no_pireps_found',
-        `No PIREPs found in the search area for the past ${input.hours} hour(s).`,
-        { ...ctx.recoveryFor('no_pireps_found') },
-      );
+      const altFiltered = (altMin != null || altMax != null) && rawCount > 0;
+      const altRange =
+        altMin != null && altMax != null
+          ? `${altMin.toLocaleString()}–${altMax.toLocaleString()} ft`
+          : altMin != null
+            ? `above ${altMin.toLocaleString()} ft`
+            : altMax != null
+              ? `below ${altMax.toLocaleString()} ft`
+              : null;
+
+      const message = altFiltered
+        ? `No PIREPs in the search area matched the altitude filter (${altRange}). ${rawCount} report(s) were found at other altitudes.`
+        : `No PIREPs found in the search area for the past ${input.hours} hour(s).`;
+
+      const recovery = altFiltered
+        ? `Remove or adjust altitude_min_ft / altitude_max_ft. ${rawCount} PIREP(s) exist in the area at other altitudes.`
+        : 'Expand the distance_nm or hours parameters, or try a different region. PIREPs are sparse; absence of reports does not mean smooth conditions.';
+
+      throw ctx.fail('no_pireps_found', message, { recovery: { hint: recovery } });
     }
 
     ctx.log.info('PIREPs retrieved', { count: pireps.length });

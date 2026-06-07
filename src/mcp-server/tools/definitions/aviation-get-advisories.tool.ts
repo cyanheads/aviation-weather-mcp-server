@@ -46,7 +46,7 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       .enum(['CONVECTIVE', 'TURBULENCE', 'ICING', 'IFR', 'MTN OBSCN', 'SURFACE WIND', 'LLWS'])
       .optional()
       .describe(
-        'Optional hazard filter. CONVECTIVE = convective SIGMETs; TURBULENCE = AIRMET Tango; ICING = AIRMET Zulu; IFR = AIRMET Sierra (IFR conditions); MTN OBSCN = AIRMET Sierra (mountain obscuration); SURFACE WIND = low-level wind shear; LLWS = low-level wind shear.',
+        'Optional hazard filter. CONVECTIVE = convective SIGMETs; TURBULENCE = AIRMET Tango; ICING = AIRMET Zulu; IFR = AIRMET Sierra (IFR conditions); MTN OBSCN = AIRMET Sierra (mountain obscuration); SURFACE WIND = sustained strong surface winds (typically >30 kt); LLWS = low-level wind shear below 2,000 ft AGL.',
       ),
     bbox: BboxSchema.optional(),
   }),
