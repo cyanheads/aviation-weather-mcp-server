@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.3](changelog/0.1.x/0.1.3.md) — 2026-06-06
+
+Tool description fixes: aviation_find_stations ICAO-only, aviation_get_pireps altitude-filter context, aviation_get_advisories SURFACE WIND vs LLWS differentiation
+
 ## [0.1.2](changelog/0.1.x/0.1.2.md) — 2026-06-06
 
 Public hosted endpoint — server.json remotes + README hosted section
