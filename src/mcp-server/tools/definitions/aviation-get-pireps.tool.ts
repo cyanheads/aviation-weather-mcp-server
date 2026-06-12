@@ -173,7 +173,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     },
     {
       reason: 'missing_location',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'Neither station_id nor bbox was provided.',
       recovery:
         'Provide station_id for a radial search (ICAO ID + distance_nm) or bbox for an area search (minLat, minLon, maxLat, maxLon).',

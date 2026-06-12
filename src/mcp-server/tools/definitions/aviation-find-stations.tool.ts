@@ -85,7 +85,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
     },
     {
       reason: 'missing_search_criteria',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'None of station_ids, bbox, or state was provided.',
       recovery:
         'Provide at least one of: station_ids (array of IDs), bbox (lat/lon bounds), or state (2-letter US state abbreviation).',
