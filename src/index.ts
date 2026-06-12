@@ -14,6 +14,8 @@ import { aviationGetTaf } from './mcp-server/tools/definitions/aviation-get-taf.
 import { initAviationWeatherService } from './services/aviation-weather/aviation-weather-service.js';
 
 await createApp({
+  name: 'aviation-weather-mcp-server',
+  title: 'aviation-weather-mcp-server',
   tools: [
     aviationFindStations,
     aviationGetMetar,
