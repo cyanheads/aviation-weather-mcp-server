@@ -1,17 +1,20 @@
 {
-  "name": "aviation-weather-mcp-server",
+  "name": "@cyanheads/aviation-weather-mcp-server",
   "version": "0.1.4",
-  "description": "",
+  "description": "Fetch METARs, TAFs, PIREPs, and SIGMETs/AIRMETs from the NWS Aviation Weather Center via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": ""
+    "name": "cyanheads"
   },
-  "homepage": "",
-  "repository": "",
+  "homepage": "https://github.com/cyanheads/aviation-weather-mcp-server#readme",
+  "repository": "git+https://github.com/cyanheads/aviation-weather-mcp-server.git",
   "license": "Apache-2.0",
   "mcpServers": {
-    "aviation-weather-mcp-server": {
+    "@cyanheads/aviation-weather-mcp-server": {
       "command": "npx",
-      "args": ["-y", "aviation-weather-mcp-server"],
+      "args": [
+        "-y",
+        "@cyanheads/aviation-weather-mcp-server"
+      ],
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio"
       }

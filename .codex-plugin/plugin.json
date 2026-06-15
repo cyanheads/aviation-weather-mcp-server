@@ -1,25 +1,25 @@
 {
-  "name": "aviation-weather-mcp-server",
+  "name": "@cyanheads/aviation-weather-mcp-server",
   "version": "0.1.4",
-  "description": "",
+  "description": "Fetch METARs, TAFs, PIREPs, and SIGMETs/AIRMETs from the NWS Aviation Weather Center via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "",
-    "email": "",
-    "url": ""
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
-  "homepage": "",
-  "repository": "",
+  "homepage": "https://github.com/cyanheads/aviation-weather-mcp-server#readme",
+  "repository": "git+https://github.com/cyanheads/aviation-weather-mcp-server.git",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "keywords": ["aviation", "aviation-weather", "metar", "taf", "pirep", "sigmet", "airmet", "aviation-weather-center", "awc", "flight-weather", "preflight", "mcp", "mcp-server", "model-context-protocol", "typescript", "bun", "stdio", "streamable-http", "ai-agent"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "aviation-weather-mcp-server",
-    "shortDescription": "",
-    "longDescription": "",
-    "developerName": "",
-    "category": "",
+    "shortDescription": "Fetch METARs, TAFs, PIREPs, and SIGMETs/AIRMETs from the NWS Aviation Weather Center via MCP.",
+    "longDescription": "Fetch aviation weather from the NWS Aviation Weather Center. Supports METARs, TAFs, PIREPs, SIGMETs and AIRMETs, plus station discovery by region. Deployable as stdio or streamable HTTP.",
+    "developerName": "cyanheads",
+    "category": "weather",
     "capabilities": ["Read"],
-    "websiteURL": "",
+    "websiteURL": "https://github.com/cyanheads/aviation-weather-mcp-server",
     "defaultPrompt": []
   }
 }
