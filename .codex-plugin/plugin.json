@@ -1,5 +1,5 @@
 {
-  "name": "@cyanheads/aviation-weather-mcp-server",
+  "name": "aviation-weather-mcp-server",
   "version": "0.1.4",
   "description": "Fetch METARs, TAFs, PIREPs, and SIGMETs/AIRMETs from the NWS Aviation Weather Center via MCP. STDIO or Streamable HTTP.",
   "author": {

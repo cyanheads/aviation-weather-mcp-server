@@ -1,5 +1,5 @@
 {
-  "@cyanheads/aviation-weather-mcp-server": {
+  "aviation-weather-mcp-server": {
     "command": "npx",
     "args": ["-y", "@cyanheads/aviation-weather-mcp-server"],
     "env": {
