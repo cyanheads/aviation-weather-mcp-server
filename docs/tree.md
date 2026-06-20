@@ -1,6 +1,6 @@
 # aviation-weather-mcp-server - Directory Structure
 
-Generated on: 2026-06-12 07:19:09
+Generated on: 2026-06-20 10:35:37
 
 ```text
 aviation-weather-mcp-server/
@@ -28,6 +28,7 @@ aviation-weather-mcp-server/
 ├── scripts/
 │   ├── build-changelog.ts
 │   ├── build.ts
+│   ├── check-dependency-specifiers.ts
 │   ├── check-docs-sync.ts
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts
