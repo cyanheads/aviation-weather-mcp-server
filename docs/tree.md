@@ -1,6 +1,6 @@
 # aviation-weather-mcp-server - Directory Structure
 
-Generated on: 2026-06-20 10:35:37
+Generated on: 2026-07-12 03:27:38
 
 ```text
 aviation-weather-mcp-server/
@@ -12,10 +12,12 @@ aviation-weather-mcp-server/
 │   ├── mcp.json
 │   └── plugin.json
 ├── .github/
-│   └── ISSUE_TEMPLATE/
-│       ├── bug_report.yml
-│       ├── config.yml
-│       └── feature_request.yml
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.yml
+│   │   ├── config.yml
+│   │   └── feature_request.yml
+│   ├── FUNDING.yml
+│   └── SECURITY.md
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
@@ -145,12 +147,17 @@ aviation-weather-mcp-server/
 │   ├── services/
 │   │   └── aviation-weather/
 │   │       ├── aviation-weather-service.ts
+│   │       ├── bbox.ts
 │   │       └── types.ts
 │   └── index.ts
 ├── tests/
 │   ├── prompts/
 │   │   └── aviation-preflight-brief.prompt.test.ts
 │   ├── resources/
+│   ├── services/
+│   │   └── aviation-weather/
+│   │       ├── aviation-weather-service.test.ts
+│   │       └── bbox.test.ts
 │   └── tools/
 │       ├── aviation-find-stations.tool.test.ts
 │       ├── aviation-get-advisories.tool.test.ts
@@ -159,6 +166,7 @@ aviation-weather-mcp-server/
 │       └── aviation-get-taf.tool.test.ts
 ├── .dockerignore
 ├── .env.example
+├── .gitattributes
 ├── .gitignore
 ├── .mcpbignore
 ├── AGENTS.md
@@ -166,6 +174,7 @@ aviation-weather-mcp-server/
 ├── bun.lock
 ├── bunfig.toml
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile

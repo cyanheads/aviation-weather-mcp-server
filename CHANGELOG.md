@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-07-11
+
+Fix elevation unit conversion and bbox validation across three tools; adopt mcp-ts-core ^0.10.14
+
 ## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-06-20
 
 Adopt mcp-ts-core ^0.10.9; devcheck gains floating-dependency-specifier and plugin-manifest guards; biome 2.5 + dev-dependency refresh; vendored skills resynced
