@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-07-11
+
+Include alternates in aviation_preflight_brief TAF step; reject bbox+state conflicts in aviation_find_stations
+
 ## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-07-11
 
 Reject conflicting station_ids/bbox/state inputs in aviation_find_stations; correct ICAO-only lookup docs
