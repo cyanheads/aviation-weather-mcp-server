@@ -177,6 +177,18 @@ describe('aviationGetAdvisories', () => {
     expect(result.advisories[0].movement).toBeNull();
     expect(result.advisories[0].severity).toBeNull();
   });
+
+  it('throws invalid_bbox when the bounding box is inverted', async () => {
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
+    const input = aviationGetAdvisories.input.parse({
+      bbox: { minLat: 49, minLon: -66, maxLat: 25, maxLon: -125 },
+    });
+
+    await expect(aviationGetAdvisories.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_bbox' },
+    });
+    expect(mockFetchAdvisories).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------

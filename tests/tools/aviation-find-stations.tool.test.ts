@@ -109,6 +109,18 @@ describe('aviationFindStations', () => {
     expect(mockFetchStations).not.toHaveBeenCalled();
   });
 
+  it('throws invalid_bbox when the bounding box is inverted', async () => {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({
+      bbox: { minLat: 49, minLon: -66, maxLat: 25, maxLon: -125 },
+    });
+
+    await expect(aviationFindStations.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_bbox' },
+    });
+    expect(mockFetchStations).not.toHaveBeenCalled();
+  });
+
   it('throws station_not_found when service returns empty array', async () => {
     mockFetchStations.mockResolvedValue([]);
     const ctx = createMockContext({ errors: aviationFindStations.errors });

@@ -4,7 +4,9 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
+import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
 
 const BboxSchema = z
   .object({
@@ -107,7 +109,24 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
         'Active advisories matching the filter criteria. May be empty during fair weather periods.',
       ),
   }),
+  errors: [
+    {
+      reason: 'invalid_bbox',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The bounding box is inverted — minLat > maxLat or minLon > maxLon.',
+      recovery:
+        'Ensure minLat <= maxLat and minLon <= maxLon. Swap the inverted min/max coordinates and retry.',
+    },
+  ],
   async handler(input, ctx) {
+    if (input.bbox && !isBboxOrdered(input.bbox)) {
+      throw ctx.fail(
+        'invalid_bbox',
+        'Bounding box is inverted: minLat must be <= maxLat and minLon <= maxLon.',
+        { ...ctx.recoveryFor('invalid_bbox') },
+      );
+    }
+
     ctx.log.info('Fetching advisories', {
       advisoryType: input.advisory_type,
       hazard: input.hazard,

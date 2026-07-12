@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
+import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
 
 const BboxSchema = z
   .object({
@@ -178,6 +179,20 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       recovery:
         'Provide station_id for a radial search (ICAO ID + distance_nm) or bbox for an area search (minLat, minLon, maxLat, maxLon).',
     },
+    {
+      reason: 'conflicting_location',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Both station_id and bbox were provided.',
+      recovery:
+        'Provide station_id OR bbox, not both. station_id runs a radial search with distance_nm; bbox runs an area search.',
+    },
+    {
+      reason: 'invalid_bbox',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The bounding box is inverted — minLat > maxLat or minLon > maxLon.',
+      recovery:
+        'Ensure minLat <= maxLat and minLon <= maxLon. Swap the inverted min/max coordinates and retry.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -188,6 +203,20 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
         {
           ...ctx.recoveryFor('missing_location'),
         },
+      );
+    }
+
+    if (input.station_id && input.bbox) {
+      throw ctx.fail('conflicting_location', 'Provide either station_id or bbox, not both.', {
+        ...ctx.recoveryFor('conflicting_location'),
+      });
+    }
+
+    if (input.bbox && !isBboxOrdered(input.bbox)) {
+      throw ctx.fail(
+        'invalid_bbox',
+        'Bounding box is inverted: minLat must be <= maxLat and minLon <= maxLon.',
+        { ...ctx.recoveryFor('invalid_bbox') },
       );
     }
 

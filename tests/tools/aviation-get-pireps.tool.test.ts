@@ -159,6 +159,32 @@ describe('aviationGetPireps', () => {
     expect(mockFetchPireps).not.toHaveBeenCalled();
   });
 
+  it('throws conflicting_location when both station_id and bbox are provided', async () => {
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      station_id: 'KSEA',
+      bbox: { minLat: 25, minLon: -125, maxLat: 49, maxLon: -66 },
+      distance_nm: 250,
+    });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'conflicting_location' },
+    });
+    expect(mockFetchPireps).not.toHaveBeenCalled();
+  });
+
+  it('throws invalid_bbox when the bounding box is inverted', async () => {
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      bbox: { minLat: 49, minLon: -66, maxLat: 25, maxLon: -125 },
+    });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_bbox' },
+    });
+    expect(mockFetchPireps).not.toHaveBeenCalled();
+  });
+
   it('throws no_pireps_found when service returns empty array', async () => {
     mockFetchPireps.mockResolvedValue([]);
     const ctx = createMockContext({ errors: aviationGetPireps.errors });

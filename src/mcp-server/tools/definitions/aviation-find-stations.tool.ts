@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
+import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
 
 /** Bounding box schema shared across tools. */
 const BboxSchema = z
@@ -90,6 +91,13 @@ export const aviationFindStations = tool('aviation_find_stations', {
       recovery:
         'Provide at least one of: station_ids (array of IDs), bbox (lat/lon bounds), or state (2-letter US state abbreviation).',
     },
+    {
+      reason: 'invalid_bbox',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The bounding box is inverted — minLat > maxLat or minLon > maxLon.',
+      recovery:
+        'Ensure minLat <= maxLat and minLon <= maxLon. Swap the inverted min/max coordinates and retry.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -100,6 +108,14 @@ export const aviationFindStations = tool('aviation_find_stations', {
         {
           ...ctx.recoveryFor('missing_search_criteria'),
         },
+      );
+    }
+
+    if (input.bbox && !isBboxOrdered(input.bbox)) {
+      throw ctx.fail(
+        'invalid_bbox',
+        'Bounding box is inverted: minLat must be <= maxLat and minLon <= maxLon.',
+        { ...ctx.recoveryFor('invalid_bbox') },
       );
     }
 
