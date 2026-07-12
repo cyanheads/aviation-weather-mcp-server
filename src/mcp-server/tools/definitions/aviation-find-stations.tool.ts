@@ -94,9 +94,9 @@ export const aviationFindStations = tool('aviation_find_stations', {
     {
       reason: 'conflicting_location',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'station_ids was provided together with bbox or state.',
+      when: 'More than one of station_ids, bbox, or state was provided.',
       recovery:
-        'Provide station_ids for direct ICAO lookup, or bbox/state to discover stations by location. Use one search mode per call, not both.',
+        'Provide exactly one location mode per call: station_ids for direct ICAO lookup, or bbox or state to discover stations by location.',
     },
     {
       reason: 'invalid_bbox',
@@ -118,10 +118,16 @@ export const aviationFindStations = tool('aviation_find_stations', {
       );
     }
 
-    if (input.station_ids?.length && (input.bbox || input.state)) {
-      throw ctx.fail('conflicting_location', 'Provide station_ids or bbox/state, not both.', {
-        ...ctx.recoveryFor('conflicting_location'),
-      });
+    const locationModeCount =
+      (input.station_ids?.length ? 1 : 0) + (input.bbox ? 1 : 0) + (input.state ? 1 : 0);
+    if (locationModeCount > 1) {
+      throw ctx.fail(
+        'conflicting_location',
+        'Provide exactly one of station_ids, bbox, or state.',
+        {
+          ...ctx.recoveryFor('conflicting_location'),
+        },
+      );
     }
 
     if (input.bbox && !isBboxOrdered(input.bbox)) {

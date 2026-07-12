@@ -147,6 +147,21 @@ describe('aviationFindStations', () => {
     expect(mockFetchStations).not.toHaveBeenCalled();
   });
 
+  it('throws conflicting_location when bbox is combined with state', async () => {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    // Ordered (valid) bbox plus a state — more than one location mode must be rejected
+    const input = aviationFindStations.input.parse({
+      bbox: { minLat: 32, minLon: -124, maxLat: 42, maxLon: -114 },
+      state: 'FL',
+    });
+
+    await expect(aviationFindStations.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'conflicting_location' },
+    });
+    // bbox must not silently override state — reject the combination instead
+    expect(mockFetchStations).not.toHaveBeenCalled();
+  });
+
   it('throws station_not_found when service returns empty array', async () => {
     mockFetchStations.mockResolvedValue([]);
     const ctx = createMockContext({ errors: aviationFindStations.errors });
