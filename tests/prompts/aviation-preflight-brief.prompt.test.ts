@@ -47,6 +47,24 @@ describe('aviationPreflightBrief', () => {
     expect(text).toContain('KPHL');
   });
 
+  it('includes alternates in the TAF instruction line, not just the METAR call', () => {
+    const args = aviationPreflightBrief.args!.parse({
+      departure_icao: 'KSEA',
+      destination_icao: 'KSFO',
+      alternates: 'KBFI,KRNT',
+    });
+    const messages = aviationPreflightBrief.generate(args);
+    const text = (messages[0].content as { type: string; text: string }).text;
+
+    // Isolate the TAF step — alternates must be listed here, not only in the METAR list above
+    const tafLine = text.split('\n').find((line) => line.includes('aviation_get_taf'));
+    expect(tafLine).toBeDefined();
+    expect(tafLine).toContain('KSEA');
+    expect(tafLine).toContain('KSFO');
+    expect(tafLine).toContain('KBFI');
+    expect(tafLine).toContain('KRNT');
+  });
+
   it('references all four aviation tools in the instructions', () => {
     const args = aviationPreflightBrief.args!.parse({
       departure_icao: 'KSFO',

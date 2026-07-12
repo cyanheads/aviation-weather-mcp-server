@@ -45,7 +45,7 @@ Follow this sequence:
    - Report flight category (VFR/MVFR/IFR/LIFR) for each station
    - Note ceiling, visibility, wind, and altimeter
 
-2. **Forecasts (TAFs)** — Call \`aviation_get_taf\` for: ${args.departure_icao}, ${args.destination_icao}
+2. **Forecasts (TAFs)** — Call \`aviation_get_taf\` for: ${icaoList}
    - Identify any forecast deterioration or improvement during the planned flight window
    - Flag TEMPO/BECMG/PROB groups that could affect operations
 
