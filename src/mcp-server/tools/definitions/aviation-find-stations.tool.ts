@@ -92,6 +92,13 @@ export const aviationFindStations = tool('aviation_find_stations', {
         'Provide at least one of: station_ids (array of IDs), bbox (lat/lon bounds), or state (2-letter US state abbreviation).',
     },
     {
+      reason: 'conflicting_location',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'station_ids was provided together with bbox or state.',
+      recovery:
+        'Provide station_ids for direct ICAO lookup, or bbox/state to discover stations by location. Use one search mode per call, not both.',
+    },
+    {
       reason: 'invalid_bbox',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The bounding box is inverted — minLat > maxLat or minLon > maxLon.',
@@ -109,6 +116,12 @@ export const aviationFindStations = tool('aviation_find_stations', {
           ...ctx.recoveryFor('missing_search_criteria'),
         },
       );
+    }
+
+    if (input.station_ids?.length && (input.bbox || input.state)) {
+      throw ctx.fail('conflicting_location', 'Provide station_ids or bbox/state, not both.', {
+        ...ctx.recoveryFor('conflicting_location'),
+      });
     }
 
     if (input.bbox && !isBboxOrdered(input.bbox)) {

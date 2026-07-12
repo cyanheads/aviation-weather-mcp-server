@@ -121,6 +121,32 @@ describe('aviationFindStations', () => {
     expect(mockFetchStations).not.toHaveBeenCalled();
   });
 
+  it('throws conflicting_location when station_ids is combined with bbox', async () => {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    // Ordered (valid) bbox — the conflict guard must fire ahead of the bbox check
+    const input = aviationFindStations.input.parse({
+      station_ids: ['KSEA'],
+      bbox: { minLat: 25, minLon: -125, maxLat: 49, maxLon: -66 },
+    });
+
+    await expect(aviationFindStations.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'conflicting_location' },
+    });
+    // station_ids must not silently override bbox — reject the combination instead
+    expect(mockFetchStations).not.toHaveBeenCalled();
+  });
+
+  it('throws conflicting_location when station_ids is combined with state', async () => {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: ['KSEA'], state: 'TX' });
+
+    await expect(aviationFindStations.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'conflicting_location' },
+    });
+    // station_ids must not silently override the state filter — reject instead
+    expect(mockFetchStations).not.toHaveBeenCalled();
+  });
+
   it('throws station_not_found when service returns empty array', async () => {
     mockFetchStations.mockResolvedValue([]);
     const ctx = createMockContext({ errors: aviationFindStations.errors });
