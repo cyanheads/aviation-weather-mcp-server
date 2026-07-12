@@ -187,6 +187,14 @@ function computeCeiling(clouds: { cover: string; base_ft: number }[]): number | 
 // Normalization helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Convert meters to whole feet. The AWC API reports station/observation
+ * elevation in meters (the `elev` field); every output surface renders feet.
+ */
+function metersToFeet(meters: number): number {
+  return Math.round(meters * 3.28084);
+}
+
 function normalizeMetar(raw: RawMetar): NormalizedMetar {
   const clouds = normalizeClouds(raw.clouds);
   const visib =
@@ -197,7 +205,7 @@ function normalizeMetar(raw: RawMetar): NormalizedMetar {
     name: raw.name ?? raw.icaoId,
     lat: raw.lat,
     lon: raw.lon,
-    elevation_ft: raw.elev ?? 0,
+    elevation_ft: raw.elev != null ? metersToFeet(raw.elev) : 0,
     flight_category: raw.fltCat ?? 'unknown',
     metar_type: raw.metarType ?? 'METAR',
     observed_at: new Date(raw.obsTime * 1000).toISOString(),
@@ -367,7 +375,7 @@ function normalizeStation(raw: RawStationInfo): NormalizedStation {
     name: raw.site,
     lat: raw.lat,
     lon: raw.lon,
-    elevation_ft: raw.elev ?? 0,
+    elevation_ft: raw.elev != null ? metersToFeet(raw.elev) : 0,
     state: raw.state ?? '',
     country: raw.country ?? '',
     data_types: raw.siteType ?? [],
