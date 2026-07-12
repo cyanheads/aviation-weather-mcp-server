@@ -43,7 +43,7 @@ Five tools covering aviation weather — station lookup, current observations, t
 
 Resolve and discover weather stations by multiple search modes.
 
-- Look up one or more stations by ICAO, IATA, or FAA ID (up to 20 IDs per call)
+- Look up one or more stations by 4-letter ICAO ID (up to 20 IDs per call) — lookup is ICAO-only, but each returned record includes its IATA/FAA aliases when available
 - Discover all stations within a geographic bounding box
 - List stations for a US state via two-letter abbreviation (uses bbox + client-side state filter)
 - Returns `data_types` (METAR, TAF, etc.) so agents can confirm what's available before querying

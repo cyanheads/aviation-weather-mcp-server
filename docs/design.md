@@ -40,7 +40,7 @@ Aviation weather from the NWS Aviation Weather Center (aviationweather.gov) — 
 - Primary data types: METAR, TAF, PIREP, AIRSIGMET (SIGMETs + AIRMETs combined endpoint)
 - All endpoints return JSON when `format=json` is passed; raw coded text is also available but not used (we surface `rawOb`/`rawTAF`/`rawAirSigmet` directly in structured output)
 - METAR/TAF coverage is global; PIREPs and SIGMETs/AIRMETs are US-centric
-- Station IDs are ICAO format (`KSEA`, `KJFK`, etc.); the `stationinfo` endpoint resolves IATA/FAA IDs
+- Station IDs are ICAO format (`KSEA`, `KJFK`, etc.); the `stationinfo` endpoint accepts ICAO IDs only and returns IATA/FAA aliases in each record
 - No geocoding in the API — inputs must be ICAO IDs or coordinates/bbox
 - Flight category (VFR/MVFR/IFR/LIFR) is returned directly by the METAR endpoint as `fltCat` — no need to compute client-side
 - Rate limits: not documented; keyless public API — implement retry with backoff
@@ -242,7 +242,7 @@ raw_text: string             // rawAirSigmet
 
 **Input schema:**
 ```
-station_ids: z.array(z.string()).min(1).max(20).optional().describe('One or more ICAO, IATA, or FAA station IDs.')
+station_ids: z.array(z.string()).min(1).max(20).optional().describe('One or more 4-letter ICAO station IDs. Lookup is ICAO-only; 3-letter IATA codes return no results.')
 bbox: z.object({ minLat, minLon, maxLat, maxLon }).optional().describe('Return all stations in bounding box.')
 state: z.string().length(2).optional().describe('Two-letter US state abbreviation (e.g., "WA").')
 ```
@@ -266,7 +266,7 @@ data_types: string[]         // siteType: ['METAR', 'TAF', etc.]
 
 **Error contract:**
 ```
-{ reason: 'station_not_found', code: NotFound, when: 'None of the requested IDs match any known station', recovery: 'ICAO IDs are 4 letters (e.g., KSEA). IATA IDs (3-letter like SEA) may not map 1:1. Try the full name with aviation_find_stations bbox.' }
+{ reason: 'station_not_found', code: NotFound, when: 'None of the requested IDs match any known station', recovery: 'Station IDs must be 4-letter ICAO format (e.g., KSEA, not SEA). Use bbox or state to discover ICAO IDs by location.' }
 ```
 
 ---
