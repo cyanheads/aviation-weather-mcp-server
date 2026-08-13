@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.9](changelog/0.1.x/0.1.9.md) — 2026-08-13
+
+Fix aviation_get_pireps lookback/filter bugs and validate aviation_find_stations state codes; adopt mcp-ts-core ^0.11.5
+
 ## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-07-11
 
 Include alternates in aviation_preflight_brief TAF step; reject bbox+state conflicts in aviation_find_stations

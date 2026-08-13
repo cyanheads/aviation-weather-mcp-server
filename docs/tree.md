@@ -1,11 +1,9 @@
 # aviation-weather-mcp-server - Directory Structure
 
-Generated on: 2026-07-12 03:27:38
+Generated on: 2026-08-13 09:03:06
 
 ```text
 aviation-weather-mcp-server/
-├── .agents/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -16,6 +14,8 @@ aviation-weather-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/
@@ -148,6 +148,7 @@ aviation-weather-mcp-server/
 │   │   └── aviation-weather/
 │   │       ├── aviation-weather-service.ts
 │   │       ├── bbox.ts
+│   │       ├── state-bboxes.ts
 │   │       └── types.ts
 │   └── index.ts
 ├── tests/
@@ -157,7 +158,8 @@ aviation-weather-mcp-server/
 │   ├── services/
 │   │   └── aviation-weather/
 │   │       ├── aviation-weather-service.test.ts
-│   │       └── bbox.test.ts
+│   │       ├── bbox.test.ts
+│   │       └── state-bboxes.test.ts
 │   └── tools/
 │       ├── aviation-find-stations.tool.test.ts
 │       ├── aviation-get-advisories.tool.test.ts
