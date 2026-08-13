@@ -21,7 +21,9 @@ import type {
   NormalizedPresentWeather,
   NormalizedStation,
   NormalizedTaf,
+  NormalizedTafCloudLayer,
   NormalizedTafPeriod,
+  NormalizedTafWindShear,
   NormalizedTurbulenceLayer,
   RawAirSigmet,
   RawCloudLayer,
@@ -29,6 +31,7 @@ import type {
   RawPirep,
   RawStationInfo,
   RawTaf,
+  RawTafCloudLayer,
   RawTafForecastPeriod,
 } from './types.js';
 
@@ -36,81 +39,145 @@ import type {
 // Weather code decoder
 // ---------------------------------------------------------------------------
 
-/** Map of common wx codes to plain English descriptions. */
-const WX_CODE_MAP: Record<string, string> = {
+/**
+ * Groups the AIM encodes as whole tokens rather than as qualifier plus code
+ * pairs. The `+` on `FC` is not an intensity — the AIM lists tornado and
+ * waterspout as their own phenomenon, so stripping it understates a tornado —
+ * and `NSW` is a standalone three-letter code that takes no qualifier.
+ */
+const WX_WHOLE_GROUPS = new Map([
+  ['+FC', 'tornado or waterspout'],
+  ['NSW', 'no significant weather'],
+]);
+
+/** Intensity qualifiers. Moderate is unqualified and carries no word. */
+const WX_INTENSITY: Record<string, string> = { '-': 'light', '+': 'heavy' };
+
+/** How a descriptor composes with the phenomena that follow it in its group. */
+interface WxDescriptor {
+  shape: 'prefix' | 'suffix' | 'lead';
+  word: string;
+}
+
+/**
+ * The AIM's descriptors, at most one per group. The shape is what places the
+ * intensity correctly: a `prefix` descriptor fuses with its phenomenon into a
+ * single term the intensity precedes (`-FZRA` is light freezing rain, not
+ * freezing light rain), while `suffix` and `lead` leave the intensity bound to
+ * the precipitation itself (`-SHRA` is light rain showers, `-TSRA` is a
+ * thunderstorm with light rain).
+ */
+const WX_DESCRIPTORS: Record<string, WxDescriptor> = {
+  MI: { shape: 'prefix', word: 'shallow' },
+  PR: { shape: 'prefix', word: 'partial' },
+  BC: { shape: 'prefix', word: 'patchy' },
+  DR: { shape: 'prefix', word: 'drifting' },
+  BL: { shape: 'prefix', word: 'blowing' },
+  FZ: { shape: 'prefix', word: 'freezing' },
+  SH: { shape: 'suffix', word: 'showers' },
+  TS: { shape: 'lead', word: 'thunderstorm' },
+};
+
+/** Precipitation, obstruction, and other phenomena — the AIM's last three slots. */
+const WX_PHENOMENA: Record<string, string> = {
+  // Precipitation
+  DZ: 'drizzle',
   RA: 'rain',
   SN: 'snow',
-  DZ: 'drizzle',
-  GR: 'hail',
-  GS: 'small hail',
   SG: 'snow grains',
   IC: 'ice crystals',
   PL: 'ice pellets',
-  FZRA: 'freezing rain',
-  FZDZ: 'freezing drizzle',
-  RASN: 'rain and snow',
-  TS: 'thunderstorm',
-  TSRA: 'thunderstorm with rain',
-  TSSN: 'thunderstorm with snow',
-  TSPL: 'thunderstorm with ice pellets',
-  TSGR: 'thunderstorm with hail',
-  SH: 'showers',
-  SHRA: 'rain showers',
-  SHSN: 'snow showers',
-  SHPL: 'ice pellet showers',
-  SHGR: 'hail showers',
-  FG: 'fog',
-  FZFG: 'freezing fog',
-  MIFG: 'shallow fog',
-  BCFG: 'patchy fog',
-  PRFG: 'partial fog',
+  GR: 'hail',
+  GS: 'small hail',
+  UP: 'unknown precipitation',
+  // Obstruction to visibility
   BR: 'mist',
-  HZ: 'haze',
+  FG: 'fog',
   FU: 'smoke',
+  VA: 'volcanic ash',
   DU: 'dust',
   SA: 'sand',
-  VA: 'volcanic ash',
+  HZ: 'haze',
+  PY: 'spray',
+  // Other
   PO: 'dust/sand whirls',
   SQ: 'squalls',
   FC: 'funnel cloud',
   SS: 'sandstorm',
   DS: 'duststorm',
-  BLSN: 'blowing snow',
-  DRSN: 'drifting snow',
-  BLDU: 'blowing dust',
-  BLSA: 'blowing sand',
 };
 
 /**
- * Decodes a wx group string (e.g., '-SHRA') to plain English.
- * Returns null if input is null/empty.
+ * Decode one weather group by the AIM's categories — intensity or proximity,
+ * descriptor, then phenomena. Returns null when any part of the group is
+ * unrecognized so the caller can hand the whole group back verbatim: rendering
+ * a qualifier in English while its phenomenon stays coded ("light XX") reads
+ * like a successful decode and hides the failure.
  */
-function decodeWxString(wxString: string | null | undefined): string | null {
-  if (!wxString) return null;
-  let decoded = wxString;
-  // Strip intensity prefix
-  let intensity = '';
-  if (decoded.startsWith('-')) {
-    intensity = 'light ';
-    decoded = decoded.slice(1);
-  } else if (decoded.startsWith('+')) {
-    intensity = 'heavy ';
-    decoded = decoded.slice(1);
-  } else if (decoded.startsWith('VC')) {
-    intensity = 'in vicinity: ';
-    decoded = decoded.slice(2);
+function decodeWxGroup(group: string): string | null {
+  const whole = WX_WHOLE_GROUPS.get(group);
+  if (whole) return whole;
+
+  let rest = group;
+  const intensity = WX_INTENSITY[rest.slice(0, 1)];
+  if (intensity) rest = rest.slice(1);
+  // Proximity scopes the group it prefixes — 5 to 10 SM from the point of
+  // observation — so it renders per group rather than leading the whole value.
+  const vicinity = rest.startsWith('VC');
+  if (vicinity) rest = rest.slice(2);
+
+  // Every code is two letters, so a remainder that does not reassemble from
+  // two-letter chunks is not a group this decoder understands.
+  const codes = rest.match(/[A-Z]{2}/g);
+  if (!codes || codes.join('') !== rest) return null;
+
+  const [head = '', ...tail] = codes;
+  const descriptor = WX_DESCRIPTORS[head];
+  const phenomena: string[] = [];
+  for (const code of descriptor ? tail : codes) {
+    const name = WX_PHENOMENA[code];
+    if (!name) return null;
+    phenomena.push(name);
   }
 
-  // Look up the code
-  const description = WX_CODE_MAP[decoded] ?? decoded;
-  return `${intensity}${description}`.trim();
+  const names = phenomena.join(' and ');
+  const qualify = (phrase: string) => (intensity ? `${intensity} ${phrase}` : phrase);
+
+  let decoded: string;
+  if (!descriptor) {
+    decoded = qualify(names);
+  } else if (descriptor.shape === 'lead') {
+    decoded = names ? `${descriptor.word} with ${qualify(names)}` : descriptor.word;
+  } else if (descriptor.shape === 'suffix') {
+    // The precipitation modifies the noun, so it drops its plural: `SHPL` is
+    // ice pellet showers, not ice pellets showers.
+    decoded = names ? `${qualify(names).replace(/s$/, '')} ${descriptor.word}` : descriptor.word;
+  } else if (names) {
+    decoded = qualify(`${descriptor.word} ${names}`);
+  } else {
+    // A bare adjective ("freezing", "patchy") is not a reading.
+    return null;
+  }
+
+  return vicinity ? `${decoded} in the vicinity` : decoded;
 }
 
 /**
- * Present weather as both the raw group and its decoded reading. TAF carries
- * only the decoded form; METAR keeps the raw group too, so a compound group the
- * decoder does not split (`+RA BR`) stays recoverable without re-parsing the
- * raw observation.
+ * Decode a present-weather value to plain English. The value is space
+ * delimited and carries one or more groups, so each group is decoded on its
+ * own and the readings are joined. A group the tables do not cover is handed
+ * back verbatim rather than blended into the prose around it.
+ */
+function decodeWxString(wxString: string | null | undefined): string | null {
+  const groups = wxString?.trim().split(/\s+/).filter(Boolean);
+  if (!groups?.length) return null;
+  return groups.map((group) => decodeWxGroup(group) ?? group).join('; ');
+}
+
+/**
+ * Present weather as both the raw group and its decoded reading. Both METAR
+ * and TAF carry the pair, so a group the decoder hands back verbatim stays
+ * recoverable from `raw` without re-parsing the raw observation or forecast.
  */
 function normalizePresentWeather(
   wxString: string | null | undefined,
@@ -143,7 +210,7 @@ function normalizeClouds(clouds: RawCloudLayer[] | null | undefined): Normalized
 const OBSCURATION_COVER = 'OVX';
 
 /**
- * Sky covers that constitute a ceiling. FAA AIM 7-1-13, on METAR sky condition:
+ * Sky covers that constitute a ceiling. FAA AIM 7-1-29, on METAR sky condition:
  * "A ceiling layer is not designated in the METAR code. For aviation purposes,
  * the ceiling is the lowest broken or overcast layer, or vertical visibility
  * into an obscuration." Few and scattered layers are not ceilings.
@@ -229,11 +296,61 @@ function normalizeMetar(raw: RawMetar): NormalizedMetar {
   };
 }
 
+/**
+ * Vertical visibility into a forecast obscuration, in feet. The TAF endpoint
+ * publishes `vertVis` in feet — a `VV002` group arrives as `200` — where the
+ * METAR endpoint publishes the group's own hundreds-of-feet value, so
+ * `verticalVisibilityFeet()` must never reach this path.
+ *
+ * The height belongs to the period's `OVX` layer rather than to the field on its
+ * own: upstream repeats `vertVis` onto a later `BECMG` group that forecasts a
+ * clearing sky (`... 3/8SM FG VV001 BECMG P6SM NSW SKC`), so reading the field
+ * alone publishes an indefinite ceiling under a sky-clear forecast.
+ */
+function tafObscurationFeet(p: RawTafForecastPeriod): number | null {
+  const obscured = p.clouds?.some((c) => c.cover === OBSCURATION_COVER) ?? false;
+  return obscured ? (p.vertVis ?? null) : null;
+}
+
+/**
+ * Forecast cloud layers. AWC publishes an obscuration as an `OVX` layer with a
+ * null base and holds the height on the period instead, so that layer takes its
+ * base from `vertVisFt` — dropping it made an obscured forecast read as a clear
+ * sky. A layer still left with no height carries no altitude to publish, which
+ * is what a baseless `SKC` group on a clearing forecast is.
+ */
+function normalizeTafClouds(
+  clouds: RawTafCloudLayer[] | null | undefined,
+  vertVisFt: number | null,
+): NormalizedTafCloudLayer[] {
+  return (clouds ?? [])
+    .map((c) => ({
+      cover: c.cover,
+      base_ft: c.cover === OBSCURATION_COVER ? (c.base ?? vertVisFt) : c.base,
+      type: c.type ?? null,
+    }))
+    .filter((c): c is NormalizedTafCloudLayer => c.base_ft != null);
+}
+
+/**
+ * Forecast low-level wind shear, from the `WShwshwshws/dddffKT` group. Both
+ * values arrive already converted — `WS020` reaches the endpoint as `2000`, not
+ * `20` — and the height is AGL, so nothing here scales or offsets them.
+ *
+ * Upstream populates the three fields together or leaves all three null, so one
+ * nullable object beats three nullable scalars: the flat shape would admit seven
+ * states upstream never produces, and a caller would have to read all three to
+ * learn whether shear was forecast at all.
+ */
+function normalizeTafWindShear(p: RawTafForecastPeriod): NormalizedTafWindShear | null {
+  return p.wshearHgt != null && p.wshearDir != null && p.wshearSpd != null
+    ? { height_ft: p.wshearHgt, direction_deg: p.wshearDir, speed_kt: p.wshearSpd }
+    : null;
+}
+
 function normalizeTafPeriod(p: RawTafForecastPeriod): NormalizedTafPeriod {
-  const clouds =
-    p.clouds
-      ?.filter((c) => c.base != null)
-      .map((c) => ({ cover: c.cover, base_ft: c.base as number, type: c.type ?? null })) ?? [];
+  const verticalVisibilityFt = tafObscurationFeet(p);
+  const clouds = normalizeTafClouds(p.clouds, verticalVisibilityFt);
   // A period carrying no visibility element arrives as an empty string, not
   // null, so a bare null check leaves it to render as a bare " sm".
   const rawVisib = p.visib == null ? null : typeof p.visib === 'string' ? p.visib : String(p.visib);
@@ -252,8 +369,10 @@ function normalizeTafPeriod(p: RawTafForecastPeriod): NormalizedTafPeriod {
       speed_kt: p.wspd ?? null,
       gust_kt: p.wgst ?? null,
     },
+    wind_shear: normalizeTafWindShear(p),
     visibility_sm: visib,
-    weather: decodeWxString(p.wxString),
+    vertical_visibility_ft: verticalVisibilityFt,
+    weather: normalizePresentWeather(p.wxString),
     clouds,
   };
 }

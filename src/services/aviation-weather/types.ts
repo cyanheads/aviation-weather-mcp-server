@@ -242,20 +242,55 @@ export interface NormalizedMetar {
   };
 }
 
+/**
+ * A forecast cloud layer. An `OVX` layer is the decoded form of a `VVhhh`
+ * group — the sky is obscured and `base_ft` is the vertical visibility into it,
+ * taken from the period's `vertVis` because AWC leaves the layer's own base null.
+ */
+export interface NormalizedTafCloudLayer {
+  base_ft: number;
+  cover: string;
+  type: string | null;
+}
+
+/**
+ * Forecast non-convective low-level wind shear, from a `WShwshwshws/dddffKT`
+ * group. `height_ft` is the top of the shear layer, and the direction and speed
+ * are the forecast wind *at* that height — not a shear direction or magnitude.
+ */
+export interface NormalizedTafWindShear {
+  direction_deg: number;
+  height_ft: number;
+  speed_kt: number;
+}
+
 export interface NormalizedTafPeriod {
   change_type: string | null;
-  clouds: { cover: string; base_ft: number; type: string | null }[];
+  clouds: NormalizedTafCloudLayer[];
   from: string; // ISO 8601
   probability: number | null;
   to: string; // ISO 8601
+  /**
+   * Vertical visibility into a forecast obscuration, in feet AGL — the TAF
+   * endpoint publishes this in feet, unlike METAR's hundreds of feet. Null when
+   * the period forecasts no obscuration; 0 is a surface-level indefinite ceiling.
+   */
+  vertical_visibility_ft: number | null;
   visibility_sm: string | null;
-  weather: string | null; // decoded wx string
+  /** Null when the period carried no weather group. */
+  weather: NormalizedPresentWeather | null;
   wind: {
     direction_deg: number | null;
     /** Null when the period carries no wind element; 0 is a forecast calm. */
     speed_kt: number | null;
     gust_kt: number | null;
   };
+  /**
+   * Null when the period carried no non-convective LLWS group — which is not a
+   * forecast of smooth air. The group is excluded from TEMPO and PROB periods
+   * and shear is assumed present in convective activity.
+   */
+  wind_shear: NormalizedTafWindShear | null;
 }
 
 export interface NormalizedTaf {

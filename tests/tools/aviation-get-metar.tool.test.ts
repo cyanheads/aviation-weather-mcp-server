@@ -3,7 +3,7 @@
  * @module tests/tools/aviation-get-metar.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { aviationGetMetar } from '@/mcp-server/tools/definitions/aviation-get-metar.tool.js';
 import type { NormalizedMetar } from '@/services/aviation-weather/types.js';
@@ -89,6 +89,21 @@ const overcastMetar: NormalizedMetar = {
     { cover: 'OVC', base_ft: 900 },
   ],
   present_weather: { raw: '-RA', decoded: 'light rain' },
+};
+
+/**
+ * Two space-delimited weather groups, live on the CONUS feed. The proximity
+ * scopes the thunderstorm alone — the rain is at the field, not in the vicinity.
+ */
+const multiGroupMetar: NormalizedMetar = {
+  ...ksea,
+  present_weather: { raw: 'VCTS -RA', decoded: 'thunderstorm in the vicinity; light rain' },
+};
+
+/** A group the decoder does not recognize, carried through as its raw token. */
+const unresolvedWeatherMetar: NormalizedMetar = {
+  ...ksea,
+  present_weather: { raw: '-SHRA XX', decoded: 'light rain showers; XX' },
 };
 
 /**
@@ -353,6 +368,53 @@ describe('aviationGetMetar obscuration', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Multi-group present weather (issue #21) — a wxString is space-delimited and
+// every group has to reach both response surfaces decoded
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar present weather', () => {
+  const presentWeather = aviationGetMetar.output.shape.observations.element.shape.present_weather;
+
+  /** Run the handler over one observation and return it. */
+  async function handle(observation: NormalizedMetar) {
+    mockFetchMetar.mockResolvedValue([observation]);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ station_ids: ['KSEA'] });
+    const result = await aviationGetMetar.handler(input, ctx);
+    return result.observations[0]!;
+  }
+
+  it('carries every decoded group to structuredContent', async () => {
+    expect((await handle(multiGroupMetar)).present_weather).toEqual({
+      raw: 'VCTS -RA',
+      decoded: 'thunderstorm in the vicinity; light rain',
+    });
+  });
+
+  it('keeps an unresolved group recoverable from the raw field', async () => {
+    expect((await handle(unresolvedWeatherMetar)).present_weather).toEqual({
+      raw: '-SHRA XX',
+      decoded: 'light rain showers; XX',
+    });
+  });
+
+  it('accepts a multi-group observation against the declared output schema', async () => {
+    mockFetchMetar.mockResolvedValue([multiGroupMetar, unresolvedWeatherMetar, ksea]);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ station_ids: ['KSEA'] });
+    const result = await aviationGetMetar.handler(input, ctx);
+
+    expect(result).toEqual(expect.schemaMatching(aviationGetMetar.output));
+  });
+
+  it('names the verbatim passthrough in the decoded description', () => {
+    // A consumer that does not know an unrecognized group comes back coded
+    // will paraphrase the raw token as a decoded reading.
+    expect(presentWeather.unwrap().shape.decoded.description ?? '').toMatch(/raw token/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Format tests
 // ---------------------------------------------------------------------------
 
@@ -485,6 +547,23 @@ describe('aviationGetMetar.format', () => {
     expect(text).toContain('fog');
   });
 
+  it('renders every group of a multi-group observation', () => {
+    const blocks = aviationGetMetar.format!({ observations: [multiGroupMetar] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain(
+      '**Present weather:** VCTS -RA (thunderstorm in the vicinity; light rain)',
+    );
+  });
+
+  it('renders an unresolved group as its raw token rather than half-translated', () => {
+    const blocks = aviationGetMetar.format!({ observations: [unresolvedWeatherMetar] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('-SHRA XX (light rain showers; XX)');
+    expect(text).not.toContain('light XX');
+  });
+
   it('omits the present-weather line on a dry observation', () => {
     const blocks = aviationGetMetar.format!({ observations: [ksea] });
     const text = (blocks[0] as { type: string; text: string }).text;
@@ -505,5 +584,144 @@ describe('aviationGetMetar.format', () => {
 
     expect(text).toContain('**Location:** 39.45, -74.57');
     expect(text).not.toContain('39.4500');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Partial-batch disclosure (issue #18) — a station that returns nothing was
+// dropped without a trace, so a partial result read as full route coverage
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar partial-batch disclosure', () => {
+  /** A second station, so a batch can come back short. */
+  const kpdx: NormalizedMetar = { ...ksea, station_id: 'KPDX', name: 'Portland Intl' };
+
+  /** Run the handler over a batch and return the enrichment it accumulated. */
+  async function enrichmentFor(station_ids: string[], observations: NormalizedMetar[], hours = 1) {
+    mockFetchMetar.mockResolvedValue(observations);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ station_ids, hours });
+    await aviationGetMetar.handler(input, ctx);
+    return getEnrichment(ctx);
+  }
+
+  it('names the station that returned no data', async () => {
+    expect(await enrichmentFor(['KSEA', 'KZZZ'], [ksea])).toMatchObject({
+      requested: ['KSEA', 'KZZZ'],
+      returned: ['KSEA'],
+      partial: true,
+      missing: ['KZZZ'],
+    });
+  });
+
+  it('carries recovery guidance on a partial result', async () => {
+    const notice = (await enrichmentFor(['KSEA', 'KZZZ'], [ksea])).notice;
+
+    expect(notice).toContain('KZZZ');
+    expect(String(notice)).toMatch(/aviation_find_stations/);
+  });
+
+  it('states completeness affirmatively on a full batch', async () => {
+    const enrichment = await enrichmentFor(['KSEA', 'KPDX'], [ksea, kpdx]);
+
+    expect(enrichment).toMatchObject({
+      requested: ['KSEA', 'KPDX'],
+      returned: ['KSEA', 'KPDX'],
+      partial: false,
+    });
+    expect(enrichment).not.toHaveProperty('missing');
+  });
+
+  it('leaves the notice off a complete batch', async () => {
+    expect(await enrichmentFor(['KSEA'], [ksea])).not.toHaveProperty('notice');
+  });
+
+  it('counts distinct stations, not observation rows', async () => {
+    // `hours: 12` returns one row per observation, so a station reporting six
+    // times must appear once in `returned` and never in `missing`.
+    const rows = Array.from({ length: 6 }, (_, i) => ({
+      ...ksea,
+      observed_at: `2026-01-15T${String(6 + i).padStart(2, '0')}:53:00.000Z`,
+    }));
+    const enrichment = await enrichmentFor(['KSEA', 'KPDX'], [...rows, kpdx], 12);
+
+    expect(enrichment).toMatchObject({
+      returned: ['KSEA', 'KPDX'],
+      partial: false,
+    });
+  });
+
+  it('states no cause for an omission', async () => {
+    // Three upstream conditions produce the same missing row and the response
+    // cannot tell them apart, so the guidance names candidates, never a verdict.
+    const notice = String((await enrichmentFor(['KSEA', 'KZZZ'], [ksea])).notice);
+
+    expect(notice).toMatch(/\bmay\b/);
+    expect(notice).not.toMatch(/\b(is not a known station|does not transmit|is stale)\b/);
+  });
+
+  it('still throws rather than disclosing an empty result as a partial one', async () => {
+    mockFetchMetar.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ station_ids: ['KZZZ', 'KZZY'] });
+
+    await expect(aviationGetMetar.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_stations_found' },
+    });
+    expect(getEnrichment(ctx)).not.toHaveProperty('partial');
+  });
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    mockFetchMetar.mockResolvedValue([ksea]);
+    const result = await runToolContract(aviationGetMetar, {
+      station_ids: ['KSEA', 'KZZZ'],
+      hours: 1,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      partial: true,
+      missing: ['KZZZ'],
+      requested: ['KSEA', 'KZZZ'],
+      returned: ['KSEA'],
+    });
+
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('KZZZ');
+    expect(text).toContain('aviation_find_stations');
+  });
+
+  it.each([['ksea'], ['SEA'], ['KSEATTLE'], ['']])(
+    'rejects %p before reconciliation can run',
+    (id) => {
+      // Comparing the requested IDs against upstream `icaoId` is only a sound
+      // set operation because the input contract fixes them at four uppercase
+      // letters — a relaxed input would surface a casing mismatch as a missing
+      // station rather than as the input error it is.
+      expect(aviationGetMetar.input.safeParse({ station_ids: [id], hours: 1 }).success).toBe(false);
+    },
+  );
+
+  it('rejects an empty batch rather than reconciling nothing', () => {
+    expect(aviationGetMetar.input.safeParse({ station_ids: [], hours: 1 }).success).toBe(false);
+  });
+
+  it('rejects a batch past the 10-station cap', () => {
+    const ids = Array.from({ length: 11 }, (_, i) => `KZZ${String.fromCharCode(65 + i)}`);
+
+    expect(aviationGetMetar.input.safeParse({ station_ids: ids, hours: 1 }).success).toBe(false);
+  });
+
+  it('leaves the observations payload and its rendering untouched', async () => {
+    mockFetchMetar.mockResolvedValue([ksea]);
+    const result = await runToolContract(aviationGetMetar, {
+      station_ids: ['KSEA', 'KZZZ'],
+      hours: 1,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      observations: [expect.objectContaining({ station_id: 'KSEA' })],
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('## KSEA — Seattle-Tacoma International Airport');
   });
 });

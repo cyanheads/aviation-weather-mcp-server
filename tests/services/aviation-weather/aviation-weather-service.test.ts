@@ -444,19 +444,462 @@ describe('AviationWeatherService METAR present weather', () => {
     expect(obs.present_weather).toEqual({ raw: 'FG', decoded: 'fog' });
   });
 
-  it('keeps the raw group when the decoder cannot split a compound', async () => {
-    // `+RA BR` is live on the CONUS feed. The decoder handles one group at a
-    // time, so the preserved raw form is what keeps the mist recoverable.
+  it('carries the raw group beside a multi-group reading', async () => {
+    // `+RA BR` is live on the CONUS feed. Both groups decode; the raw form
+    // stays alongside so a consumer can re-read a group the decoder hands
+    // back verbatim.
     const obs = await normalize({ wxString: '+RA BR' });
 
-    expect(obs.present_weather?.raw).toBe('+RA BR');
-    expect(obs.present_weather?.decoded).toContain('heavy');
+    expect(obs.present_weather).toEqual({ raw: '+RA BR', decoded: 'heavy rain; mist' });
   });
 
   it.each([null, '', '   '])('reports %p present weather as null', async (wxString) => {
     const obs = await normalize({ wxString });
 
     expect(obs.present_weather).toBeNull();
+  });
+
+  // Single-group readings the live feed publishes constantly. They are the
+  // baseline a decoder rewrite must reproduce exactly.
+  it.each([
+    ['-RA', 'light rain'],
+    ['+RA', 'heavy rain'],
+    ['RA', 'rain'],
+    ['BR', 'mist'],
+    ['FG', 'fog'],
+    ['HZ', 'haze'],
+    ['FU', 'smoke'],
+    ['SHRA', 'rain showers'],
+    ['-SHRA', 'light rain showers'],
+    ['-FZRA', 'light freezing rain'],
+    ['FZFG', 'freezing fog'],
+    ['BCFG', 'patchy fog'],
+    ['MIFG', 'shallow fog'],
+    ['PRFG', 'partial fog'],
+    ['TSRA', 'thunderstorm with rain'],
+    ['TSGR', 'thunderstorm with hail'],
+    ['RASN', 'rain and snow'],
+    ['BLSN', 'blowing snow'],
+    ['DRSN', 'drifting snow'],
+    ['SHSN', 'snow showers'],
+  ])('decodes %s as %s', async (wxString, decoded) => {
+    const obs = await normalize({ wxString });
+
+    expect(obs.present_weather).toEqual({ raw: wxString, decoded });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Present-weather group decoding (issue #21) — a value is space-delimited and
+// carries one or more groups, and each group is read by its AIM categories
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService present-weather group decoding', () => {
+  /** Decode one wxString through the real METAR normalization path. */
+  async function decode(wxString: string) {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([{ ...rawMetarKDEN, wxString }]));
+    const [obs] = await svc.fetchMetar(['KDEN'], 1, createMockContext());
+    return obs!.present_weather;
+  }
+
+  // Every multi-group value below was live on the AWC METAR or TAF feed. The
+  // whole-string lookup decoded at most the first group and passed the rest
+  // through as raw code.
+  it.each([
+    ['-SHRA BR', 'light rain showers; mist'],
+    ['-RA BR', 'light rain; mist'],
+    ['TSRA BR', 'thunderstorm with rain; mist'],
+    ['RA BR', 'rain; mist'],
+    ['BR BCFG', 'mist; patchy fog'],
+    ['HZ FU', 'haze; smoke'],
+    ['-SHRA PRFG', 'light rain showers; partial fog'],
+    ['SHRA BR VCTS', 'rain showers; mist; thunderstorm in the vicinity'],
+    ['-SHRA BR VCTS', 'light rain showers; mist; thunderstorm in the vicinity'],
+    ['FU VCSH', 'smoke; showers in the vicinity'],
+    ['-RA VCTS', 'light rain; thunderstorm in the vicinity'],
+  ])('decodes every group of %s', async (wxString, decoded) => {
+    expect(await decode(wxString)).toEqual({ raw: wxString, decoded });
+  });
+
+  // The AIM gives the group format as Intensity/Proximity, Descriptor,
+  // Precipitation, Obstruction, Other, and states that intensity "applies only
+  // to the first type of precipitation reported" — so `-TSRA` is a
+  // thunderstorm with light rain, never a light thunderstorm.
+  it.each([
+    ['-TSRA', 'thunderstorm with light rain'],
+    ['+TSRA', 'thunderstorm with heavy rain'],
+    ['-TSRA BR', 'thunderstorm with light rain; mist'],
+    ['+TSRA BR', 'thunderstorm with heavy rain; mist'],
+    ['-TSSN', 'thunderstorm with light snow'],
+  ])('binds the intensity of %s to the precipitation, not the descriptor', async (wx, decoded) => {
+    expect((await decode(wx))?.decoded).toBe(decoded);
+  });
+
+  it.each(['-TSRA', '+TSRA', '-TSRA BR', '+TSRA BR', 'VCTS -RA', '-TSSN'])(
+    'never reads %s as a light or heavy thunderstorm',
+    async (wxString) => {
+      const decoded = (await decode(wxString))?.decoded ?? '';
+
+      expect(decoded).not.toContain('light thunderstorm');
+      expect(decoded).not.toContain('heavy thunderstorm');
+    },
+  );
+
+  // VC scopes the group it prefixes — 5 to 10 SM from the point of observation,
+  // per the AIM. As a leading phrase on a joined reading it would claim every
+  // later group is in the vicinity too.
+  it.each([
+    ['VCTS', 'thunderstorm in the vicinity'],
+    ['VCSH', 'showers in the vicinity'],
+    ['VCFG', 'fog in the vicinity'],
+    ['VCTS -RA', 'thunderstorm in the vicinity; light rain'],
+    ['VCTS -RA BR', 'thunderstorm in the vicinity; light rain; mist'],
+  ])('scopes the proximity of %s to its own group', async (wxString, decoded) => {
+    expect((await decode(wxString))?.decoded).toBe(decoded);
+  });
+
+  it('resolves VCTSRA as one group rather than splitting on a code boundary', async () => {
+    // Splitting is on spaces only — a run of codes is one group however long.
+    expect((await decode('VCTSRA'))?.decoded).toBe('thunderstorm with rain in the vicinity');
+  });
+
+  it('decodes NSW, which the map had no entry for, to plain English', async () => {
+    expect((await decode('NSW'))?.decoded).toBe('no significant weather');
+  });
+
+  it('reads +FC as a tornado or waterspout, not a heavy funnel cloud', async () => {
+    // The AIM lists tornado/waterspout as its own phenomenon; the `+` is not an
+    // intensity, and stripping it understates a tornado.
+    const decoded = (await decode('+FC'))?.decoded;
+
+    expect(decoded).toBe('tornado or waterspout');
+    expect(decoded).not.toContain('funnel cloud');
+  });
+
+  it('still reads a bare FC as a funnel cloud', async () => {
+    expect((await decode('FC'))?.decoded).toBe('funnel cloud');
+  });
+
+  it.each([
+    ['XX', 'XX'],
+    ['-XX', '-XX'],
+    ['+ZZ', '+ZZ'],
+    ['VCXX', 'VCXX'],
+    ['RAX', 'RAX'],
+    ['-SHRA XX', 'light rain showers; XX'],
+    ['XX BR', 'XX; mist'],
+  ])('hands back the unresolved group of %s verbatim', async (wxString, decoded) => {
+    expect((await decode(wxString))?.decoded).toBe(decoded);
+  });
+
+  it.each(['constructor', '__proto__', 'toString', 'valueOf'])(
+    'hands back %s verbatim rather than resolving it off a prototype',
+    async (wxString) => {
+      expect((await decode(wxString))?.decoded).toBe(wxString);
+    },
+  );
+
+  it('never renders a qualifier in English while its phenomenon stays coded', async () => {
+    // `light XX BR` is the silent-failure shape: the reading looks decoded, so
+    // nothing marks the group that did not resolve.
+    const decoded = (await decode('-XX BR'))?.decoded ?? '';
+
+    expect(decoded).toBe('-XX; mist');
+    expect(decoded).not.toContain('light XX');
+  });
+
+  it.each(['-SHRA BR', 'VCTS -RA BR', '+TSRA BR', '-SHRA  BR'])(
+    'round-trips the raw group of %s byte for byte',
+    async (wxString) => {
+      expect((await decode(wxString))?.raw).toBe(wxString);
+    },
+  );
+});
+
+describe('AviationWeatherService TAF present weather', () => {
+  /** Normalize one raw TAF forecast period through the real service path. */
+  async function normalize(overrides: Partial<RawTafForecastPeriod>) {
+    const period = { ...rawTafKSEA.fcsts[0]!, ...overrides };
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([{ ...rawTafKSEA, fcsts: [period] }]),
+    );
+    const [taf] = await svc.fetchTaf(['KSEA'], createMockContext());
+    return taf!.forecast_periods[0]!;
+  }
+
+  it('carries the raw group beside the decoded reading, as METAR does', async () => {
+    const period = await normalize({ wxString: '-SHRA BR' });
+
+    expect(period.weather).toEqual({ raw: '-SHRA BR', decoded: 'light rain showers; mist' });
+  });
+
+  it('decodes every group of a multi-group forecast', async () => {
+    const period = await normalize({ wxString: 'SHRA BR VCTS' });
+
+    expect(period.weather?.decoded).toBe('rain showers; mist; thunderstorm in the vicinity');
+  });
+
+  it('keeps an unresolved forecast group recoverable from the raw field', async () => {
+    const period = await normalize({ wxString: '-SHRA XX' });
+
+    expect(period.weather).toEqual({ raw: '-SHRA XX', decoded: 'light rain showers; XX' });
+  });
+
+  it.each([null, '', '   '])('reports %p forecast weather as null', async (wxString) => {
+    const period = await normalize({ wxString });
+
+    expect(period.weather).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TAF cloud layers — the ordinary layers an obscuration fix must leave alone
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService TAF cloud layers', () => {
+  /** Normalize one raw TAF forecast period through the real service path. */
+  async function normalize(overrides: Partial<RawTafForecastPeriod>) {
+    const period = { ...rawTafKSEA.fcsts[0]!, ...overrides };
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([{ ...rawTafKSEA, fcsts: [period] }]),
+    );
+    const [taf] = await svc.fetchTaf(['KSEA'], createMockContext());
+    return taf!.forecast_periods[0]!;
+  }
+
+  it('passes a reported layer through with its cover, base, and type', async () => {
+    const period = await normalize({
+      clouds: [
+        { base: 800, cover: 'OVC', type: null },
+        { base: 1500, cover: 'BKN', type: 'CB' },
+      ],
+    });
+
+    expect(period.clouds).toEqual([
+      { cover: 'OVC', base_ft: 800, type: null },
+      { cover: 'BKN', base_ft: 1500, type: 'CB' },
+    ]);
+  });
+
+  it('keeps the upstream layer order', async () => {
+    const period = await normalize({
+      clouds: [
+        { base: 20000, cover: 'BKN', type: null },
+        { base: 3000, cover: 'SCT', type: null },
+      ],
+    });
+
+    expect(period.clouds.map((c) => c.base_ft)).toEqual([20000, 3000]);
+  });
+
+  it.each(['SKC', 'CLR', 'CAVOK'])(
+    'drops a baseless %s layer, which has no height',
+    async (cover) => {
+      // `SKC` arrives with a null base on a BECMG group forecasting a clearing
+      // sky — there is no altitude to publish, so the layer carries no data.
+      const period = await normalize({ clouds: [{ base: null, cover, type: null }] });
+
+      expect(period.clouds).toEqual([]);
+    },
+  );
+
+  it.each([null, []])('reports %p upstream clouds as an empty array', async (clouds) => {
+    const period = await normalize({ clouds });
+
+    expect(period.clouds).toEqual([]);
+  });
+
+  it('keeps a surface-level layer at 0 feet rather than dropping it', async () => {
+    const period = await normalize({ clouds: [{ base: 0, cover: 'OVC', type: null }] });
+
+    expect(period.clouds).toEqual([{ cover: 'OVC', base_ft: 0, type: null }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TAF obscuration (issue #28) — this endpoint publishes an obscuration as an
+// OVX layer with no base, carrying the height in the period's vertVis, in FEET
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService TAF obscuration', () => {
+  /** Normalize one raw TAF forecast period through the real service path. */
+  async function normalize(overrides: Partial<RawTafForecastPeriod>) {
+    const period = { ...rawTafKSEA.fcsts[0]!, ...overrides };
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([{ ...rawTafKSEA, fcsts: [period] }]),
+    );
+    const [taf] = await svc.fetchTaf(['KSEA'], createMockContext());
+    return taf!.forecast_periods[0]!;
+  }
+
+  it('keeps the obscuration layer and fills its base from vertVis', async () => {
+    // Live KDIK: `TAF KDIK 131126Z 1312/1412 15005KT 1/4SM FG VV002 ...`, which
+    // arrives with the height on the period and no base on the layer.
+    const period = await normalize({
+      clouds: [{ base: null, cover: 'OVX', type: null }],
+      vertVis: 200,
+      visib: 0.25,
+      wxString: 'FG',
+    });
+
+    expect(period.clouds).toEqual([{ cover: 'OVX', base_ft: 200, type: null }]);
+    expect(period.vertical_visibility_ft).toBe(200);
+  });
+
+  it.each([
+    [100, 'VV001'],
+    [200, 'VV002'],
+    [300, 'VV003'],
+  ])('reads a TAF vertVis of %i (%s) as feet, never as hundreds of feet', async (vertVis) => {
+    // The METAR endpoint publishes this field in hundreds of feet and needs a
+    // ×100 conversion; this one publishes feet. Applying the METAR conversion
+    // here turns a 200 ft indefinite ceiling into a 20,000 ft one.
+    const period = await normalize({ clouds: [{ base: null, cover: 'OVX', type: null }], vertVis });
+
+    expect(period.vertical_visibility_ft).toBe(vertVis);
+    expect(period.clouds[0]!.base_ft).toBe(vertVis);
+  });
+
+  it('keeps a surface-level indefinite ceiling rather than dropping it', async () => {
+    // `VV000` is a real group and the most hazardous value the field can hold.
+    // Any truthiness guard on the height drops exactly that case.
+    const period = await normalize({
+      clouds: [{ base: null, cover: 'OVX', type: null }],
+      vertVis: 0,
+    });
+
+    expect(period.vertical_visibility_ft).toBe(0);
+    expect(period.clouds).toEqual([{ cover: 'OVX', base_ft: 0, type: null }]);
+  });
+
+  it('keeps the cloud-type qualifier on an obscuration', async () => {
+    // `VV008CB` — NWSI 10-813 §B2.7.3 sanctions CB following an obscuration
+    // height, so the qualifier is not an anomaly to normalize away.
+    const period = await normalize({
+      clouds: [{ base: null, cover: 'OVX', type: 'CB' }],
+      vertVis: 800,
+    });
+
+    expect(period.clouds).toEqual([{ cover: 'OVX', base_ft: 800, type: 'CB' }]);
+    expect(period.vertical_visibility_ft).toBe(800);
+  });
+
+  it('reports no vertical visibility on a period forecasting no obscuration', async () => {
+    const period = await normalize({ clouds: [{ base: 2500, cover: 'BKN', type: null }] });
+
+    expect(period.vertical_visibility_ft).toBeNull();
+    expect(period.clouds).toEqual([{ cover: 'BKN', base_ft: 2500, type: null }]);
+  });
+
+  it('ignores a vertVis upstream carried forward onto a sky-clear period', async () => {
+    // Live CYXU: `... 3/8SM FG VV001 BECMG 1312/1314 P6SM NSW SKC ...`. The
+    // BECMG group forecasts a clearing sky and carries no VV group of its own,
+    // yet upstream repeats the base period's vertVis on it. Reading the field
+    // alone would publish a 100 ft indefinite ceiling under a P6SM NSW SKC
+    // forecast — the obscuration is what the OVX layer marks, not the field.
+    const period = await normalize({
+      clouds: [{ base: null, cover: 'SKC', type: null }],
+      vertVis: 100,
+      fcstChange: 'BECMG',
+      visib: '6+',
+      wxString: 'NSW',
+    });
+
+    expect(period.vertical_visibility_ft).toBeNull();
+    expect(period.clouds).toEqual([]);
+  });
+
+  it('fills only the obscuration when other layers sit beside it', async () => {
+    const period = await normalize({
+      clouds: [
+        { base: null, cover: 'OVX', type: null },
+        { base: 3000, cover: 'BKN', type: null },
+      ],
+      vertVis: 200,
+    });
+
+    expect(period.clouds).toEqual([
+      { cover: 'OVX', base_ft: 200, type: null },
+      { cover: 'BKN', base_ft: 3000, type: null },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TAF low-level wind shear (issue #23) — the WShwshwshws/dddffKT group arrives
+// already converted, and the three fields are populated together or not at all
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService TAF wind shear', () => {
+  /** Normalize one raw TAF forecast period through the real service path. */
+  async function normalize(overrides: Partial<RawTafForecastPeriod>) {
+    const period = { ...rawTafKSEA.fcsts[0]!, ...overrides };
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([{ ...rawTafKSEA, fcsts: [period] }]),
+    );
+    const [taf] = await svc.fetchTaf(['KSEA'], createMockContext());
+    return taf!.forecast_periods[0]!;
+  }
+
+  it('maps the three upstream fields to one object', async () => {
+    // Live KTUL: `... WS020/20040KT ...` — the group's own values, unscaled.
+    const period = await normalize({ wshearHgt: 2000, wshearDir: 200, wshearSpd: 40 });
+
+    expect(period.wind_shear).toEqual({ height_ft: 2000, direction_deg: 200, speed_kt: 40 });
+  });
+
+  it('passes the shear height through in feet rather than scaling it', async () => {
+    // `WS020` reaches the endpoint as 2000, already in feet AGL. Multiplying by
+    // 100 as the PIREP and METAR hundreds-of-feet fields require would publish
+    // a 200,000 ft shear layer; treating it as hundreds would publish 20 ft.
+    const period = await normalize({ wshearHgt: 2000, wshearDir: 220, wshearSpd: 45 });
+
+    expect(period.wind_shear?.height_ft).toBe(2000);
+  });
+
+  it('adds no station elevation to the shear height', async () => {
+    // The sampled shear stations sit at 643–1,270 ft MSL and every one reports
+    // exactly 2000, so the datum is AGL and no offset belongs here.
+    const period = await normalize({ wshearHgt: 2000, wshearDir: 210, wshearSpd: 35 });
+
+    expect(period.wind_shear?.height_ft).toBe(2000);
+  });
+
+  it('reports a period carrying no shear group as null', async () => {
+    const period = await normalize({ wshearHgt: null, wshearDir: null, wshearSpd: null });
+
+    expect(period.wind_shear).toBeNull();
+  });
+
+  it('reports a period whose upstream shear keys are absent as null', async () => {
+    // The three keys ride every sampled period, but the raw type marks them
+    // optional — an absent key is the same "no group issued" state as a null.
+    const period = await normalize({});
+
+    expect(period.wind_shear).toBeNull();
+  });
+
+  it('leaves the surface wind untouched when shear is forecast', async () => {
+    const period = await normalize({
+      wdir: 180,
+      wspd: 12,
+      wgst: 22,
+      wshearHgt: 2000,
+      wshearDir: 200,
+      wshearSpd: 40,
+    });
+
+    expect(period.wind).toEqual({ direction_deg: 180, speed_kt: 12, gust_kt: 22 });
+    expect(period.wind_shear).toEqual({ height_ft: 2000, direction_deg: 200, speed_kt: 40 });
+  });
+
+  it('synthesizes nothing from a partially populated shear group', async () => {
+    // Never observed upstream: the three fields ride together in every sampled
+    // record. Publishing a wind velocity with a fabricated height would be worse
+    // than omitting a group that upstream did not actually complete.
+    const period = await normalize({ wshearHgt: 2000, wshearDir: null, wshearSpd: 40 });
+
+    expect(period.wind_shear).toBeNull();
   });
 });
 

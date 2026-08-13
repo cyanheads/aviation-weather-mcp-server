@@ -109,7 +109,7 @@ export const aviationGetMetar = tool('aviation_get_metar', {
               .number()
               .nullable()
               .describe(
-                'Ceiling in feet AGL — the lowest broken, overcast, or obscuration layer. Per FAA AIM 7-1-13 the ceiling is the lowest broken or overcast layer, or the vertical visibility into an obscuration; few and scattered layers are never ceilings. Null when the observation reported no such layer.',
+                'Ceiling in feet AGL — the lowest broken, overcast, or obscuration layer. Per FAA AIM 7-1-29 the ceiling is the lowest broken or overcast layer, or the vertical visibility into an obscuration; few and scattered layers are never ceilings. Null when the observation reported no such layer.',
               ),
             ceiling_type: z
               .enum(['measured', 'indefinite'])
@@ -124,11 +124,13 @@ export const aviationGetMetar = tool('aviation_get_metar', {
               .object({
                 raw: z
                   .string()
-                  .describe('Weather group exactly as encoded (e.g., "FG", "-SHRA", "+RA BR").'),
+                  .describe(
+                    'Weather groups exactly as encoded, space-delimited (e.g., "FG", "-SHRA", "VCTS -RA").',
+                  ),
                 decoded: z
                   .string()
                   .describe(
-                    'Plain-English reading of the group (e.g., "fog", "light rain showers").',
+                    'Plain-English reading of each group, joined with "; " (e.g., "fog", "light rain showers; mist"). A group the decoder does not recognize is carried through as its own raw token rather than half-translated, so compare against raw when a reading still looks coded.',
                   ),
               })
               .nullable()
@@ -175,6 +177,39 @@ export const aviationGetMetar = tool('aviation_get_metar', {
     },
   ],
 
+  enrichment: {
+    requested: z
+      .array(z.string().describe('An ICAO station ID as requested.'))
+      .describe('Station IDs this call asked for, in the order given.'),
+    returned: z
+      .array(z.string().describe('An ICAO station ID present in the result.'))
+      .describe(
+        'Distinct station IDs that produced at least one observation. Counted per station, not per row — with hours > 1 a station reporting six times still appears once.',
+      ),
+    partial: z
+      .boolean()
+      .describe(
+        'True when a requested station produced no observation. False affirms the result covers every requested station, so full coverage is distinguishable from a short batch rather than being inferred from the count.',
+      ),
+    missing: z
+      .array(z.string().describe('A requested ICAO station ID that produced no observation.'))
+      .optional()
+      .describe('Requested station IDs absent from the result. Absent when none are missing.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Recovery guidance naming the missing station IDs. Present only on a partial result. It lists the candidate causes without asserting one — upstream omits the row either way.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    requested: { render: (ids) => `**Requested:** ${ids.join(', ')}` },
+    returned: { render: (ids) => `**Returned:** ${ids.join(', ')}` },
+    missing: { render: (ids) => `**No data returned for:** ${ids?.join(', ')}` },
+    partial: { label: 'Partial result' },
+  },
+
   async handler(input, ctx) {
     ctx.log.info('Fetching METARs', { stationIds: input.station_ids, hours: input.hours });
     const svc = getAviationWeatherService();
@@ -191,7 +226,20 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       );
     }
 
-    ctx.log.info('METARs retrieved', { count: observations.length });
+    // Upstream drops a station that produced nothing without reporting it, so a
+    // short batch is otherwise indistinguishable from a complete one. Reconcile
+    // on distinct station IDs — hours > 1 returns a row per observation.
+    const returned = [...new Set(observations.map((o) => o.station_id))];
+    const missing = input.station_ids.filter((id) => !returned.includes(id));
+    ctx.enrich({ requested: input.station_ids, returned, partial: missing.length > 0 });
+    if (missing.length > 0) {
+      ctx.enrich({ missing });
+      ctx.enrich.notice(
+        `No data returned for ${missing.join(', ')}. Three conditions produce this and the response cannot tell them apart: the ID may not be a known station, the station may transmit no METARs, or it may have reported nothing inside the ${input.hours}-hour lookback. Widen hours, or verify the IDs with aviation_find_stations.`,
+      );
+    }
+
+    ctx.log.info('METARs retrieved', { count: observations.length, missing: missing.length });
     return { observations };
   },
 

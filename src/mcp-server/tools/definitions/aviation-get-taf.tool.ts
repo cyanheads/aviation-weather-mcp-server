@@ -9,12 +9,22 @@ import { getAviationWeatherService } from '@/services/aviation-weather/aviation-
 
 const TafCloudLayerSchema = z
   .object({
-    cover: z.string().describe('Sky cover code: FEW, SCT, BKN, OVC, SKC, CLR.'),
-    base_ft: z.number().describe('Cloud base altitude in feet AGL.'),
+    cover: z
+      .string()
+      .describe(
+        'Sky cover code: FEW, SCT, BKN, OVC, SKC, or OVX. OVX is the decoded form of a VVhhh group — the sky is obscured and the base is the vertical visibility into it, not a cloud bottom.',
+      ),
+    base_ft: z
+      .number()
+      .describe(
+        'Cloud base altitude in feet AGL. On an OVX layer this is the vertical visibility into the obscuration rather than a layer bottom, and 0 is a surface-level indefinite ceiling.',
+      ),
     type: z
       .string()
       .nullable()
-      .describe('Cloud type qualifier: CB (cumulonimbus), TCU (towering cumulus), or null.'),
+      .describe(
+        'Cloud type qualifier: CB (cumulonimbus), TCU (towering cumulus), or null. An obscuration can carry one — a VV008CB group is an OVX layer with type CB.',
+      ),
   })
   .describe('A forecast cloud layer.');
 
@@ -48,16 +58,55 @@ const ForecastPeriodSchema = z
           ),
         gust_kt: z.number().nullable().describe('Forecast gust speed in knots, or null if none.'),
       })
-      .describe('Forecast wind conditions for this period.'),
+      .describe('Forecast wind conditions at the surface for this period.'),
+    wind_shear: z
+      .object({
+        height_ft: z
+          .number()
+          .describe(
+            'Top of the shear layer in feet AGL — not the layer base and not its thickness. A WS020 group is 2000 ft.',
+          ),
+        direction_deg: z
+          .number()
+          .describe(
+            'Forecast wind direction at the top of the shear layer, in degrees true — not a direction of shear.',
+          ),
+        speed_kt: z
+          .number()
+          .describe(
+            'Forecast wind speed at the top of the shear layer, in knots — the wind at that height, not the magnitude of the shear.',
+          ),
+      })
+      .nullable()
+      .describe(
+        'Forecast non-convective low-level wind shear (a WS group), confined to the surface–2,000 ft AGL band. A null means no non-convective LLWS group was issued for this period, rather than no shear expected: the group is excluded from TEMPO and PROB groups, and shear is always assumed present in convective activity.',
+      ),
     visibility_sm: z
       .string()
       .nullable()
       .describe('Forecast visibility in statute miles (e.g., "6", "1/2"). Null if not specified.'),
-    weather: z
-      .string()
+    vertical_visibility_ft: z
+      .number()
       .nullable()
       .describe(
-        'Decoded weather condition (e.g., "light rain showers", "thunderstorm with rain"). Null if none.',
+        'Vertical visibility into a forecast obscuration, in feet AGL — an indefinite ceiling, and the same height as this period OVX cloud layer. 0 is a surface-level indefinite ceiling; null means the period forecasts no obscuration.',
+      ),
+    weather: z
+      .object({
+        raw: z
+          .string()
+          .describe(
+            'Weather groups exactly as forecast, space-delimited (e.g., "-SHRA", "-SHRA BR", "VCTS -RA").',
+          ),
+        decoded: z
+          .string()
+          .describe(
+            'Plain-English reading of each group, joined with "; " (e.g., "light rain showers; mist"). A group the decoder does not recognize is carried through as its own raw token rather than half-translated, so compare against raw when a reading still looks coded.',
+          ),
+      })
+      .nullable()
+      .describe(
+        'Forecast weather for this period, or null when the period carried no weather group.',
       ),
     clouds: z.array(TafCloudLayerSchema).describe('Forecast cloud layers for this period.'),
   })
@@ -66,7 +115,7 @@ const ForecastPeriodSchema = z
 export const aviationGetTaf = tool('aviation_get_taf', {
   title: 'Get Terminal Aerodrome Forecast (TAF)',
   description:
-    'Get the Terminal Aerodrome Forecast (TAF) for one or more airports. Returns each forecast period with valid times, wind, visibility, decoded weather conditions, and cloud layers, plus the raw TAF string. TAFs cover the next 24–30 hours and are issued only for airports with scheduled commercial service; check data_types from aviation_find_stations to confirm TAF availability. Accepts 1–4 ICAO station IDs (e.g., KSEA, KJFK).',
+    'Get the Terminal Aerodrome Forecast (TAF) for one or more airports. Returns each forecast period with valid times, surface wind, low-level wind shear, visibility, decoded weather conditions, cloud layers, and the vertical visibility into a forecast obscuration, plus the raw TAF string. TAFs cover the next 24–30 hours and are issued only for airports with scheduled commercial service; check data_types from aviation_find_stations to confirm TAF availability. Accepts 1–4 ICAO station IDs (e.g., KSEA, KJFK).',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     station_ids: z
@@ -115,6 +164,37 @@ export const aviationGetTaf = tool('aviation_get_taf', {
     },
   ],
 
+  enrichment: {
+    requested: z
+      .array(z.string().describe('An ICAO station ID as requested.'))
+      .describe('Station IDs this call asked for, in the order given.'),
+    returned: z
+      .array(z.string().describe('An ICAO station ID present in the result.'))
+      .describe('Distinct station IDs that produced a forecast.'),
+    partial: z
+      .boolean()
+      .describe(
+        'True when a requested station produced no forecast. False affirms the result covers every requested station, so full coverage is distinguishable from a short batch rather than being inferred from the count.',
+      ),
+    missing: z
+      .array(z.string().describe('A requested ICAO station ID that produced no forecast.'))
+      .optional()
+      .describe('Requested station IDs absent from the result. Absent when none are missing.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Recovery guidance naming the missing station IDs. Present only on a partial result. It lists the candidate causes without asserting one — upstream omits the row either way.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    requested: { render: (ids) => `**Requested:** ${ids.join(', ')}` },
+    returned: { render: (ids) => `**Returned:** ${ids.join(', ')}` },
+    missing: { render: (ids) => `**No forecast returned for:** ${ids?.join(', ')}` },
+    partial: { label: 'Partial result' },
+  },
+
   async handler(input, ctx) {
     ctx.log.info('Fetching TAFs', { stationIds: input.station_ids });
     const svc = getAviationWeatherService();
@@ -127,7 +207,20 @@ export const aviationGetTaf = tool('aviation_get_taf', {
       });
     }
 
-    ctx.log.info('TAFs retrieved', { count: forecasts.length });
+    // Upstream drops a station that issued no forecast without reporting it, so
+    // a route check asking for departure, destination, and alternate cannot see
+    // which leg came back empty — or that anything is missing at all.
+    const returned = [...new Set(forecasts.map((f) => f.station_id))];
+    const missing = input.station_ids.filter((id) => !returned.includes(id));
+    ctx.enrich({ requested: input.station_ids, returned, partial: missing.length > 0 });
+    if (missing.length > 0) {
+      ctx.enrich({ missing });
+      ctx.enrich.notice(
+        `No forecast returned for ${missing.join(', ')}. Two conditions produce this and the response cannot tell them apart: the ID may not be a known station, or the station may issue no TAFs. Check data_types from aviation_find_stations to confirm TAF capability.`,
+      );
+    }
+
+    ctx.log.info('TAFs retrieved', { count: forecasts.length, missing: missing.length });
     return { forecasts };
   },
 
@@ -156,10 +249,28 @@ export const aviationGetTaf = tool('aviation_get_taf', {
           lines.push('**Wind:** not specified');
         }
 
+        // Omitted rather than negated: a null is no LLWS group in a period that
+        // can carry one, which is not a forecast of smooth air.
+        if (period.wind_shear) {
+          lines.push(
+            `**Wind shear:** layer top ${period.wind_shear.height_ft} ft AGL, forecast wind ${period.wind_shear.direction_deg}° at ${period.wind_shear.speed_kt} kt`,
+          );
+        }
+
         lines.push(
           `**Visibility:** ${period.visibility_sm != null ? `${period.visibility_sm} sm` : 'not specified'}`,
         );
-        lines.push(`**Weather:** ${period.weather ?? 'not specified'}`);
+        lines.push(
+          `**Weather:** ${period.weather ? `${period.weather.raw} (${period.weather.decoded})` : 'not specified'}`,
+        );
+        // A forecast vertical visibility of 0 is a surface-level indefinite
+        // ceiling — the most hazardous value the field holds, and the one a
+        // truthiness guard drops.
+        if (period.vertical_visibility_ft != null) {
+          lines.push(
+            `**Vertical visibility:** ${period.vertical_visibility_ft} ft AGL (indefinite ceiling)`,
+          );
+        }
         if (period.clouds.length > 0) {
           const cloudStr = period.clouds
             .map((c) => `${c.cover} @ ${c.base_ft} ft${c.type ? ` (${c.type})` : ''}`)
