@@ -3,6 +3,7 @@
  * @module tests/tools/aviation-get-pireps.tool.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { aviationGetPireps } from '@/mcp-server/tools/definitions/aviation-get-pireps.tool.js';
@@ -18,10 +19,7 @@ vi.mock('@/services/aviation-weather/aviation-weather-service.js', () => ({
 
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 
-const mockFetchPireps = vi.fn<
-  Parameters<ReturnType<typeof getAviationWeatherService>['fetchPireps']>,
-  ReturnType<ReturnType<typeof getAviationWeatherService>['fetchPireps']>
->();
+const mockFetchPireps = vi.fn<ReturnType<typeof getAviationWeatherService>['fetchPireps']>();
 
 beforeEach(() => {
   vi.mocked(getAviationWeatherService).mockReturnValue({
@@ -120,7 +118,7 @@ describe('aviationGetPireps', () => {
 
     // Only the FL270 pirep passes the filter
     expect(result.pireps).toHaveLength(1);
-    expect(result.pireps[0].altitude_ft).toBe(27000);
+    expect(result.pireps[0]!.altitude_ft).toBe(27000);
   });
 
   it('applies altitude_max_ft client-side filter', async () => {
@@ -134,7 +132,7 @@ describe('aviationGetPireps', () => {
 
     // Only the FL080 pirep passes the filter
     expect(result.pireps).toHaveLength(1);
-    expect(result.pireps[0].altitude_ft).toBe(8000);
+    expect(result.pireps[0]!.altitude_ft).toBe(8000);
   });
 
   it('sorts pireps by observed_at descending', async () => {
@@ -145,8 +143,8 @@ describe('aviationGetPireps', () => {
     const result = await aviationGetPireps.handler(input, ctx);
 
     // Most recent first
-    expect(result.pireps[0].observed_at).toBe(pirep.observed_at);
-    expect(result.pireps[1].observed_at).toBe(minimalPirep.observed_at);
+    expect(result.pireps[0]!.observed_at).toBe(pirep.observed_at);
+    expect(result.pireps[1]!.observed_at).toBe(minimalPirep.observed_at);
   });
 
   it('throws missing_location when neither station_id nor bbox provided', async () => {
@@ -255,10 +253,197 @@ describe('aviationGetPireps', () => {
     const input = aviationGetPireps.input.parse({ station_id: 'KSEA' });
     const result = await aviationGetPireps.handler(input, ctx);
 
-    expect(result.pireps[0].turbulence).toHaveLength(2);
-    expect(result.pireps[0].icing).toHaveLength(2);
-    expect(result.pireps[0].turbulence[0].intensity).toBe('MOD');
-    expect(result.pireps[0].icing[1].intensity).toBe('MOD');
+    const report = result.pireps[0]!;
+    expect(report.turbulence).toHaveLength(2);
+    expect(report.icing).toHaveLength(2);
+    expect(report.turbulence[0]!.intensity).toBe('MOD');
+    expect(report.icing[1]!.intensity).toBe('MOD');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// distance_nm scope (issue #19) — the radius only means something relative to
+// a station_id center point; a bbox search has nothing to measure from
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps distance_nm scope', () => {
+  it('throws conflicting_distance when distance_nm accompanies bbox', async () => {
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      bbox: { minLat: 45.0, minLon: -125.0, maxLat: 49.0, maxLon: -116.0 },
+      distance_nm: 250,
+    });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'conflicting_distance' },
+    });
+    expect(mockFetchPireps).not.toHaveBeenCalled();
+  });
+
+  it('throws conflicting_distance for an explicit distance_nm of 100 with bbox', async () => {
+    // 100 is the radius a station_id search falls back to. Passing it
+    // explicitly alongside bbox must still be refused, so the guard cannot be
+    // keyed on the value.
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      bbox: { minLat: 45.0, minLon: -125.0, maxLat: 49.0, maxLon: -116.0 },
+      distance_nm: 100,
+    });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'conflicting_distance' },
+    });
+    expect(mockFetchPireps).not.toHaveBeenCalled();
+  });
+
+  it('conflicting_distance recovery points at both ways out', async () => {
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      bbox: { minLat: 45.0, minLon: -125.0, maxLat: 49.0, maxLon: -116.0 },
+      distance_nm: 250,
+    });
+
+    let thrown: unknown;
+    try {
+      await aviationGetPireps.handler(input, ctx);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeDefined();
+    const err = thrown as { data?: { recovery?: { hint?: string } } };
+    expect(err.data?.recovery?.hint).toContain('distance_nm');
+    expect(err.data?.recovery?.hint).toContain('station_id');
+  });
+
+  it('throws invalid_bbox ahead of conflicting_distance for an inverted bbox', async () => {
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      bbox: { minLat: 49, minLon: -66, maxLat: 25, maxLon: -125 },
+      distance_nm: 250,
+    });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_bbox' },
+    });
+    expect(mockFetchPireps).not.toHaveBeenCalled();
+  });
+
+  it('omits distanceNm from the service call for a bbox query', async () => {
+    mockFetchPireps.mockResolvedValue([pirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      bbox: { minLat: 45.0, minLon: -125.0, maxLat: 49.0, maxLon: -116.0 },
+    });
+    await aviationGetPireps.handler(input, ctx);
+
+    expect(mockFetchPireps.mock.calls[0]![0]).not.toHaveProperty('distanceNm');
+  });
+
+  it('forwards an explicit distance_nm for a station_id query', async () => {
+    mockFetchPireps.mockResolvedValue([pirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KSEA', distance_nm: 250 });
+    await aviationGetPireps.handler(input, ctx);
+
+    expect(mockFetchPireps).toHaveBeenCalledWith(
+      expect.objectContaining({ stationId: 'KSEA', distanceNm: 250 }),
+      ctx,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Altitude range ordering (issue #19)
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps altitude range', () => {
+  it('throws invalid_altitude_range when the bounds are inverted', async () => {
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      station_id: 'KSEA',
+      altitude_min_ft: 30000,
+      altitude_max_ft: 10000,
+    });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_altitude_range' },
+    });
+    expect(mockFetchPireps).not.toHaveBeenCalled();
+  });
+
+  it('throws invalid_altitude_range in bbox mode too', async () => {
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      bbox: { minLat: 45.0, minLon: -125.0, maxLat: 49.0, maxLon: -116.0 },
+      altitude_min_ft: 30000,
+      altitude_max_ft: 10000,
+    });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_altitude_range' },
+    });
+    expect(mockFetchPireps).not.toHaveBeenCalled();
+  });
+
+  it('accepts equal bounds as a valid degenerate range', async () => {
+    mockFetchPireps.mockResolvedValue([pirep, minimalPirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      station_id: 'KSEA',
+      altitude_min_ft: 27000,
+      altitude_max_ft: 27000,
+    });
+    const result = await aviationGetPireps.handler(input, ctx);
+
+    expect(result.pireps).toHaveLength(1);
+    expect(result.pireps[0]!.altitude_ft).toBe(27000);
+  });
+
+  it('accepts a correctly-ordered range', async () => {
+    mockFetchPireps.mockResolvedValue([pirep, minimalPirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      station_id: 'KSEA',
+      altitude_min_ft: 5000,
+      altitude_max_ft: 10000,
+    });
+    const result = await aviationGetPireps.handler(input, ctx);
+
+    expect(result.pireps).toHaveLength(1);
+    expect(result.pireps[0]!.altitude_ft).toBe(8000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Input schema surface
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps.input', () => {
+  it('leaves distance_nm undefined when omitted', () => {
+    // The handler needs to tell "omitted" from an explicit value, so the
+    // schema must not stamp a default over the difference.
+    expect(aviationGetPireps.input.parse({ station_id: 'KSEA' }).distance_nm).toBeUndefined();
+  });
+
+  it('keeps the 10–500 nm distance_nm bounds', () => {
+    expect(aviationGetPireps.input.parse({ station_id: 'KSEA', distance_nm: 10 }).distance_nm).toBe(
+      10,
+    );
+    expect(
+      aviationGetPireps.input.parse({ station_id: 'KSEA', distance_nm: 500 }).distance_nm,
+    ).toBe(500);
+    expect(() => aviationGetPireps.input.parse({ station_id: 'KSEA', distance_nm: 9 })).toThrow();
+    expect(() => aviationGetPireps.input.parse({ station_id: 'KSEA', distance_nm: 501 })).toThrow();
+  });
+
+  it('keeps the hours default at 3 and its 1–12 bounds', () => {
+    expect(aviationGetPireps.input.parse({ station_id: 'KSEA' }).hours).toBe(3);
+    expect(aviationGetPireps.input.parse({ station_id: 'KSEA', hours: 1 }).hours).toBe(1);
+    expect(aviationGetPireps.input.parse({ station_id: 'KSEA', hours: 12 }).hours).toBe(12);
+    expect(() => aviationGetPireps.input.parse({ station_id: 'KSEA', hours: 0 })).toThrow();
+    expect(() => aviationGetPireps.input.parse({ station_id: 'KSEA', hours: 13 })).toThrow();
   });
 });
 

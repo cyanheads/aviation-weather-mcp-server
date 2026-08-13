@@ -8,7 +8,7 @@
 |:-----|:------------|:-----------|:------------|
 | `aviation_get_metar` | Current weather observations for one or more airports. Returns decoded fields (wind direction/speed/gusts, visibility, ceiling, temp/dewpoint, altimeter, cloud layers) plus the computed flight category (VFR/MVFR/IFR/LIFR) and the raw METAR string. Accepts 1–10 ICAO station IDs. | `station_ids: string[]`, `hours?: number (1–12, default 1)` | `readOnlyHint: true, idempotentHint: true` |
 | `aviation_get_taf` | Terminal Aerodrome Forecast for one or more airports. Returns each forecast period with valid times, wind, visibility, weather codes, and cloud layers, plus the raw TAF string. Accepts 1–4 ICAO station IDs. | `station_ids: string[]` | `readOnlyHint: true, idempotentHint: true` |
-| `aviation_get_pireps` | Recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence/icing/cloud reports with altitude, aircraft type, intensity, and the raw pirep string. | `station_id?: string`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `distance_nm?: number (default 100)`, `hours?: number (1–12, default 3)` | `readOnlyHint: true, idempotentHint: true` |
+| `aviation_get_pireps` | Recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence/icing/cloud reports with altitude, aircraft type, intensity, and the raw pirep string. | `station_id?: string`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `distance_nm?: number (station_id only, 100 when omitted)`, `hours?: number (1–12, default 3)` | `readOnlyHint: true, idempotentHint: true` |
 | `aviation_get_advisories` | Active SIGMETs and AIRMETs for a region. Returns each advisory with hazard type (CONVECTIVE, TURBULENCE, ICING, IFR, MTN OBSCN), severity, altitude range, valid period, polygon coordinates, and raw text. Accepts optional hazard filter or bounding box. | `hazard?: enum`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `advisory_type?: 'sigmet' \| 'airmet' \| 'all'` | `readOnlyHint: true, idempotentHint: true` |
 | `aviation_find_stations` | Resolve an airport or weather reporting station by ICAO ID, or discover stations within a bounding box or US state. Returns ICAO/IATA/FAA IDs, coordinates, elevation, and available data types. | `station_ids?: string[]`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `state?: string (2-letter)` | `readOnlyHint: true, idempotentHint: true, openWorldHint: false` |
 
@@ -88,7 +88,7 @@ Each step is independently testable.
 | Station | find by ICAO IDs, find by bbox, find by US state | `GET /stationinfo` |
 | METAR | get current/recent by ICAO IDs | `GET /metar?ids=&format=json&hours=` |
 | TAF | get current by ICAO IDs | `GET /taf?ids=&format=json` |
-| PIREP | list recent by station + distance, or by bbox | `GET /pirep?id=&format=json&distance=&hours=` |
+| PIREP | list recent by station + distance, or by bbox | `GET /pirep?id=&format=json&distance=&age=` |
 | AIRSIGMET | list active by type and/or bbox | `GET /airsigmet?format=json&type=` |
 
 ---
@@ -167,13 +167,15 @@ raw_taf: string              // rawTAF
 ```
 station_id: z.string().regex(/^[A-Z]{4}$/).optional().describe('Center ICAO station for radial search.')
 bbox: z.object({ minLat, minLon, maxLat, maxLon }).optional()
-distance_nm: z.number().int().min(10).max(500).default(100).describe('Search radius in nautical miles around station_id.')
+distance_nm: z.number().int().min(10).max(500).optional().describe('Search radius in nautical miles around station_id. 100 when omitted.')
 hours: z.number().int().min(1).max(12).default(3).describe('How far back to look.')
 altitude_min_ft: z.number().int().optional().describe('Filter by minimum altitude in feet MSL (e.g., 18000 for FL180).')
 altitude_max_ft: z.number().int().optional().describe('Filter by maximum altitude in feet MSL (e.g., 35000 for FL350).')
 ```
 
 Note: `station_id` or `bbox` is required (mutually exclusive, validate in handler).
+
+`distance_nm` carries no schema default — the handler must tell an omitted value from an explicit one to reject `bbox` + `distance_nm`, so the 100 nm fallback is applied on the `station_id` path instead.
 
 **Output schema (per PIREP):**
 ```
@@ -204,8 +206,14 @@ raw_pirep: string            // rawOb
 **Error contract:**
 ```
 { reason: 'no_pireps_found', code: NotFound, when: 'No pilot reports found in the search area/time window', recovery: 'Expand the distance_nm or hours parameters, or try a different region. PIREPs are sparse; absence of reports does not mean smooth conditions.' }
-{ reason: 'missing_location', code: InvalidParams, when: 'Neither station_id nor bbox provided', recovery: 'Provide station_id for a radial search or bbox for an area search.' }
+{ reason: 'missing_location', code: ValidationError, when: 'Neither station_id nor bbox provided', recovery: 'Provide station_id for a radial search or bbox for an area search.' }
+{ reason: 'conflicting_location', code: ValidationError, when: 'Both station_id and bbox provided', recovery: 'Provide station_id OR bbox, not both.' }
+{ reason: 'invalid_bbox', code: ValidationError, when: 'The bounding box is inverted', recovery: 'Ensure minLat <= maxLat and minLon <= maxLon.' }
+{ reason: 'conflicting_distance', code: ValidationError, when: 'distance_nm provided together with bbox', recovery: 'Drop distance_nm, or replace bbox with station_id.' }
+{ reason: 'invalid_altitude_range', code: ValidationError, when: 'altitude_min_ft > altitude_max_ft', recovery: 'Ensure altitude_min_ft <= altitude_max_ft, or drop one bound.' }
 ```
+
+Guard order is `missing_location` → `conflicting_location` → `invalid_bbox` → `conflicting_distance` → `invalid_altitude_range`, so a location-mode mistake is always reported ahead of a filter mistake. Equal altitude bounds are a valid degenerate range, mirroring `isBboxOrdered`'s `<=`.
 
 ### `aviation_get_advisories`
 
@@ -244,12 +252,12 @@ raw_text: string             // rawAirSigmet
 ```
 station_ids: z.array(z.string()).min(1).max(20).optional().describe('One or more 4-letter ICAO station IDs. Lookup is ICAO-only; 3-letter IATA codes return no results.')
 bbox: z.object({ minLat, minLon, maxLat, maxLon }).optional().describe('Return all stations in bounding box.')
-state: z.string().length(2).optional().describe('Two-letter US state abbreviation (e.g., "WA").')
+state: z.string().length(2).optional().describe('Two-letter USPS code for one of the 50 US states or DC (e.g., "WA").')
 ```
 
-At least one of `station_ids`, `bbox`, or `state` is required.
+Exactly one of `station_ids`, `bbox`, or `state` is required.
 
-**Note:** The API requires either `ids` or `bbox` — `state` is not a supported API filter. For `state` queries, the tool will use a pre-built bbox approximation per state, then client-side filter by the `state` field in the response.
+**Note:** The API requires either `ids` or `bbox` — `state` is not a supported API filter. For `state` queries, the tool uses a pre-built bbox approximation per state (`src/services/aviation-weather/state-bboxes.ts`), then client-side filters by the `state` field in the response. The table covers the 50 states plus DC; anything else is rejected handler-side by `isSupportedState` before a request goes out.
 
 **Output schema (per station):**
 ```
@@ -267,7 +275,13 @@ data_types: string[]         // siteType: ['METAR', 'TAF', etc.]
 **Error contract:**
 ```
 { reason: 'station_not_found', code: NotFound, when: 'None of the requested IDs match any known station', recovery: 'Station IDs must be 4-letter ICAO format (e.g., KSEA, not SEA). Use bbox or state to discover ICAO IDs by location.' }
+{ reason: 'missing_search_criteria', code: ValidationError, when: 'None of station_ids, bbox, or state provided', recovery: 'Provide exactly one of station_ids, bbox, or state.' }
+{ reason: 'conflicting_location', code: ValidationError, when: 'More than one of station_ids, bbox, or state provided', recovery: 'Provide exactly one location mode per call.' }
+{ reason: 'invalid_bbox', code: ValidationError, when: 'The bounding box is inverted', recovery: 'Ensure minLat <= maxLat and minLon <= maxLon.' }
+{ reason: 'invalid_state', code: ValidationError, when: 'The state code is not one of the 50 US states or DC', recovery: 'Use a USPS code for a state or DC; territories are unsupported — search them with bbox.' }
 ```
+
+`conflicting_location` is checked ahead of `invalid_state`, so combining a bogus `state` with another location mode reports the mode conflict.
 
 ---
 
@@ -283,7 +297,11 @@ During live probing, `type=airmet` and `type=sigmet` both returned only SIGMETs 
 The AWC Data API does not geocode. All tools take ICAO station IDs or coordinates as input. `aviation_find_stations` provides the lookup from human-readable names via bbox/state queries. Agents needing "nearest airport to lat/lon" should chain with `openstreetmap-mcp-server`.
 
 **4. `stationinfo` with `state` uses bbox workaround.**
-The API does not accept a `state` query parameter for `stationinfo`. The live probe with `state=WA` returned `{"status":"error","error":"Must specify station IDs or bounding box, zoom, and density"}`. The service will maintain a state→approximate-bbox table and client-side filter the results by the `state` field.
+The API does not accept a `state` query parameter for `stationinfo`. The live probe with `state=WA` returned `{"status":"error","error":"Must specify station IDs or bounding box, zoom, and density"}`. The service maintains a state→approximate-bbox table and client-side filters the results by the `state` field.
+
+The table covers the 50 states plus DC. DC is a real AWC jurisdiction but holds exactly one station — `WASD2` ("Washington DC"), a mesonet site with every identifier null; the region's airports (KDCA, KIAD, KBWI) carry `VA` or `MD`. US territories (PR, VI, GU, MP, AS) are deliberately excluded: AWC leaves `state` empty on their stations and identifies them by `country`, so a bbox entry would filter down to zero rows rather than working. Supporting them needs a country-based filter path, not another table row.
+
+Validation lives in the handler rather than a schema `z.enum()`: an enum mismatch is raised by the SDK transport as JSON-RPC -32602 before the handler runs, which bypasses the tool's typed `reason`/`recovery` contract.
 
 **5. PIREPs use `icaoId: "KWBC"` for the center — not the station queried.**
 All PIREP responses have `icaoId` set to `KWBC` (the collection center), not the station the search was centered on. The actual location is in `lat`/`lon`. This is a quirk of the API and should be documented in the service layer.
@@ -293,6 +311,12 @@ The AIRSIGMET endpoint doesn't support bbox filtering in the API itself. The ser
 
 **7. Prompt included despite read-only server.**
 The `aviation_preflight_brief` prompt earns its place: a preflight briefing has a well-established structure (METAR → TAF → PIREPs → advisories) that agents frequently get wrong by omitting steps. The prompt encodes the correct sequence and synthesis pattern.
+
+**8. The PIREP lookback parameter is `age`, not `hours`.**
+`/pirep` declares `id, distance, bbox, format, age, level, inten, date` — no `hours`. The endpoint returns HTTP 200 and silently drops query keys it does not recognize, so sending `hours` produced the same fixed window for every value in both query modes. `/metar` and `/taf` do define a separate, correctly-named `hours` parameter, so the mismatch is specific to `/pirep`. The tool's public `hours` input keeps its name; only the outgoing key differs.
+
+**9. `distance_nm` alongside `bbox` is rejected, not forwarded.**
+A live sweep against a fixed bbox with `distance` at 1, 10, 50, 100, 200, 500 and omitted returned byte-identical PIREP sets — upstream ignores `distance` without an `id` center point to measure from, so there is nothing to forward it to. Rejecting the combination is the only way the caller learns the radius did nothing.
 
 ---
 
@@ -313,8 +337,9 @@ The `aviation_preflight_brief` prompt earns its place: a preflight briefing has 
 **Common parameters:**
 - `format=json` — required for JSON responses (default is plain text)
 - `ids=KSEA,KJFK` — comma-separated ICAO IDs for station-keyed endpoints
-- `hours=N` — lookback window (METAR: 1–12 typical; PIREP: 1–12)
-- `distance=N` — radius in nautical miles for PIREP searches
+- `hours=N` — lookback window for `metar` and `taf` (METAR: 1–12 typical)
+- `age=N` — lookback window ("Hours Back") for `pirep`; that endpoint has no `hours` parameter and silently ignores one
+- `distance=N` — radius in nautical miles around the `id` center point for PIREP searches; ignored when the search is a bbox
 
 **Timestamp fields are Unix epoch seconds (integers), not ISO strings.** Applies to: METAR `obsTime`, TAF `validTimeFrom`/`validTimeTo`, AIRSIGMET `validTimeFrom`/`validTimeTo`. Convert via `new Date(value * 1000).toISOString()`. METAR `receiptTime`/`reportTime` and TAF `issueTime` are already ISO 8601 strings.
 

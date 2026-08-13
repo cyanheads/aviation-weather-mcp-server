@@ -3,6 +3,7 @@
  * @module tests/tools/aviation-find-stations.tool.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { aviationFindStations } from '@/mcp-server/tools/definitions/aviation-find-stations.tool.js';
@@ -18,10 +19,7 @@ vi.mock('@/services/aviation-weather/aviation-weather-service.js', () => ({
 
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 
-const mockFetchStations = vi.fn<
-  Parameters<ReturnType<typeof getAviationWeatherService>['fetchStations']>,
-  ReturnType<ReturnType<typeof getAviationWeatherService>['fetchStations']>
->();
+const mockFetchStations = vi.fn<ReturnType<typeof getAviationWeatherService>['fetchStations']>();
 
 beforeEach(() => {
   vi.mocked(getAviationWeatherService).mockReturnValue({
@@ -60,6 +58,24 @@ const kbfi: NormalizedStation = {
   data_types: ['METAR'],
 };
 
+/**
+ * The only station AWC reports under state DC — a mesonet site with no ICAO,
+ * IATA, or FAA identifier and no data products. DC proper has no airport of its
+ * own; KDCA/KIAD/KBWI all carry VA or MD.
+ */
+const wasd2: NormalizedStation = {
+  icao_id: null,
+  iata_id: null,
+  faa_id: null,
+  name: 'Washington DC',
+  lat: 38.87,
+  lon: -77.02,
+  elevation_ft: 0,
+  state: 'DC',
+  country: 'US',
+  data_types: [],
+};
+
 // ---------------------------------------------------------------------------
 // Handler tests
 // ---------------------------------------------------------------------------
@@ -72,8 +88,9 @@ describe('aviationFindStations', () => {
     const result = await aviationFindStations.handler(input, ctx);
 
     expect(result.stations).toHaveLength(1);
-    expect(result.stations[0].icao_id).toBe('KSEA');
-    expect(result.stations[0].data_types).toContain('METAR');
+    const station = result.stations[0]!;
+    expect(station.icao_id).toBe('KSEA');
+    expect(station.data_types).toContain('METAR');
   });
 
   it('returns multiple stations from a bbox query', async () => {
@@ -196,8 +213,109 @@ describe('aviationFindStations', () => {
     const input = aviationFindStations.input.parse({ station_ids: ['KSEA'] });
     const result = await aviationFindStations.handler(input, ctx);
 
-    expect(result.stations[0].iata_id).toBeNull();
-    expect(result.stations[0].faa_id).toBeNull();
+    const station = result.stations[0]!;
+    expect(station.iata_id).toBeNull();
+    expect(station.faa_id).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// State validation (issue #20)
+// ---------------------------------------------------------------------------
+
+describe('aviationFindStations state validation', () => {
+  it('throws invalid_state for a code with no bounding box', async () => {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ state: 'ZZ' });
+
+    await expect(aviationFindStations.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_state' },
+    });
+    expect(mockFetchStations).not.toHaveBeenCalled();
+  });
+
+  it('names the rejected code and points at the supported set', async () => {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ state: 'ZZ' });
+
+    let thrown: unknown;
+    try {
+      await aviationFindStations.handler(input, ctx);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeDefined();
+    const err = thrown as { message: string; data?: { recovery?: { hint?: string } } };
+    expect(err.message).toContain('ZZ');
+    expect(err.data?.recovery?.hint).toContain('DC');
+    expect(err.data?.recovery?.hint).toMatch(/territor/i);
+  });
+
+  /**
+   * AWC leaves `state` empty on territory stations, so a bbox entry would
+   * return zero stations rather than working. Typed guidance beats a silent
+   * empty result until a country-based filter path exists.
+   */
+  it.each(['PR', 'VI', 'GU', 'MP', 'AS'])(
+    'throws invalid_state for the %s territory',
+    async (code) => {
+      const ctx = createMockContext({ errors: aviationFindStations.errors });
+      const input = aviationFindStations.input.parse({ state: code });
+
+      await expect(aviationFindStations.handler(input, ctx)).rejects.toMatchObject({
+        data: { reason: 'invalid_state' },
+      });
+      expect(mockFetchStations).not.toHaveBeenCalled();
+    },
+  );
+
+  it('returns stations for a DC query', async () => {
+    mockFetchStations.mockResolvedValue([wasd2]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ state: 'DC' });
+    const result = await aviationFindStations.handler(input, ctx);
+
+    expect(mockFetchStations).toHaveBeenCalledWith(expect.objectContaining({ state: 'DC' }), ctx);
+    expect(result.stations.every((s) => s.state === 'DC')).toBe(true);
+  });
+
+  it('accepts a lowercase state code', async () => {
+    mockFetchStations.mockResolvedValue([ksea, kbfi]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ state: 'wa' });
+    const result = await aviationFindStations.handler(input, ctx);
+
+    expect(result.stations).toHaveLength(2);
+    expect(mockFetchStations).toHaveBeenCalledWith(expect.objectContaining({ state: 'wa' }), ctx);
+  });
+
+  it('throws conflicting_location ahead of invalid_state', async () => {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: ['KSEA'], state: 'ZZ' });
+
+    await expect(aviationFindStations.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'conflicting_location' },
+    });
+    expect(mockFetchStations).not.toHaveBeenCalled();
+  });
+
+  it('leaves the station_ids and bbox modes untouched', async () => {
+    mockFetchStations.mockResolvedValue([ksea]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+
+    await aviationFindStations.handler(
+      aviationFindStations.input.parse({ station_ids: ['KSEA'] }),
+      ctx,
+    );
+    await aviationFindStations.handler(
+      aviationFindStations.input.parse({
+        bbox: { minLat: 47.0, minLon: -123.0, maxLat: 48.0, maxLon: -122.0 },
+      }),
+      ctx,
+    );
+
+    expect(mockFetchStations).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -228,5 +346,16 @@ describe('aviationFindStations.format', () => {
     const text = (blocks[0] as { type: string; text: string }).text;
     // Should still render, just without IATA/FAA labels
     expect(text).toContain('KSEA');
+  });
+
+  it('renders an identifier-less station without a dangling ID label', () => {
+    const blocks = aviationFindStations.format!({ stations: [wasd2] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('Washington DC');
+    expect(text).toContain('38.8700, -77.0200');
+    expect(text).toContain('DC, US');
+    // No identifier of any kind exists — the IDs label must not render empty.
+    expect(text).not.toMatch(/^\*\*IDs:\*\*\s*$/m);
   });
 });

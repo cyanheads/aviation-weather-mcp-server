@@ -75,10 +75,13 @@ const PirepCloudLayerSchema = z
   })
   .describe('A cloud layer with base and top altitudes.');
 
+/** Radius applied to a station_id search when distance_nm is omitted. */
+const DEFAULT_DISTANCE_NM = 100;
+
 export const aviationGetPireps = tool('aviation_get_pireps', {
   title: 'Get Pilot Reports (PIREPs)',
   description:
-    'Get recent Pilot Reports (PIREPs) near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, and the raw PIREP string. Requires either station_id (ICAO center point for radial search, e.g., KSEA) or bbox (area search) — not both. Coverage is US-centric; PIREPs are sparse and absence of reports does not imply smooth conditions.',
+    'Get recent Pilot Reports (PIREPs) near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, and the raw PIREP string. Requires either station_id (ICAO center point for radial search, e.g., KSEA) or bbox (area search) — not both. distance_nm belongs to the station_id search only, and altitude_min_ft must not exceed altitude_max_ft. Coverage is US-centric; PIREPs are sparse and absence of reports does not imply smooth conditions.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     station_id: z
@@ -94,9 +97,9 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       .int()
       .min(10)
       .max(500)
-      .default(100)
+      .optional()
       .describe(
-        'Search radius in nautical miles around station_id. Only used when station_id is provided. Default 100.',
+        'Search radius in nautical miles around station_id, defaulting to 100 when omitted. Belongs to the station_id search only — supplying it alongside bbox is rejected.',
       ),
     hours: z
       .number()
@@ -193,6 +196,20 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       recovery:
         'Ensure minLat <= maxLat and minLon <= maxLon. Swap the inverted min/max coordinates and retry.',
     },
+    {
+      reason: 'conflicting_distance',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'distance_nm was provided together with bbox, where a search radius has no meaning.',
+      recovery:
+        'Drop distance_nm to search the bbox as drawn, or replace bbox with station_id to run a radial search at that distance.',
+    },
+    {
+      reason: 'invalid_altitude_range',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'altitude_min_ft is greater than altitude_max_ft, so no report can match both bounds.',
+      recovery:
+        'Ensure altitude_min_ft <= altitude_max_ft. Swap the two values, or drop one to filter on a single bound.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -220,19 +237,40 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       );
     }
 
+    if (input.bbox && input.distance_nm != null) {
+      throw ctx.fail(
+        'conflicting_distance',
+        'distance_nm is a radius around station_id and has no effect on a bbox search.',
+        { ...ctx.recoveryFor('conflicting_distance') },
+      );
+    }
+
+    // Client-side altitude filter bounds (capture so TypeScript narrows in the
+    // filter callbacks below). Equal bounds are a valid, if narrow, range.
+    const altMin = input.altitude_min_ft;
+    const altMax = input.altitude_max_ft;
+    if (altMin != null && altMax != null && altMin > altMax) {
+      throw ctx.fail(
+        'invalid_altitude_range',
+        `Altitude range is inverted: altitude_min_ft (${altMin.toLocaleString()}) must be <= altitude_max_ft (${altMax.toLocaleString()}).`,
+        { ...ctx.recoveryFor('invalid_altitude_range') },
+      );
+    }
+
+    const radiusNm = input.distance_nm ?? DEFAULT_DISTANCE_NM;
+
     ctx.log.info('Fetching PIREPs', {
       stationId: input.station_id,
       hasBbox: !!input.bbox,
-      distanceNm: input.distance_nm,
+      ...(input.station_id ? { distanceNm: radiusNm } : {}),
       hours: input.hours,
     });
 
     const svc = getAviationWeatherService();
     let pireps = await svc.fetchPireps(
       {
-        ...(input.station_id ? { stationId: input.station_id } : {}),
+        ...(input.station_id ? { stationId: input.station_id, distanceNm: radiusNm } : {}),
         ...(input.bbox ? { bbox: input.bbox } : {}),
-        distanceNm: input.distance_nm,
         hours: input.hours,
       },
       ctx,
@@ -240,9 +278,6 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
 
     const rawCount = pireps.length;
 
-    // Client-side altitude filter (capture to const so TypeScript narrows inside the callback)
-    const altMin = input.altitude_min_ft;
-    const altMax = input.altitude_max_ft;
     if (altMin != null) pireps = pireps.filter((p) => p.altitude_ft >= altMin);
     if (altMax != null) pireps = pireps.filter((p) => p.altitude_ft <= altMax);
 

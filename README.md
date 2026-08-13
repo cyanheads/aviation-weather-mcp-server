@@ -45,7 +45,7 @@ Resolve and discover weather stations by multiple search modes.
 
 - Look up one or more stations by 4-letter ICAO ID (up to 20 IDs per call) — lookup is ICAO-only, but each returned record includes its IATA/FAA aliases when available
 - Discover all stations within a geographic bounding box
-- List stations for a US state via two-letter abbreviation (uses bbox + client-side state filter)
+- List stations for one of the 50 US states or DC via two-letter USPS code (uses bbox + client-side state filter)
 - Returns `data_types` (METAR, TAF, etc.) so agents can confirm what's available before querying
 
 ---
@@ -75,9 +75,9 @@ Fetch Terminal Aerodrome Forecasts for 1–4 airports.
 
 Search for recent Pilot Reports by station+radius or bounding box.
 
-- `station_id` + `distance_nm` (10–500 nm, default 100) for radial search around an airport
-- `bbox` for geographic area search — useful for en-route corridor checks
-- `altitude_min_ft` / `altitude_max_ft` filters to isolate reports at cruise altitude
+- `station_id` + `distance_nm` (10–500 nm, 100 when omitted) for radial search around an airport
+- `bbox` for geographic area search — useful for en-route corridor checks; `distance_nm` has no meaning here and is rejected alongside it
+- `altitude_min_ft` / `altitude_max_ft` filters to isolate reports at cruise altitude, either bound alone or both (min must not exceed max)
 - Turbulence and icing arrays include up to two layers per report (as reported by the API)
 - Note: absence of PIREPs does not mean smooth conditions — they are sparse by nature
 

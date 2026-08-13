@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
+import { isSupportedState } from '@/services/aviation-weather/state-bboxes.js';
 
 /** Bounding box schema shared across tools. */
 const BboxSchema = z
@@ -46,7 +47,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
       .length(2)
       .optional()
       .describe(
-        'Two-letter US state abbreviation (e.g., "WA") to list all stations in that state.',
+        'Two-letter USPS code for one of the 50 US states or DC (e.g., "WA") to list all stations in that jurisdiction. US territories are not supported — use bbox for those.',
       ),
   }),
   output: z.object({
@@ -105,6 +106,13 @@ export const aviationFindStations = tool('aviation_find_stations', {
       recovery:
         'Ensure minLat <= maxLat and minLon <= maxLon. Swap the inverted min/max coordinates and retry.',
     },
+    {
+      reason: 'invalid_state',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The state code is not one of the 50 US states or DC.',
+      recovery:
+        'Use a USPS two-letter code for one of the 50 US states or DC (e.g., WA, TX, DC). US territories such as PR, VI, GU, MP, and AS are not supported — their stations carry no state value upstream, so search them with bbox instead.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -136,6 +144,12 @@ export const aviationFindStations = tool('aviation_find_stations', {
         'Bounding box is inverted: minLat must be <= maxLat and minLon <= maxLon.',
         { ...ctx.recoveryFor('invalid_bbox') },
       );
+    }
+
+    if (input.state && !isSupportedState(input.state)) {
+      throw ctx.fail('invalid_state', `Unsupported state code: ${input.state}.`, {
+        ...ctx.recoveryFor('invalid_state'),
+      });
     }
 
     ctx.log.info('Finding aviation stations', {
@@ -175,7 +189,8 @@ export const aviationFindStations = tool('aviation_find_stations', {
       ]
         .filter(Boolean)
         .join(' | ');
-      lines.push(`**IDs:** ${ids}`);
+      // Some AWC sites (mesonet stations, DC's WASD2) carry no identifier at all.
+      if (ids) lines.push(`**IDs:** ${ids}`);
       lines.push(
         `**Location:** ${s.lat.toFixed(4)}, ${s.lon.toFixed(4)} | **Elevation:** ${s.elevation_ft} ft`,
       );
