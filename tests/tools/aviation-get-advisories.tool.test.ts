@@ -18,10 +18,8 @@ vi.mock('@/services/aviation-weather/aviation-weather-service.js', () => ({
 
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 
-const mockFetchAdvisories = vi.fn<
-  Parameters<ReturnType<typeof getAviationWeatherService>['fetchAdvisories']>,
-  ReturnType<ReturnType<typeof getAviationWeatherService>['fetchAdvisories']>
->();
+const mockFetchAdvisories =
+  vi.fn<ReturnType<typeof getAviationWeatherService>['fetchAdvisories']>();
 
 beforeEach(() => {
   vi.mocked(getAviationWeatherService).mockReturnValue({
@@ -80,7 +78,7 @@ const airmet: NormalizedAdvisory = {
 describe('aviationGetAdvisories', () => {
   it('returns advisories for default "all" type', async () => {
     mockFetchAdvisories.mockResolvedValue([sigmet, airmet]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
     const input = aviationGetAdvisories.input.parse({});
     const result = await aviationGetAdvisories.handler(input, ctx);
 
@@ -93,7 +91,7 @@ describe('aviationGetAdvisories', () => {
 
   it('passes advisory_type filter to the service', async () => {
     mockFetchAdvisories.mockResolvedValue([sigmet]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
     const input = aviationGetAdvisories.input.parse({ advisory_type: 'sigmet' });
     const result = await aviationGetAdvisories.handler(input, ctx);
 
@@ -106,7 +104,7 @@ describe('aviationGetAdvisories', () => {
 
   it('passes hazard filter to the service', async () => {
     mockFetchAdvisories.mockResolvedValue([sigmet]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
     const input = aviationGetAdvisories.input.parse({ hazard: 'CONVECTIVE' });
     await aviationGetAdvisories.handler(input, ctx);
 
@@ -118,7 +116,7 @@ describe('aviationGetAdvisories', () => {
 
   it('passes bbox filter to the service', async () => {
     mockFetchAdvisories.mockResolvedValue([airmet]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
     const input = aviationGetAdvisories.input.parse({
       bbox: { minLat: 36.0, minLon: -123.0, maxLat: 39.0, maxLon: -119.0 },
     });
@@ -134,7 +132,7 @@ describe('aviationGetAdvisories', () => {
 
   it('returns empty advisories array when no advisories are active', async () => {
     mockFetchAdvisories.mockResolvedValue([]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
     const input = aviationGetAdvisories.input.parse({});
     const result = await aviationGetAdvisories.handler(input, ctx);
 
@@ -143,7 +141,7 @@ describe('aviationGetAdvisories', () => {
 
   it('accepts SURFACE WIND hazard filter', async () => {
     mockFetchAdvisories.mockResolvedValue([]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
     // Validates that the enum still accepts SURFACE WIND after the description fix
     const input = aviationGetAdvisories.input.parse({ hazard: 'SURFACE WIND' });
     expect(input.hazard).toBe('SURFACE WIND');
@@ -156,7 +154,7 @@ describe('aviationGetAdvisories', () => {
 
   it('accepts LLWS hazard filter', async () => {
     mockFetchAdvisories.mockResolvedValue([]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
     const input = aviationGetAdvisories.input.parse({ hazard: 'LLWS' });
     expect(input.hazard).toBe('LLWS');
     await aviationGetAdvisories.handler(input, ctx);
@@ -168,14 +166,15 @@ describe('aviationGetAdvisories', () => {
 
   it('handles advisory with null altitude and movement (sparse)', async () => {
     mockFetchAdvisories.mockResolvedValue([airmet]);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
     const input = aviationGetAdvisories.input.parse({ advisory_type: 'airmet' });
     const result = await aviationGetAdvisories.handler(input, ctx);
 
-    expect(result.advisories[0].altitude_low_ft).toBeNull();
-    expect(result.advisories[0].altitude_high_ft).toBeNull();
-    expect(result.advisories[0].movement).toBeNull();
-    expect(result.advisories[0].severity).toBeNull();
+    const advisory = result.advisories[0]!;
+    expect(advisory.altitude_low_ft).toBeNull();
+    expect(advisory.altitude_high_ft).toBeNull();
+    expect(advisory.movement).toBeNull();
+    expect(advisory.severity).toBeNull();
   });
 
   it('throws invalid_bbox when the bounding box is inverted', async () => {

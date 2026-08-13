@@ -7,39 +7,39 @@ import { describe, expect, it } from 'vitest';
 import { aviationPreflightBrief } from '@/mcp-server/prompts/definitions/aviation-preflight-brief.prompt.js';
 
 describe('aviationPreflightBrief', () => {
-  it('generates a single user message for a simple departure/destination pair', () => {
+  it('generates a single user message for a simple departure/destination pair', async () => {
     const args = aviationPreflightBrief.args!.parse({
       departure_icao: 'KSEA',
       destination_icao: 'KJFK',
     });
-    const messages = aviationPreflightBrief.generate(args);
+    const messages = await aviationPreflightBrief.generate(args);
 
     expect(messages).toBeInstanceOf(Array);
     expect(messages).toHaveLength(1);
-    expect(messages[0].role).toBe('user');
-    expect(messages[0].content.type).toBe('text');
+    expect(messages[0]!.role).toBe('user');
+    expect(messages[0]!.content.type).toBe('text');
   });
 
-  it('includes departure and destination ICAOs in the generated text', () => {
+  it('includes departure and destination ICAOs in the generated text', async () => {
     const args = aviationPreflightBrief.args!.parse({
       departure_icao: 'KSEA',
       destination_icao: 'KJFK',
     });
-    const messages = aviationPreflightBrief.generate(args);
-    const text = (messages[0].content as { type: string; text: string }).text;
+    const messages = await aviationPreflightBrief.generate(args);
+    const text = (messages[0]!.content as { type: string; text: string }).text;
 
     expect(text).toContain('KSEA');
     expect(text).toContain('KJFK');
   });
 
-  it('includes all alternates in the generated tool call list', () => {
+  it('includes all alternates in the generated tool call list', async () => {
     const args = aviationPreflightBrief.args!.parse({
       departure_icao: 'KBOS',
       destination_icao: 'KLGA',
       alternates: 'KEWR,KPHL',
     });
-    const messages = aviationPreflightBrief.generate(args);
-    const text = (messages[0].content as { type: string; text: string }).text;
+    const messages = await aviationPreflightBrief.generate(args);
+    const text = (messages[0]!.content as { type: string; text: string }).text;
 
     expect(text).toContain('KBOS');
     expect(text).toContain('KLGA');
@@ -47,14 +47,14 @@ describe('aviationPreflightBrief', () => {
     expect(text).toContain('KPHL');
   });
 
-  it('includes alternates in the TAF instruction line, not just the METAR call', () => {
+  it('includes alternates in the TAF instruction line, not just the METAR call', async () => {
     const args = aviationPreflightBrief.args!.parse({
       departure_icao: 'KSEA',
       destination_icao: 'KSFO',
       alternates: 'KBFI,KRNT',
     });
-    const messages = aviationPreflightBrief.generate(args);
-    const text = (messages[0].content as { type: string; text: string }).text;
+    const messages = await aviationPreflightBrief.generate(args);
+    const text = (messages[0]!.content as { type: string; text: string }).text;
 
     // Isolate the TAF step — alternates must be listed here, not only in the METAR list above
     const tafLine = text.split('\n').find((line) => line.includes('aviation_get_taf'));
@@ -65,13 +65,13 @@ describe('aviationPreflightBrief', () => {
     expect(tafLine).toContain('KRNT');
   });
 
-  it('references all four aviation tools in the instructions', () => {
+  it('references all four aviation tools in the instructions', async () => {
     const args = aviationPreflightBrief.args!.parse({
       departure_icao: 'KSFO',
       destination_icao: 'KLAX',
     });
-    const messages = aviationPreflightBrief.generate(args);
-    const text = (messages[0].content as { type: string; text: string }).text;
+    const messages = await aviationPreflightBrief.generate(args);
+    const text = (messages[0]!.content as { type: string; text: string }).text;
 
     expect(text).toContain('aviation_get_metar');
     expect(text).toContain('aviation_get_taf');
@@ -79,47 +79,47 @@ describe('aviationPreflightBrief', () => {
     expect(text).toContain('aviation_get_advisories');
   });
 
-  it('omits alternates section when alternates is not provided', () => {
+  it('omits alternates section when alternates is not provided', async () => {
     const args = aviationPreflightBrief.args!.parse({
       departure_icao: 'KSEA',
       destination_icao: 'KORD',
     });
-    const messages = aviationPreflightBrief.generate(args);
-    const text = (messages[0].content as { type: string; text: string }).text;
+    const messages = await aviationPreflightBrief.generate(args);
+    const text = (messages[0]!.content as { type: string; text: string }).text;
 
     expect(text).not.toContain('**Alternates:**');
   });
 
-  it('includes go/no-go briefing summary instructions', () => {
+  it('includes go/no-go briefing summary instructions', async () => {
     const args = aviationPreflightBrief.args!.parse({
       departure_icao: 'KDEN',
       destination_icao: 'KDFW',
     });
-    const messages = aviationPreflightBrief.generate(args);
-    const text = (messages[0].content as { type: string; text: string }).text;
+    const messages = await aviationPreflightBrief.generate(args);
+    const text = (messages[0]!.content as { type: string; text: string }).text;
 
     expect(text).toContain('Go/No-Go');
   });
 
-  it('includes disclaimer about official briefing sources', () => {
+  it('includes disclaimer about official briefing sources', async () => {
     const args = aviationPreflightBrief.args!.parse({
       departure_icao: 'KMIA',
       destination_icao: 'KATL',
     });
-    const messages = aviationPreflightBrief.generate(args);
-    const text = (messages[0].content as { type: string; text: string }).text;
+    const messages = await aviationPreflightBrief.generate(args);
+    const text = (messages[0]!.content as { type: string; text: string }).text;
 
     expect(text).toContain('informational purposes only');
   });
 
-  it('trims whitespace from alternate IDs', () => {
+  it('trims whitespace from alternate IDs', async () => {
     const args = aviationPreflightBrief.args!.parse({
       departure_icao: 'KSEA',
       destination_icao: 'KSFO',
       alternates: ' KBFI , KRNT ',
     });
-    const messages = aviationPreflightBrief.generate(args);
-    const text = (messages[0].content as { type: string; text: string }).text;
+    const messages = await aviationPreflightBrief.generate(args);
+    const text = (messages[0]!.content as { type: string; text: string }).text;
 
     // Trimmed IDs should appear in the text
     expect(text).toContain('KBFI');

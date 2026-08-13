@@ -18,10 +18,7 @@ vi.mock('@/services/aviation-weather/aviation-weather-service.js', () => ({
 
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 
-const mockFetchTaf = vi.fn<
-  Parameters<ReturnType<typeof getAviationWeatherService>['fetchTaf']>,
-  ReturnType<ReturnType<typeof getAviationWeatherService>['fetchTaf']>
->();
+const mockFetchTaf = vi.fn<ReturnType<typeof getAviationWeatherService>['fetchTaf']>();
 
 beforeEach(() => {
   vi.mocked(getAviationWeatherService).mockReturnValue({
@@ -104,8 +101,9 @@ describe('aviationGetTaf', () => {
     const result = await aviationGetTaf.handler(input, ctx);
 
     expect(result.forecasts).toHaveLength(1);
-    expect(result.forecasts[0].station_id).toBe('KSEA');
-    expect(result.forecasts[0].forecast_periods).toHaveLength(2);
+    const forecast = result.forecasts[0]!;
+    expect(forecast.station_id).toBe('KSEA');
+    expect(forecast.forecast_periods).toHaveLength(2);
     expect(mockFetchTaf).toHaveBeenCalledWith(['KSEA'], ctx);
   });
 
@@ -125,10 +123,10 @@ describe('aviationGetTaf', () => {
     const result = await aviationGetTaf.handler(input, ctx);
 
     // All time fields should be ISO strings, not numbers
-    const taf = result.forecasts[0];
+    const taf = result.forecasts[0]!;
     expect(taf.valid_from).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
     expect(taf.valid_to).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
-    expect(taf.forecast_periods[0].from).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
+    expect(taf.forecast_periods[0]!.from).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
   });
 
   it('throws no_taf_available when service returns empty array', async () => {
@@ -147,7 +145,7 @@ describe('aviationGetTaf', () => {
     const input = aviationGetTaf.input.parse({ station_ids: ['KLAX'] });
     const result = await aviationGetTaf.handler(input, ctx);
 
-    const period = result.forecasts[0].forecast_periods[0];
+    const period = result.forecasts[0]!.forecast_periods[0]!;
     expect(period.visibility_sm).toBeNull();
     expect(period.weather).toBeNull();
     expect(period.clouds).toHaveLength(0);

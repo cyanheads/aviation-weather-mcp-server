@@ -18,10 +18,7 @@ vi.mock('@/services/aviation-weather/aviation-weather-service.js', () => ({
 
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 
-const mockFetchMetar = vi.fn<
-  Parameters<ReturnType<typeof getAviationWeatherService>['fetchMetar']>,
-  ReturnType<ReturnType<typeof getAviationWeatherService>['fetchMetar']>
->();
+const mockFetchMetar = vi.fn<ReturnType<typeof getAviationWeatherService>['fetchMetar']>();
 
 beforeEach(() => {
   vi.mocked(getAviationWeatherService).mockReturnValue({
@@ -119,9 +116,10 @@ describe('aviationGetMetar', () => {
     const input = aviationGetMetar.input.parse({ station_ids: ['KWMC'] });
     const result = await aviationGetMetar.handler(input, ctx);
 
-    expect(result.observations[0].ceiling_ft).toBeNull();
-    expect(result.observations[0].wind.direction_deg).toBeNull();
-    expect(result.observations[0].clouds).toHaveLength(0);
+    const obs = result.observations[0]!;
+    expect(obs.ceiling_ft).toBeNull();
+    expect(obs.wind.direction_deg).toBeNull();
+    expect(obs.clouds).toHaveLength(0);
   });
 
   it('accepts visib as string from upstream (e.g. "10+")', async () => {
@@ -131,8 +129,8 @@ describe('aviationGetMetar', () => {
     const input = aviationGetMetar.input.parse({ station_ids: ['KSEA'] });
     const result = await aviationGetMetar.handler(input, ctx);
 
-    expect(typeof result.observations[0].visibility_sm).toBe('string');
-    expect(result.observations[0].visibility_sm).toBe('10+');
+    expect(typeof result.observations[0]!.visibility_sm).toBe('string');
+    expect(result.observations[0]!.visibility_sm).toBe('10+');
   });
 });
 
@@ -144,7 +142,7 @@ describe('aviationGetMetar.format', () => {
   it('renders station ID, flight category, and raw METAR', () => {
     const blocks = aviationGetMetar.format!({ observations: [ksea] });
     expect(blocks).toHaveLength(1);
-    expect(blocks[0].type).toBe('text');
+    expect(blocks[0]!.type).toBe('text');
     const text = (blocks[0] as { type: string; text: string }).text;
     expect(text).toContain('KSEA');
     expect(text).toContain('VFR');
