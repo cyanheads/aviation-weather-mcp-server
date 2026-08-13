@@ -1,6 +1,6 @@
 # aviation-weather-mcp-server - Directory Structure
 
-Generated on: 2026-08-13 09:03:06
+Generated on: 2026-08-13 11:14:44
 
 ```text
 aviation-weather-mcp-server/
@@ -23,6 +23,7 @@ aviation-weather-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.2.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -138,12 +139,13 @@ aviation-weather-mcp-server/
 │   │   ├── resources/
 │   │   │   └── definitions/
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── aviation-find-stations.tool.ts
-│   │           ├── aviation-get-advisories.tool.ts
-│   │           ├── aviation-get-metar.tool.ts
-│   │           ├── aviation-get-pireps.tool.ts
-│   │           └── aviation-get-taf.tool.ts
+│   │       ├── definitions/
+│   │       │   ├── aviation-find-stations.tool.ts
+│   │       │   ├── aviation-get-advisories.tool.ts
+│   │       │   ├── aviation-get-metar.tool.ts
+│   │       │   ├── aviation-get-pireps.tool.ts
+│   │       │   └── aviation-get-taf.tool.ts
+│   │       └── format-degrees.ts
 │   ├── services/
 │   │   └── aviation-weather/
 │   │       ├── aviation-weather-service.ts
@@ -165,7 +167,8 @@ aviation-weather-mcp-server/
 │       ├── aviation-get-advisories.tool.test.ts
 │       ├── aviation-get-metar.tool.test.ts
 │       ├── aviation-get-pireps.tool.test.ts
-│       └── aviation-get-taf.tool.test.ts
+│       ├── aviation-get-taf.tool.test.ts
+│       └── format-degrees.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

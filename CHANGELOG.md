@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-08-13 · ⚠️ Breaking
+
+Nullable METAR/TAF/PIREP/station outputs replace fabricated zeros (breaking); ceiling now covers obscured skies; cloud heights corrected to AGL
+
 ## [0.1.9](changelog/0.1.x/0.1.9.md) — 2026-08-13
 
 Fix aviation_get_pireps lookback/filter bugs and validate aviation_find_stations state codes; adopt mcp-ts-core ^0.11.5
