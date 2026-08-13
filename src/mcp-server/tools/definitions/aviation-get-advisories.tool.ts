@@ -1,5 +1,5 @@
 /**
- * @fileoverview Tool to fetch active SIGMETs and AIRMETs for a region.
+ * @fileoverview Tool to fetch active domestic SIGMETs for a region.
  * @module mcp-server/tools/definitions/aviation-get-advisories
  */
 
@@ -33,23 +33,31 @@ const PolygonPointSchema = z
   })
   .describe('A polygon vertex as a lat/lon coordinate pair.');
 
+/**
+ * Hazard values naming AIRMET-family phenomena. `/airsigmet` enumerates exactly
+ * four hazard classes — conv, turb, ice, ifr — so no row it serves can carry
+ * any of these, and filtering on one returned an empty array that read as "this
+ * hazard is not active" rather than "this tool cannot answer that".
+ */
+const AIRMET_ONLY_HAZARDS = new Set(['MTN OBSCN', 'SURFACE WIND', 'LLWS']);
+
 export const aviationGetAdvisories = tool('aviation_get_advisories', {
-  title: 'Get Active Aviation Advisories (SIGMETs / AIRMETs)',
+  title: 'Get Active Aviation Advisories (SIGMETs)',
   description:
-    'Get active SIGMETs and AIRMETs for a region. Returns each advisory with hazard type (CONVECTIVE, TURBULENCE, ICING, IFR, MTN OBSCN, etc.), severity, altitude range, valid period, polygon coordinates, and raw text. Coverage is US-centric (NWS Aviation Weather Center). During fair-weather periods no advisories may be active — an empty result is normal, not an error. Filter by advisory_type, hazard, or bbox.',
+    'Get active domestic SIGMETs for a region. Returns each advisory with hazard type (CONVECTIVE, TURBULENCE, ICING, IFR), severity, altitude range, valid period, polygon coordinates, and raw text. Coverage is US-centric (NWS Aviation Weather Center). This tool reads the domestic SIGMET feed only and cannot return an AIRMET; requests for one are rejected rather than answered with SIGMETs. During fair-weather periods no advisories may be active — an empty result is normal, not an error. Filter by advisory_type, hazard, or bbox.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     advisory_type: z
       .enum(['sigmet', 'airmet', 'all'])
       .default('all')
       .describe(
-        'Filter by advisory type. "sigmet" includes convective SIGMETs. "airmet" includes AIRMET Sierra (IFR/mountain obscuration), Tango (turbulence), and Zulu (icing). "all" returns both.',
+        'Filter by advisory type. "sigmet" and "all" both return the active domestic SIGMET set, which is everything this tool serves. "airmet" is rejected with guidance: the upstream feed cannot return an AIRMET, so answering it would mean presenting SIGMETs as AIRMET matches.',
       ),
     hazard: z
       .enum(['CONVECTIVE', 'TURBULENCE', 'ICING', 'IFR', 'MTN OBSCN', 'SURFACE WIND', 'LLWS'])
       .optional()
       .describe(
-        'Optional hazard filter. CONVECTIVE = convective SIGMETs; TURBULENCE = AIRMET Tango; ICING = AIRMET Zulu; IFR = AIRMET Sierra (IFR conditions); MTN OBSCN = AIRMET Sierra (mountain obscuration); SURFACE WIND = sustained strong surface winds (typically >30 kt); LLWS = low-level wind shear below 2,000 ft AGL.',
+        'Optional hazard filter. CONVECTIVE, TURBULENCE, ICING, and IFR match the four hazard classes the domestic SIGMET feed carries. MTN OBSCN, SURFACE WIND, and LLWS are AIRMET-family phenomena with no upstream counterpart here and are rejected rather than returning an empty result.',
       ),
     bbox: BboxSchema.optional(),
   }),
@@ -58,16 +66,20 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       .array(
         z
           .object({
-            advisory_type: z.string().describe('Advisory type: SIGMET or AIRMET.'),
+            advisory_type: z
+              .string()
+              .describe(
+                'Advisory type as issued. The domestic SIGMET feed this tool reads emits SIGMET.',
+              ),
             series_id: z.string().describe('Unique advisory identifier (e.g., BOSMA0).'),
             hazard: z
               .string()
-              .describe('Hazard type (e.g., CONVECTIVE, TURBULENCE, ICING, IFR, MTN OBSCN).'),
+              .describe('Hazard type — one of CONVECTIVE, TURBULENCE, ICING, or IFR.'),
             severity: z
               .number()
               .nullable()
               .describe(
-                'Severity integer for convective SIGMETs (higher = more intense). Null for AIRMETs.',
+                'Severity integer for convective SIGMETs (higher = more intense). Null when the advisory stated none.',
               ),
             issued_by: z.string().describe('ICAO ID of the issuing meteorological watch office.'),
             valid_from: z
@@ -101,10 +113,10 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
             raw_text: z
               .string()
               .describe(
-                'Original encoded SIGMET or AIRMET text as issued by the meteorological watch office.',
+                'Original encoded SIGMET text as issued by the meteorological watch office.',
               ),
           })
-          .describe('An active SIGMET or AIRMET advisory.'),
+          .describe('An active SIGMET advisory.'),
       )
       .describe(
         'Active advisories matching the filter criteria. May be empty during fair weather periods.',
@@ -118,6 +130,13 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       recovery:
         'Ensure minLat <= maxLat and minLon <= maxLon. Swap the inverted min/max coordinates and retry.',
     },
+    {
+      reason: 'airmet_not_served',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'advisory_type "airmet" was requested, or a hazard filter naming an AIRMET-family phenomenon (MTN OBSCN, SURFACE WIND, LLWS) with no counterpart on the SIGMET feed.',
+      recovery:
+        'This tool reads the AWC domestic SIGMET feed, which cannot return an AIRMET — use advisory_type "sigmet" or "all", and the CONVECTIVE, TURBULENCE, ICING, or IFR hazard values. AIRMET information lives on separate products this tool does not read: the Graphical AIRMET (G-AIRMET), which replaced the textual AIRMET over the CONUS in January 2025, and the textual AIRMET feed that continues for the regions outside it.',
+    },
   ],
   async handler(input, ctx) {
     if (input.bbox && !isBboxOrdered(input.bbox)) {
@@ -125,6 +144,24 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
         'invalid_bbox',
         'Bounding box is inverted: minLat must be <= maxLat and minLon <= maxLon.',
         { ...ctx.recoveryFor('invalid_bbox') },
+      );
+    }
+
+    // Rejected here rather than by narrowing the Zod enum, so the caller
+    // receives the typed reason and its recovery instead of a bare -32602.
+    if (input.advisory_type === 'airmet') {
+      throw ctx.fail(
+        'airmet_not_served',
+        'advisory_type "airmet" is not served: the upstream feed behind this tool carries domestic SIGMETs only.',
+        { ...ctx.recoveryFor('airmet_not_served') },
+      );
+    }
+
+    if (input.hazard && AIRMET_ONLY_HAZARDS.has(input.hazard)) {
+      throw ctx.fail(
+        'airmet_not_served',
+        `Hazard "${input.hazard}" is not served: it is an AIRMET-family phenomenon, and the upstream feed behind this tool carries domestic SIGMETs only.`,
+        { ...ctx.recoveryFor('airmet_not_served') },
       );
     }
 
@@ -152,8 +189,8 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
     const lines: string[] = [`**${result.advisories.length} active advisory(ies)**\n`];
     for (const a of result.advisories) {
       lines.push(`## ${a.advisory_type}: ${a.series_id} — ${a.hazard}`);
-      // Severity is populated on convective SIGMETs and null on AIRMETs, so a
-      // dropped line reads as a severity the renderer skipped.
+      // Severity is populated on convective SIGMETs and null where the advisory
+      // stated none, so a dropped line reads as a severity the renderer skipped.
       lines.push(`**Severity:** ${a.severity != null ? a.severity : 'not reported'}`);
       lines.push(`**Issued by:** ${a.issued_by} | **Valid:** ${a.valid_from} → ${a.valid_to}`);
 

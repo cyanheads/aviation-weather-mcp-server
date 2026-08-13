@@ -147,7 +147,7 @@ export interface RawPirepCloudLayer {
 
 /** Raw AIRSIGMET record from the AWC API. */
 export interface RawAirSigmet {
-  airSigmetType: string | null; // 'SIGMET' | 'AIRMET'
+  airSigmetType: string | null; // Pinned to 'SIGMET' — the endpoint serves no AIRMET
   alphaChar?: string | null;
   altitudeHi1: number | null;
   altitudeHi2?: number | null;
@@ -342,7 +342,7 @@ export interface NormalizedPirep {
 }
 
 export interface NormalizedAdvisory {
-  advisory_type: string; // 'SIGMET' | 'AIRMET'
+  advisory_type: string; // 'SIGMET' — the only type the upstream feed emits
   altitude_high_ft: number | null;
   altitude_low_ft: number | null;
   hazard: string;

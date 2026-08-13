@@ -79,6 +79,25 @@ describe('aviationPreflightBrief', () => {
     expect(text).toContain('aviation_get_advisories');
   });
 
+  it('does not send the briefing after AIRMETs the advisories tool rejects', async () => {
+    const args = aviationPreflightBrief.args!.parse({
+      departure_icao: 'KSFO',
+      destination_icao: 'KLAX',
+    });
+    const messages = await aviationPreflightBrief.generate(args);
+    const text = (messages[0]!.content as { type: string; text: string }).text;
+
+    /**
+     * `aviation_get_advisories` throws `airmet_not_served`, so an advisories
+     * step that asks for AIRMETs walks the model into a hard failure partway
+     * through a brief. Naming the gap is the point — silently listing only
+     * SIGMETs would read as a route cleared of AIRMET-class hazards.
+     */
+    expect(text).toMatch(/domestic SIGMETs/);
+    expect(text).toMatch(/AIRMETs are not available/);
+    expect(text).toMatch(/do not request one/);
+  });
+
   it('omits alternates section when alternates is not provided', async () => {
     const args = aviationPreflightBrief.args!.parse({
       departure_icao: 'KSEA',

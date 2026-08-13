@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
+import { AWC_MAX_ROWS, isUpstreamCapped } from '@/services/aviation-weather/awc-limits.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
 import { isSupportedState } from '@/services/aviation-weather/state-bboxes.js';
 
@@ -121,6 +122,42 @@ export const aviationFindStations = tool('aviation_find_stations', {
     },
   ],
 
+  enrichment: {
+    truncated: z
+      .boolean()
+      .describe(
+        'True when the upstream draw hit the AWC row cap, so stations inside the search area are missing from this result. False affirms the area was drawn in full, which a count alone cannot establish.',
+      ),
+    shown: z
+      .number()
+      .describe('Stations in this result, counted after any client-side state filter.'),
+    cap: z
+      .number()
+      .optional()
+      .describe(
+        'The upstream row maximum that was applied to the draw. Present only on a truncated result.',
+      ),
+    upstreamRows: z
+      .number()
+      .optional()
+      .describe(
+        'Rows AWC returned before the client-side state filter ran. Present only on a truncated state query the filter then narrowed, where the post-filter count sits below the cap and so cannot reveal the truncation on its own.',
+      ),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance naming the lever that narrows the draw. Present only on a truncated result.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    truncated: { label: 'Truncated at the upstream row cap' },
+    shown: { label: 'Stations returned' },
+    cap: { label: 'Upstream row maximum' },
+    upstreamRows: { label: 'Rows drawn before the state filter' },
+  },
+
   async handler(input, ctx) {
     if (!input.station_ids?.length && !input.bbox && !input.state) {
       throw ctx.fail(
@@ -165,11 +202,17 @@ export const aviationFindStations = tool('aviation_find_stations', {
     });
 
     const svc = getAviationWeatherService();
+    // Reported only by the state mode, which filters its draw inside the
+    // service; the other modes return the draw as served.
+    let preFilterRows: number | undefined;
     const stations = await svc.fetchStations(
       {
         ...(input.station_ids?.length ? { stationIds: input.station_ids } : {}),
         ...(input.bbox ? { bbox: input.bbox } : {}),
         ...(input.state ? { state: input.state } : {}),
+        onPreFilterRows: (rows) => {
+          preFilterRows = rows;
+        },
       },
       ctx,
     );
@@ -180,7 +223,25 @@ export const aviationFindStations = tool('aviation_find_stations', {
       });
     }
 
-    ctx.log.info('Stations found', { count: stations.length });
+    // The cap applies to the draw, not to what survives the state filter, so a
+    // state query holding 279 stations can still be a cut page.
+    const drawnRows = preFilterRows ?? stations.length;
+    if (isUpstreamCapped(drawnRows)) {
+      const scope = input.state
+        ? `stations in ${input.state.toUpperCase()} are missing from this result — the ${stations.length} shown are what survived the state filter applied to that capped page`
+        : 'stations inside the box are missing from this result';
+      ctx.enrich.truncated({
+        shown: stations.length,
+        cap: AWC_MAX_ROWS,
+        guidance: `AWC served ${drawnRows} rows for this query, its per-request maximum, so ${scope}. Re-run over smaller bbox quadrants and union the results — a smaller box is the only narrowing lever the stationinfo endpoint offers, and it replaces a capped state query too.`,
+      });
+      // Restating the drawn count is only informative where a filter moved it.
+      if (drawnRows > stations.length) ctx.enrich({ upstreamRows: drawnRows });
+    } else {
+      ctx.enrich({ truncated: false, shown: stations.length });
+    }
+
+    ctx.log.info('Stations found', { count: stations.length, drawnRows });
     return { stations };
   },
 

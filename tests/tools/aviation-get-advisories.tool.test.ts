@@ -3,6 +3,7 @@
  * @module tests/tools/aviation-get-advisories.tool.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { aviationGetAdvisories } from '@/mcp-server/tools/definitions/aviation-get-advisories.tool.js';
@@ -52,12 +53,17 @@ const sigmet: NormalizedAdvisory = {
   raw_text: 'KKCI SIGW 151800 CONVECTIVE SIGMET BOSW0',
 };
 
-const airmet: NormalizedAdvisory = {
-  advisory_type: 'AIRMET',
-  series_id: 'SFOsierra0',
+/**
+ * A SIGMET that stated no severity, altitude bounds, or movement — the sparse
+ * shape the null-rendering cases need. `/airsigmet` pins `airSigmetType` to
+ * `SIGMET`, so an AIRMET fixture would encode a row the source cannot emit.
+ */
+const sparseSigmet: NormalizedAdvisory = {
+  advisory_type: 'SIGMET',
+  series_id: 'SFOT0',
   hazard: 'IFR',
   severity: null,
-  issued_by: 'KSFO',
+  issued_by: 'KKCI',
   valid_from: '2026-01-15T16:00:00.000Z',
   valid_to: '2026-01-15T22:00:00.000Z',
   altitude_low_ft: null,
@@ -68,7 +74,7 @@ const airmet: NormalizedAdvisory = {
     { lat: 38.0, lon: -122.0 },
     { lat: 38.0, lon: -120.0 },
   ],
-  raw_text: 'KSFO SIERRA0 IFR CONDS',
+  raw_text: 'KKCI SIGT0 IFR CONDS',
 };
 
 // ---------------------------------------------------------------------------
@@ -77,7 +83,7 @@ const airmet: NormalizedAdvisory = {
 
 describe('aviationGetAdvisories', () => {
   it('returns advisories for default "all" type', async () => {
-    mockFetchAdvisories.mockResolvedValue([sigmet, airmet]);
+    mockFetchAdvisories.mockResolvedValue([sigmet, sparseSigmet]);
     const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
     const input = aviationGetAdvisories.input.parse({});
     const result = await aviationGetAdvisories.handler(input, ctx);
@@ -115,7 +121,7 @@ describe('aviationGetAdvisories', () => {
   });
 
   it('passes bbox filter to the service', async () => {
-    mockFetchAdvisories.mockResolvedValue([airmet]);
+    mockFetchAdvisories.mockResolvedValue([sparseSigmet]);
     const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
     const input = aviationGetAdvisories.input.parse({
       bbox: { minLat: 36.0, minLon: -123.0, maxLat: 39.0, maxLon: -119.0 },
@@ -139,35 +145,10 @@ describe('aviationGetAdvisories', () => {
     expect(result.advisories).toHaveLength(0);
   });
 
-  it('accepts SURFACE WIND hazard filter', async () => {
-    mockFetchAdvisories.mockResolvedValue([]);
-    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
-    // Validates that the enum still accepts SURFACE WIND after the description fix
-    const input = aviationGetAdvisories.input.parse({ hazard: 'SURFACE WIND' });
-    expect(input.hazard).toBe('SURFACE WIND');
-    await aviationGetAdvisories.handler(input, ctx);
-    expect(mockFetchAdvisories).toHaveBeenCalledWith(
-      expect.objectContaining({ hazard: 'SURFACE WIND' }),
-      ctx,
-    );
-  });
-
-  it('accepts LLWS hazard filter', async () => {
-    mockFetchAdvisories.mockResolvedValue([]);
-    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
-    const input = aviationGetAdvisories.input.parse({ hazard: 'LLWS' });
-    expect(input.hazard).toBe('LLWS');
-    await aviationGetAdvisories.handler(input, ctx);
-    expect(mockFetchAdvisories).toHaveBeenCalledWith(
-      expect.objectContaining({ hazard: 'LLWS' }),
-      ctx,
-    );
-  });
-
   it('handles advisory with null altitude and movement (sparse)', async () => {
-    mockFetchAdvisories.mockResolvedValue([airmet]);
+    mockFetchAdvisories.mockResolvedValue([sparseSigmet]);
     const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
-    const input = aviationGetAdvisories.input.parse({ advisory_type: 'airmet' });
+    const input = aviationGetAdvisories.input.parse({ advisory_type: 'sigmet' });
     const result = await aviationGetAdvisories.handler(input, ctx);
 
     const advisory = result.advisories[0]!;
@@ -187,6 +168,136 @@ describe('aviationGetAdvisories', () => {
       data: { reason: 'invalid_bbox' },
     });
     expect(mockFetchAdvisories).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AIRMET requests are rejected, not answered (issue #12) — the only upstream
+// source is `/airsigmet`, whose `airSigmetType` is pinned to `SIGMET`, so an
+// AIRMET request was being answered with convective SIGMETs
+// ---------------------------------------------------------------------------
+
+describe('aviationGetAdvisories AIRMET rejection', () => {
+  /** Run the handler over live-looking rows and return the error it threw. */
+  async function errorFor(input: Record<string, unknown>) {
+    mockFetchAdvisories.mockResolvedValue([sigmet]);
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
+    try {
+      await aviationGetAdvisories.handler(aviationGetAdvisories.input.parse(input), ctx);
+    } catch (e) {
+      return e as {
+        code: number;
+        message: string;
+        data?: { reason?: string; recovery?: { hint?: string } };
+      };
+    }
+    throw new Error('handler resolved where it was expected to throw');
+  }
+
+  it('rejects advisory_type "airmet" rather than answering it with SIGMETs', async () => {
+    const err = await errorFor({ advisory_type: 'airmet' });
+
+    expect(err.data?.reason).toBe('airmet_not_served');
+    expect(mockFetchAdvisories).not.toHaveBeenCalled();
+  });
+
+  it.each(['MTN OBSCN', 'SURFACE WIND', 'LLWS'] as const)(
+    'rejects the %s hazard rather than returning an empty array',
+    async (hazard) => {
+      // These three name AIRMET-family phenomena. `/airsigmet` enumerates only
+      // conv, turb, ice, and ifr, so no row can ever carry them — an empty
+      // result read as "this hazard is not active" rather than "not served".
+      const err = await errorFor({ hazard });
+
+      expect(err.data?.reason).toBe('airmet_not_served');
+      expect(mockFetchAdvisories).not.toHaveBeenCalled();
+    },
+  );
+
+  it('carries a typed reason and recovery, not a transport-level -32602', async () => {
+    // Rejecting in the handler rather than narrowing the Zod enum is what puts
+    // the reason and the recovery hint on the wire.
+    expect(aviationGetAdvisories.input.safeParse({ advisory_type: 'airmet' }).success).toBe(true);
+    expect(aviationGetAdvisories.input.safeParse({ hazard: 'LLWS' }).success).toBe(true);
+
+    const err = await errorFor({ advisory_type: 'airmet' });
+
+    expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(err.code).not.toBe(-32602);
+    expect(err.data?.recovery?.hint).toBeTruthy();
+  });
+
+  it('points the recovery at what this tool does serve', async () => {
+    const hint = String((await errorFor({ advisory_type: 'airmet' })).data?.recovery?.hint);
+
+    expect(hint).toContain('sigmet');
+    expect(hint).toContain('all');
+    expect(hint).toMatch(/SIGMET/);
+  });
+
+  it('names the products that carry AIRMET information today', async () => {
+    const hint = String((await errorFor({ hazard: 'MTN OBSCN' })).data?.recovery?.hint);
+
+    expect(hint).toMatch(/G-AIRMET|Graphical AIRMET/);
+    expect(hint).toMatch(/textual AIRMET/);
+    // The CONUS retirement is what makes G-AIRMET the replacement rather than a
+    // parallel product; naming a region set here would overstate what was checked.
+    expect(hint).toMatch(/CONUS/);
+  });
+
+  it('reports invalid_bbox ahead of the AIRMET rejection', async () => {
+    // Guard order: a malformed bbox is the caller's first fixable mistake.
+    const err = await errorFor({
+      advisory_type: 'airmet',
+      bbox: { minLat: 49, minLon: -66, maxLat: 25, maxLon: -125 },
+    });
+
+    expect(err.data?.reason).toBe('invalid_bbox');
+  });
+
+  it.each(['sigmet', 'all'] as const)('leaves advisory_type %s serving advisories', async (t) => {
+    mockFetchAdvisories.mockResolvedValue([sigmet, sparseSigmet]);
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
+    const result = await aviationGetAdvisories.handler(
+      aviationGetAdvisories.input.parse({ advisory_type: t }),
+      ctx,
+    );
+
+    expect(result.advisories).toHaveLength(2);
+    expect(result).toEqual(expect.schemaMatching(aviationGetAdvisories.output));
+  });
+
+  it.each(['CONVECTIVE', 'TURBULENCE', 'ICING', 'IFR'] as const)(
+    'leaves the %s hazard reaching the service',
+    async (hazard) => {
+      // The four with upstream counterparts stay in scope; their matching
+      // behavior is a separate concern from whether they are served at all.
+      mockFetchAdvisories.mockResolvedValue([sigmet]);
+      const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
+      await aviationGetAdvisories.handler(aviationGetAdvisories.input.parse({ hazard }), ctx);
+
+      expect(mockFetchAdvisories).toHaveBeenCalledWith(expect.objectContaining({ hazard }), ctx);
+    },
+  );
+
+  it('keeps an empty upstream result a valid state, not an error', async () => {
+    mockFetchAdvisories.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
+    const result = await aviationGetAdvisories.handler(
+      aviationGetAdvisories.input.parse({ advisory_type: 'all' }),
+      ctx,
+    );
+
+    expect(result.advisories).toEqual([]);
+  });
+
+  it('stops advertising AIRMET retrieval on the input and tool descriptions', async () => {
+    const advisoryType = aviationGetAdvisories.input.shape.advisory_type;
+    const hazard = aviationGetAdvisories.input.shape.hazard;
+
+    expect(aviationGetAdvisories.description).not.toMatch(/AIRMETs\b(?!.*not)/);
+    expect(String(advisoryType.description)).not.toMatch(/"all" returns both/);
+    expect(String(hazard.description)).toMatch(/not served|no upstream counterpart|rejected/i);
   });
 });
 
@@ -234,9 +345,9 @@ describe('aviationGetAdvisories.format', () => {
   });
 
   it('renders raw text', () => {
-    const blocks = aviationGetAdvisories.format!({ advisories: [airmet] });
+    const blocks = aviationGetAdvisories.format!({ advisories: [sparseSigmet] });
     const text = (blocks[0] as { type: string; text: string }).text;
-    expect(text).toContain(airmet.raw_text);
+    expect(text).toContain(sparseSigmet.raw_text);
   });
 
   it('renders valid period', () => {
@@ -284,22 +395,22 @@ describe('aviationGetAdvisories.format null states', () => {
   });
 
   it('renders both unstated bounds without inventing either', () => {
-    const text = render(airmet);
+    const text = render(sparseSigmet);
 
     expect(text).not.toContain('SFC');
     expect(text).not.toContain('UNL');
   });
 
   it('renders a null severity as an explicit unreported state', () => {
-    // Severity is populated on convective SIGMETs and null on AIRMETs, so a
-    // dropped line reads as an AIRMET whose severity was simply not rendered.
-    const text = render(airmet);
+    // Severity is populated on convective SIGMETs and null where the advisory
+    // stated none, so a dropped line reads as a severity the renderer skipped.
+    const text = render(sparseSigmet);
 
     expect(text).toContain('**Severity:** not reported');
   });
 
   it('renders a null movement as an explicit unreported state', () => {
-    const text = render(airmet);
+    const text = render(sparseSigmet);
 
     expect(text).toContain('**Movement:** not reported');
   });

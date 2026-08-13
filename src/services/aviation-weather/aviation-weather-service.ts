@@ -675,19 +675,27 @@ export class AviationWeatherService {
     return raw.map(normalizePirep);
   }
 
-  /** Fetch active SIGMETs/AIRMETs, optionally filtered by type and/or bbox. */
+  /**
+   * Fetch the active domestic SIGMET set, optionally filtered by hazard and/or
+   * bbox. Both filters run client-side, over the whole active set.
+   *
+   * The endpoint defines no type parameter — its schema pins `airSigmetType` to
+   * `SIGMET` — and answers HTTP 200 while dropping query keys it does not
+   * recognize, so a `type=` (or the deprecated `types=`) key would read as a
+   * filter that ran while changing nothing. `advisoryType` shapes nothing here
+   * and is kept for its type: AIRMET requests are rejected in the handler, and
+   * the `'sigmet' | 'all'` union is what makes that guard a compile-time
+   * requirement — without it the handler holds a value this signature refuses.
+   */
   async fetchAdvisories(
     params: {
-      advisoryType: 'sigmet' | 'airmet' | 'all';
+      advisoryType: 'sigmet' | 'all';
       hazard?: string;
       bbox?: { minLat: number; minLon: number; maxLat: number; maxLon: number };
     },
     ctx: Context,
   ): Promise<NormalizedAdvisory[]> {
-    let url = `${this.baseUrl}/airsigmet?format=json`;
-    if (params.advisoryType !== 'all') {
-      url += `&type=${params.advisoryType}`;
-    }
+    const url = `${this.baseUrl}/airsigmet?format=json`;
     ctx.log.debug('Fetching advisories', { advisoryType: params.advisoryType });
     const raw = await this.fetchJson<RawAirSigmet[]>(url, ctx);
     if (!Array.isArray(raw)) return [];
@@ -709,12 +717,23 @@ export class AviationWeatherService {
     return advisories;
   }
 
-  /** Fetch station info by ICAO IDs, bbox, or US state. */
+  /**
+   * Fetch station info by ICAO IDs, bbox, or US state.
+   *
+   * The state mode is a bbox draw filtered on each station's `state` field in
+   * here, so its return value is smaller than the page the upstream row cap
+   * applied to. `onPreFilterRows` hands that drawn size back — without it a
+   * capped state query is indistinguishable from a complete one, since the
+   * count the caller receives sits well below the cap either way. The other two
+   * modes return their draw unfiltered and so report nothing; there the rows
+   * returned are the rows drawn.
+   */
   async fetchStations(
     params: {
       stationIds?: string[];
       bbox?: { minLat: number; minLon: number; maxLat: number; maxLon: number };
       state?: string;
+      onPreFilterRows?: (rows: number) => void;
     },
     ctx: Context,
   ): Promise<NormalizedStation[]> {
@@ -752,6 +771,7 @@ export class AviationWeatherService {
 
     // Client-side state filter when using the bbox workaround
     if (stateFilter) {
+      params.onPreFilterRows?.(stations.length);
       stations = stations.filter((s) => s.state && s.state.toUpperCase() === stateFilter);
     }
 

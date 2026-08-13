@@ -55,8 +55,9 @@ Follow this sequence:
    - Absence of PIREPs does not guarantee smooth conditions
 
 4. **Advisories** — Call \`aviation_get_advisories\` for the entire route area
-   - List any active SIGMETs or AIRMETs (turbulence, icing, IFR, convective)
+   - List any active domestic SIGMETs (turbulence, icing, IFR, convective)
    - Include valid times and affected altitudes
+   - AIRMETs are not available from this server; do not request one. Say so plainly rather than implying the route was cleared of AIRMET-class hazards
 
 5. **Briefing summary** — Synthesize the above into:
    - **Go/No-Go recommendation** based on the aggregate picture

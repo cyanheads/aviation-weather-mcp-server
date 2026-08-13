@@ -1,12 +1,12 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.cyanheads/aviation-weather-mcp-server",
-  "description": "Fetch METARs, TAFs, PIREPs, and SIGMETs/AIRMETs from the NWS Aviation Weather Center.",
+  "description": "Fetch METARs, TAFs, PIREPs, and domestic SIGMETs from the NWS Aviation Weather Center.",
   "repository": {
     "url": "https://github.com/cyanheads/aviation-weather-mcp-server",
     "source": "github"
   },
-  "version": "0.3.0",
+  "version": "0.4.0",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/aviation-weather-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "packageArguments": [
         {
           "type": "positional",
@@ -62,7 +62,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/aviation-weather-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "packageArguments": [
         {
           "type": "positional",

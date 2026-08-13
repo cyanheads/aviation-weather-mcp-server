@@ -9,7 +9,7 @@
 | `aviation_get_metar` | Current weather observations for one or more airports. Returns decoded fields (wind direction/speed/gusts, visibility, ceiling and its kind, present weather, temp/dewpoint, altimeter, cloud layers) plus the computed flight category (VFR/MVFR/IFR/LIFR) and the raw METAR string. Accepts 1–10 ICAO station IDs. | `station_ids: string[]`, `hours?: number (1–12, default 1)` | `readOnlyHint: true, idempotentHint: true` |
 | `aviation_get_taf` | Terminal Aerodrome Forecast for one or more airports. Returns each forecast period with valid times, wind, visibility, decoded weather, and cloud layers, plus the raw TAF string. Accepts 1–4 ICAO station IDs. | `station_ids: string[]` | `readOnlyHint: true, idempotentHint: true` |
 | `aviation_get_pireps` | Recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence/icing/cloud reports with altitude, aircraft type, intensity, and the raw pirep string. | `station_id?: string`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `distance_nm?: number (station_id only, 100 when omitted)`, `hours?: number (1–12, default 3)` | `readOnlyHint: true, idempotentHint: true` |
-| `aviation_get_advisories` | Active SIGMETs and AIRMETs for a region. Returns each advisory with hazard type (CONVECTIVE, TURBULENCE, ICING, IFR, MTN OBSCN), severity, altitude range, valid period, polygon coordinates, and raw text. Accepts optional hazard filter or bounding box. | `hazard?: enum`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `advisory_type?: 'sigmet' \| 'airmet' \| 'all'` | `readOnlyHint: true, idempotentHint: true` |
+| `aviation_get_advisories` | Active domestic SIGMETs for a region. Returns each advisory with hazard type (CONVECTIVE, TURBULENCE, ICING, IFR), severity, altitude range, valid period, polygon coordinates, and raw text. Accepts optional hazard filter or bounding box. AIRMETs are not served — a request for one is rejected. | `hazard?: enum`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `advisory_type?: 'sigmet' \| 'airmet' \| 'all'` | `readOnlyHint: true, idempotentHint: true` |
 | `aviation_find_stations` | Resolve an airport or weather reporting station by ICAO ID, or discover stations within a bounding box or US state. Returns ICAO/IATA/FAA IDs, coordinates, elevation, and available data types. | `station_ids?: string[]`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `state?: string (2-letter)` | `readOnlyHint: true, idempotentHint: true, openWorldHint: false` |
 
 ### Resources
@@ -26,7 +26,7 @@ None. All data is time-sensitive (METARs valid ~1 hour, advisories minutes to ho
 
 ## Overview
 
-Aviation weather from the NWS Aviation Weather Center (aviationweather.gov) — METARs, TAFs, PIREPs, and SIGMETs/AIRMETs decoded and ready for agent use. Keyless, no authentication required. Covers the AWC Data API at `https://aviationweather.gov/api/data/`.
+Aviation weather from the NWS Aviation Weather Center (aviationweather.gov) — METARs, TAFs, PIREPs, and domestic SIGMETs decoded and ready for agent use. Keyless, no authentication required. Covers the AWC Data API at `https://aviationweather.gov/api/data/`.
 
 **Audience:** Pilots (GA and commercial), flight dispatchers, drone operators, aviation enthusiasts, and agents answering questions like "What's the weather at KSEA?", "Is it VFR at my destination?", "Any SIGMETs along this route?"
 
@@ -37,9 +37,9 @@ Aviation weather from the NWS Aviation Weather Center (aviationweather.gov) — 
 ## Requirements
 
 - Keyless REST — no API key or auth required
-- Primary data types: METAR, TAF, PIREP, AIRSIGMET (SIGMETs + AIRMETs combined endpoint)
+- Primary data types: METAR, TAF, PIREP, AIRSIGMET (domestic SIGMETs; the endpoint's `airSigmetType` is pinned to `SIGMET` and it serves no AIRMETs)
 - All endpoints return JSON when `format=json` is passed; raw coded text is also available but not used (we surface `rawOb`/`rawTAF`/`rawAirSigmet` directly in structured output)
-- METAR/TAF coverage is global; PIREPs and SIGMETs/AIRMETs are US-centric
+- METAR/TAF coverage is global; PIREPs and SIGMETs are US-centric
 - Station IDs are ICAO format (`KSEA`, `KJFK`, etc.); the `stationinfo` endpoint accepts ICAO IDs only and returns IATA/FAA aliases in each record
 - No geocoding in the API — inputs must be ICAO IDs or coordinates/bbox
 - Flight category (VFR/MVFR/IFR/LIFR) is returned directly by the METAR endpoint as `fltCat` — no need to compute client-side
@@ -89,7 +89,7 @@ Each step is independently testable.
 | METAR | get current/recent by ICAO IDs | `GET /metar?ids=&format=json&hours=` |
 | TAF | get current by ICAO IDs | `GET /taf?ids=&format=json` |
 | PIREP | list recent by station + distance, or by bbox | `GET /pirep?id=&format=json&distance=&age=` |
-| AIRSIGMET | list active by type and/or bbox | `GET /airsigmet?format=json&type=` |
+| AIRSIGMET | list active, filtered client-side by hazard and/or bbox | `GET /airsigmet?format=json` |
 
 ---
 
@@ -245,21 +245,34 @@ raw_pirep: string            // rawOb
 
 Guard order is `missing_location` → `conflicting_location` → `invalid_bbox` → `conflicting_distance` → `invalid_altitude_range`, so a location-mode mistake is always reported ahead of a filter mistake. Equal altitude bounds are a valid degenerate range, mirroring `isBboxOrdered`'s `<=`.
 
+**Enrichment contract** (see decision 18):
+```
+truncated:    boolean         // always — true when the page hit the 400-row upstream cap
+shown:        number          // always — reports returned, after any altitude filter
+cap:          number          // only when truncated — the upstream row maximum applied
+upstreamRows: number          // only when the altitude filter narrowed a truncated page
+notice:       string          // only when truncated — names bbox, distance_nm, and hours as the levers
+```
+
+Detection reads the row count upstream served, before the altitude filter selects from it. `fetchPireps` applies no client-side filter of its own, so that count is the length the handler receives; the altitude filter runs afterwards in the handler, which is why the disclosure is computed there and not from the returned count.
+
+When a capped page is then emptied by the altitude filter, `no_pireps_found` says the area was searched only in part and points at the same narrowing levers. It does not report the capped page's row count as the reports present in the area — that count describes the page, not the area, and the filter never saw beyond it.
+
 ### `aviation_get_advisories`
 
 **Input schema:**
 ```
-advisory_type: z.enum(['sigmet', 'airmet', 'all']).default('all').describe('Filter by advisory type. "sigmet" includes convective SIGMETs. "airmet" includes AIRMET Sierra (IFR/mountain), Tango (turbulence), Zulu (icing).')
+advisory_type: z.enum(['sigmet', 'airmet', 'all']).default('all').describe('Filter by advisory type. "sigmet" and "all" both return the active domestic SIGMET set. "airmet" is rejected — the upstream feed cannot return one.')
 hazard: z.enum(['CONVECTIVE', 'TURBULENCE', 'ICING', 'IFR', 'MTN OBSCN', 'SURFACE WIND', 'LLWS']).optional()
 bbox: z.object({ minLat, minLon, maxLat, maxLon }).optional().describe('Geographic filter — returns advisories whose polygon overlaps the bbox.')
 ```
 
 **Output schema (per advisory):**
 ```
-advisory_type: 'SIGMET' | 'AIRMET'
+advisory_type: string        // airSigmetType, which the endpoint's schema pins to 'SIGMET'
 series_id: string            // seriesId — unique advisory identifier
-hazard: string
-severity: number | null      // severity field from API (integer, e.g. 5); present on convective SIGMETs, null on AIRMETs
+hazard: string               // one of CONVECTIVE, TURBULENCE, ICING, IFR — the four classes /airsigmet enumerates
+severity: number | null      // severity field from API (integer, e.g. 5); null when the advisory stated none
 issued_by: string            // icaoId of issuing center
 valid_from / valid_to: string // ISO 8601 (converted from unix timestamps validTimeFrom/validTimeTo)
 altitude_low_ft: number | null   // altitudeLow1 — use the primary (1) pair; altitudeLow2/altitudeHi2 are rarely set
@@ -273,8 +286,11 @@ raw_text: string             // rawAirSigmet
 
 **Error contract:**
 ```
-{ reason: 'no_advisories', code: NotFound, when: 'No active advisories match the filter criteria', recovery: 'Try without filters to see all active advisories, or check a broader bbox.' }
+{ reason: 'invalid_bbox', code: ValidationError, when: 'The bounding box is inverted', recovery: 'Ensure minLat <= maxLat and minLon <= maxLon.' }
+{ reason: 'airmet_not_served', code: ValidationError, when: 'advisory_type "airmet", or a hazard naming an AIRMET-family phenomenon (MTN OBSCN, SURFACE WIND, LLWS)', recovery: 'Use advisory_type "sigmet"/"all" and the CONVECTIVE, TURBULENCE, ICING, or IFR hazards; AIRMET information lives on the G-AIRMET and textual AIRMET products this tool does not read.' }
 ```
+
+An empty result is not an error — fair weather is a valid state, so no `no_advisories` reason exists. `invalid_bbox` is checked ahead of `airmet_not_served`, so a malformed box is reported before the unsupported product. The rejection is raised in the handler rather than by narrowing the Zod enum, so the caller receives the typed reason and recovery instead of a transport-level `-32602`; `advisory_type` keeps all three enum members for that reason, and so the parameter remains the discriminator when AIRMET-family sources are added (#29).
 
 ### `aviation_find_stations`
 
@@ -313,6 +329,17 @@ data_types: string[]         // siteType: ['METAR', 'TAF', etc.]
 
 `conflicting_location` is checked ahead of `invalid_state`, so combining a bogus `state` with another location mode reports the mode conflict.
 
+**Enrichment contract** (see decision 18):
+```
+truncated:    boolean         // always — true when the draw hit the 400-row upstream cap
+shown:        number          // always — stations returned, after any client-side state filter
+cap:          number          // only when truncated — the upstream row maximum applied
+upstreamRows: number          // only when the state filter narrowed a truncated draw
+notice:       string          // only when truncated — names a smaller bbox as the narrowing lever
+```
+
+Detection reads the drawn row count, never the returned one. The state mode filters its draw inside `fetchStations` and reports that pre-filter size back through the `onPreFilterRows` callback; the `station_ids` and `bbox` modes return their draw unfiltered and report nothing, because there the rows returned are the rows drawn. `upstreamRows` is emitted only where a filter moved the count, since elsewhere it would restate `shown`. An empty result stays `station_not_found` and carries no disclosure.
+
 ---
 
 ## Design Decisions
@@ -320,8 +347,10 @@ data_types: string[]         // siteType: ['METAR', 'TAF', etc.]
 **1. `fltCat` is returned by the API — no client-side computation needed.**
 The AWC METAR endpoint returns `fltCat` directly in the JSON response. Initial assumption was that flight category would need to be computed from ceiling + visibility; it doesn't. This simplifies the service layer significantly.
 
-**2. AIRSIGMET type filter is unreliable for non-convective.**
-During live probing, `type=airmet` and `type=sigmet` both returned only SIGMETs (15 convective SIGMETs, no AIRMETs present at query time). The API appears to serve only currently-active advisories — it's common for AIRMETs to be absent during clear weather. The tool accepts an `advisory_type` filter parameter and passes it to the API, but notes to clients that absence of results reflects current conditions, not a query error.
+**2. The AIRSIGMET endpoint has no type filter, and serves no AIRMETs at all.**
+During live probing, `type=airmet` and `type=sigmet` returned the same 15 convective SIGMETs. That was first read as fair weather — no AIRMETs active at query time — and the reading was wrong. `/airsigmet` defines no `type` parameter, and the AWC API answers HTTP 200 while silently dropping query keys it does not recognize, so the filter never applied; the deprecated plural `types=` is equally inert. Re-probed with `hazard=conv`, the bodies with `type=airmet`, with `types=airmet`, and with neither are byte-identical, while `hazard=turb` returns 204 and `hazard=nonsense` returns 400 — the endpoint honors the parameters it defines, so `type=` is being dropped rather than applied and matched.
+
+The endpoint cannot return an AIRMET under any parameter: its schema titles it "Domestic SIGMETs" and pins `airSigmetType` to `enum: [SIGMET]`. CONUS text AIRMETs no longer exist — NWS Service Change Notice 24-92 retired them effective 2025-01-27 1900Z in favor of the Graphical AIRMET, with Alaska and Hawaii unaffected — and AWC serves the replacements on separate endpoints (`/gairmet`, `/airmet`) whose shapes do not fit this tool's output schema. So the dead `type=` key comes out of the URL, and an AIRMET request is rejected with a typed reason instead of being answered with SIGMETs. Restoring the capability behind real sources is #29.
 
 **3. No geocoding — ICAO IDs are the interface.**
 The AWC Data API does not geocode. All tools take ICAO station IDs or coordinates as input. `aviation_find_stations` provides the lookup from human-readable names via bbox/state queries. Agents needing "nearest airport to lat/lon" should chain with `openstreetmap-mcp-server`.
@@ -402,15 +431,25 @@ This lives in `enrichment`, not `output`: it is agent-facing context about the r
 
 *One missing state, not several.* A station can go missing because the ID is unknown, because it issues no such product, or because it reported nothing inside the lookback, and the weather response cannot tell them apart — AWC omits the row identically in all three cases. Resolving them would take a second `/stationinfo` request per call and still fail, because a registered station with no recent observation is listed as fully capable. So `missing` is flat and the notice names the candidate causes without asserting one, which is the same rule that keeps normalization from fabricating facts out of absent upstream data.
 
+**18. A capped result says so; it does not quietly reassemble itself.**
+Every AWC endpoint serves at most 400 rows and the OpenAPI schema neither paginates nor mentions the limit, so a cut page is indistinguishable from a complete one. `aviation_find_stations` and `aviation_get_pireps` are the two tools whose inputs can reach that ceiling, and both then filter client-side — on `state` and on altitude — so a cut page is narrowed again before the caller sees it. A `state: "TX"` query returns 279 stations against a cap of 400, which reads as headroom while a bbox tiling of the same area reaches 298; an altitude band can come back empty because the reports that matched it sat in the part of the window the cap dropped.
+
+The disclosure is the fix, not recovery. Narrowing provably converges — the same query against the same upstream state returns a byte-identical page, and each partition of a capped query is a strict superset of what the capped call held — but only the caller can pace the follow-ups. Partitioning inside a single tool call would issue 5 requests for one state and an unbounded number for a global box, against AWC's published guidance of no more than one request per minute per thread. The cache datasets are complete but a different architecture: a gzipped bulk download with its own refresh semantics and formats the normalizers do not read. Both are out of scope here; the caller who is told the result is capped can finish the job with the levers the tool names.
+
+Detection is `drawn rows >= 400`, read before any client-side filter — the returned count cannot carry it, which is why `fetchStations` hands its pre-filter draw size back to the handler. A genuine 400-row complete result is reported as capped. That false positive over-warns in the safe direction: the caller narrows a query that did not need it, rather than trusting a page that was cut.
+
+The two tools' empty-result errors are deliberately asymmetric. `no_pireps_found` distinguishes a capped page, because an altitude band selecting nothing out of a cut window is ordinary and the old message reported that page's size as an area-wide count. `station_not_found` carries no such branch: reaching it from a capped draw needs a state whose bbox fills all 400 rows without one of the state's own stations among them, and a sweep of all 51 boxes finds Texas the only one that caps at all, keeping 279. Adding the branch would guard a state that cannot occur — leave it out rather than restoring it for symmetry.
+
 ---
 
 ## Known Limitations
 
-- **Coverage:** METAR/TAF are global; PIREPs and SIGMETs/AIRMETs are US-centric (AWC is a US NWS product).
+- **Coverage:** METAR/TAF are global; PIREPs and SIGMETs are US-centric (AWC is a US NWS product).
 - **Recency:** METARs are typically 20–60 min old. TAFs are 6–30 hour forecasts. PIREPs are real-time but sparse. Advisory set reflects only currently active products.
 - **No historical archive:** The API serves recent observations only (`hours` parameter up to 12 for METAR). No multi-day historical queries.
+- **400-row result cap:** Every endpoint returns at most 400 entries and offers no pagination surface. `aviation_find_stations` (bbox and state modes) and `aviation_get_pireps` can reach it; both disclose a capped result and name the levers that narrow the query before the cap applies. The other three tools' input limits keep them well below it. See decision 18.
 - **Not an official briefing:** This data does not constitute a regulatory-compliant preflight weather briefing. Pilots flying IFR or in controlled airspace must use an authorized source.
-- **AIRSIGMET scope:** During fair-weather periods, no AIRMETs may be active. Absence of results is a valid state, not an error.
+- **AIRSIGMET scope:** The endpoint serves domestic SIGMETs only and cannot return an AIRMET, so `aviation_get_advisories` rejects an AIRMET request rather than answering it (see decision 2); G-AIRMET and textual AIRMET support is tracked in #29. During fair-weather periods no SIGMETs may be active — absence of results is a valid state, not an error.
 - **Empty cloud arrays are ambiguous:** AWC does not encode a clear sky as a layer — a METAR reporting `CLR` and one carrying no sky-condition group at all both arrive as `clouds: []`. Both currently render as `Clear`, which overstates the second case and is the one place the "never state what the structured result does not support" rule above is not yet honored. Separating them requires inspecting the raw observation; tracked in #27.
 
 ---
@@ -425,6 +464,8 @@ This lives in `enrichment`, not `output`: it is agent-facing context about the r
 - `hours=N` — lookback window for `metar` and `taf` (METAR: 1–12 typical)
 - `age=N` — lookback window ("Hours Back") for `pirep`; that endpoint has no `hours` parameter and silently ignores one
 - `distance=N` — radius in nautical miles around the `id` center point for PIREP searches; ignored when the search is a bbox
+
+**Every endpoint returns at most 400 entries.** The limit is stated under Restrictions in the API documentation, alongside a request-pacing guideline of no more than 1 request/min per thread. The OpenAPI schema declares no `page`, `offset`, `limit`, or cursor parameter on any endpoint and does not mention the cap, so a client parsing the schema cannot learn the limit exists — a capped page is detectable only by counting the rows returned. `stationinfo` accepts only `ids`, `bbox`, and `format`, which leaves a smaller bounding box as its single narrowing lever.
 
 **Timestamp fields are Unix epoch seconds (integers), not ISO strings.** Applies to: METAR `obsTime`, TAF `validTimeFrom`/`validTimeTo`, AIRSIGMET `validTimeFrom`/`validTimeTo`. Convert via `new Date(value * 1000).toISOString()`. METAR `receiptTime`/`reportTime` and TAF `issueTime` are already ISO 8601 strings.
 

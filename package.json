@@ -1,8 +1,8 @@
 {
   "name": "@cyanheads/aviation-weather-mcp-server",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "mcpName": "io.github.cyanheads/aviation-weather-mcp-server",
-  "description": "Fetch METARs, TAFs, PIREPs, and SIGMETs/AIRMETs from the NWS Aviation Weather Center via MCP. STDIO or Streamable HTTP.",
+  "description": "Fetch METARs, TAFs, PIREPs, and domestic SIGMETs from the NWS Aviation Weather Center via MCP. STDIO or Streamable HTTP.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -48,7 +48,6 @@
     "taf",
     "pirep",
     "sigmet",
-    "airmet",
     "aviation-weather-center",
     "awc",
     "flight-weather",

@@ -4,9 +4,10 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { aviationFindStations } from '@/mcp-server/tools/definitions/aviation-find-stations.tool.js';
+import { AWC_MAX_ROWS } from '@/services/aviation-weather/awc-limits.js';
 import type { NormalizedStation } from '@/services/aviation-weather/types.js';
 
 // ---------------------------------------------------------------------------
@@ -482,5 +483,143 @@ describe('aviationFindStations.format', () => {
 
     expect(text).toContain('**Elevation:** 0 ft');
     expect(text).not.toContain('unknown');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Upstream result-cap disclosure (issue #11) — `stationinfo` serves at most 400
+// rows, and the state mode filters that page again inside the service, so a
+// count far below the cap can still be a cut draw
+// ---------------------------------------------------------------------------
+
+describe('aviationFindStations truncation disclosure', () => {
+  /** A page of distinct stations, so a draw can be filled to the cap. */
+  function page(count: number, state = 'TX'): NormalizedStation[] {
+    return Array.from({ length: count }, (_, i) => ({
+      ...ksea,
+      icao_id: `K${String(i).padStart(3, '0')}`,
+      name: `Station ${i}`,
+      state,
+    }));
+  }
+
+  /**
+   * Resolve the service mock with `stations`, reporting `preFilterRows` through
+   * the pre-filter channel the way the state mode does. Omit it to model the
+   * modes that run no client-side filter and therefore report nothing.
+   */
+  function mockDraw(stations: NormalizedStation[], preFilterRows?: number) {
+    mockFetchStations.mockImplementation(async (params) => {
+      if (preFilterRows != null) params.onPreFilterRows?.(preFilterRows);
+      return stations;
+    });
+  }
+
+  /** Run the handler and return the enrichment it accumulated. */
+  async function enrichmentFor(input: Record<string, unknown>) {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    await aviationFindStations.handler(aviationFindStations.input.parse(input), ctx);
+    return getEnrichment(ctx);
+  }
+
+  it('discloses a bbox draw cut at the upstream maximum', async () => {
+    mockDraw(page(AWC_MAX_ROWS));
+
+    expect(
+      await enrichmentFor({ bbox: { minLat: 25, minLon: -107, maxLat: 37, maxLon: -93 } }),
+    ).toMatchObject({ truncated: true, shown: AWC_MAX_ROWS, cap: AWC_MAX_ROWS });
+  });
+
+  it('discloses a capped state query whose post-filter count sits below the cap', async () => {
+    // The Texas case from the issue: 400 rows drawn, 279 of them in-state. The
+    // count alone reads as headroom, so the pre-filter draw has to be stated.
+    mockDraw(page(279), AWC_MAX_ROWS);
+
+    expect(await enrichmentFor({ state: 'TX' })).toMatchObject({
+      truncated: true,
+      shown: 279,
+      cap: AWC_MAX_ROWS,
+      upstreamRows: AWC_MAX_ROWS,
+    });
+  });
+
+  it('names a smaller bbox as the lever on a capped state query', async () => {
+    mockDraw(page(279), AWC_MAX_ROWS);
+    const notice = String((await enrichmentFor({ state: 'TX' })).notice);
+
+    expect(notice).toContain('bbox');
+    expect(notice).toContain('TX');
+  });
+
+  it('states completeness affirmatively on an uncapped draw', async () => {
+    mockDraw([ksea, kbfi], 2);
+    const enrichment = await enrichmentFor({ state: 'WA' });
+
+    expect(enrichment).toMatchObject({ truncated: false, shown: 2 });
+    expect(enrichment).not.toHaveProperty('cap');
+    expect(enrichment).not.toHaveProperty('upstreamRows');
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('omits the pre-filter count when no client-side filter ran', async () => {
+    // A bbox draw is served as-is, so a second count would only restate `shown`.
+    mockDraw(page(AWC_MAX_ROWS));
+    const enrichment = await enrichmentFor({
+      bbox: { minLat: 25, minLon: -107, maxLat: 37, maxLon: -93 },
+    });
+
+    expect(enrichment).toMatchObject({ truncated: true });
+    expect(enrichment).not.toHaveProperty('upstreamRows');
+  });
+
+  it('omits the pre-filter count when the state filter dropped nothing', async () => {
+    // A capped draw entirely inside the requested state: the truncation still
+    // stands, but the drawn count equals `shown` and restates it.
+    mockDraw(page(AWC_MAX_ROWS), AWC_MAX_ROWS);
+    const enrichment = await enrichmentFor({ state: 'TX' });
+
+    expect(enrichment).toMatchObject({ truncated: true, shown: AWC_MAX_ROWS });
+    expect(enrichment).not.toHaveProperty('upstreamRows');
+  });
+
+  it('leaves an empty result an error rather than a truncation disclosure', async () => {
+    mockDraw([], AWC_MAX_ROWS);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ state: 'TX' });
+
+    await expect(aviationFindStations.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'station_not_found' },
+    });
+    expect(getEnrichment(ctx)).not.toHaveProperty('truncated');
+  });
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    mockDraw(page(279), AWC_MAX_ROWS);
+    const result = await runToolContract(aviationFindStations, { state: 'TX' });
+
+    expect(result.structuredContent).toMatchObject({
+      truncated: true,
+      shown: 279,
+      cap: AWC_MAX_ROWS,
+      upstreamRows: AWC_MAX_ROWS,
+    });
+
+    // A client reading only content[] must learn the same two facts: the result
+    // was cut, and a smaller bbox is what recovers the rest.
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain(String(AWC_MAX_ROWS));
+    expect(text).toContain('bbox');
+  });
+
+  it('leaves the stations payload and its rendering untouched', async () => {
+    mockDraw([ksea], AWC_MAX_ROWS);
+    const result = await runToolContract(aviationFindStations, { state: 'WA' });
+
+    expect(result.structuredContent).toMatchObject({
+      stations: [expect.objectContaining({ icao_id: 'KSEA' })],
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('## Seattle-Tacoma International Airport');
+    expect(text).toContain('**Data types:** METAR, TAF, SYNOP');
   });
 });

@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/aviation-weather-mcp-server</h1>
-  <p><b>Fetch METARs, TAFs, PIREPs, and SIGMETs/AIRMETs from the NWS Aviation Weather Center via MCP. STDIO or Streamable HTTP.</b>
+  <p><b>Fetch METARs, TAFs, PIREPs, and domestic SIGMETs from the NWS Aviation Weather Center via MCP. STDIO or Streamable HTTP.</b>
   <div>5 Tools • 1 Prompt</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -37,7 +37,7 @@ Five tools covering aviation weather — station lookup, current observations, t
 | `aviation_get_metar` | Get current weather observations (METARs) for one or more airports. Returns decoded wind, visibility, ceiling, present weather, temp/dewpoint, altimeter, cloud layers, flight category (VFR/MVFR/IFR/LIFR), and the raw METAR string. |
 | `aviation_get_taf` | Get Terminal Aerodrome Forecasts for one or more airports. Returns each forecast period with valid times, surface wind, low-level wind shear, visibility, decoded weather, cloud layers, and vertical visibility into a forecast obscuration, plus the raw TAF string. |
 | `aviation_get_pireps` | Get recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, and the raw PIREP string. |
-| `aviation_get_advisories` | Get active SIGMETs and AIRMETs for a region. Returns hazard type (CONVECTIVE, TURBULENCE, ICING, IFR, MTN OBSCN), severity, altitude range, valid period, polygon coordinates, and raw text. |
+| `aviation_get_advisories` | Get active domestic SIGMETs for a region. Returns hazard type (CONVECTIVE, TURBULENCE, ICING, IFR), severity, altitude range, valid period, polygon coordinates, and raw text. |
 
 ### `aviation_find_stations`
 
@@ -47,6 +47,7 @@ Resolve and discover weather stations by multiple search modes.
 - Discover all stations within a geographic bounding box
 - List stations for one of the 50 US states or DC via two-letter USPS code (uses bbox + client-side state filter)
 - Returns `data_types` (METAR, TAF, etc.) so agents can confirm what's available before querying
+- Every result states whether the upstream 400-row cap cut it, so a truncated draw is never mistaken for every station in the area — a capped state query also reports the row count from before the state filter, and a smaller `bbox` is the named lever
 
 ---
 
@@ -84,18 +85,20 @@ Search for recent Pilot Reports by station+radius or bounding box.
 - `bbox` for geographic area search — useful for en-route corridor checks; `distance_nm` has no meaning here and is rejected alongside it
 - `altitude_min_ft` / `altitude_max_ft` filters to isolate reports at cruise altitude, either bound alone or both (min must not exceed max)
 - Turbulence and icing arrays include up to two layers per report (as reported by the API)
+- Every result states whether the upstream 400-row cap cut it, naming `bbox`, `distance_nm`, and `hours` as the levers that narrow a query before the cap applies — the altitude filter runs after it and cannot recover a dropped report
 - Note: absence of PIREPs does not mean smooth conditions — they are sparse by nature
 
 ---
 
 ### `aviation_get_advisories`
 
-List currently active SIGMETs and AIRMETs.
+List currently active domestic SIGMETs.
 
-- `advisory_type` filter: `sigmet`, `airmet`, or `all` (default)
-- `hazard` filter: `CONVECTIVE`, `TURBULENCE`, `ICING`, `IFR`, `MTN OBSCN`, `SURFACE WIND`, `LLWS`
+- `advisory_type` filter: `sigmet` or `all` (default) — both return the active SIGMET set
+- `hazard` filter: `CONVECTIVE`, `TURBULENCE`, `ICING`, `IFR`
 - `bbox` filter applied client-side (AWC API returns all active advisories; the tool filters by polygon overlap)
-- During fair-weather periods, no AIRMETs may be active — an empty result is a valid state, not an error
+- AIRMETs are not served. The upstream feed carries domestic SIGMETs only, so `advisory_type: airmet` and the `MTN OBSCN`, `SURFACE WIND`, and `LLWS` hazards are rejected with guidance rather than answered with SIGMETs or an empty array
+- During fair-weather periods, no SIGMETs may be active — an empty result is a valid state, not an error
 
 ---
 

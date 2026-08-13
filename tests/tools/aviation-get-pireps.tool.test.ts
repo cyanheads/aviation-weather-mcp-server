@@ -4,9 +4,10 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { aviationGetPireps } from '@/mcp-server/tools/definitions/aviation-get-pireps.tool.js';
+import { AWC_MAX_ROWS } from '@/services/aviation-weather/awc-limits.js';
 import type { NormalizedPirep } from '@/services/aviation-weather/types.js';
 
 // ---------------------------------------------------------------------------
@@ -841,5 +842,167 @@ describe('aviationGetPireps.format hazard altitude bounds', () => {
     expect(text).toContain('36.037, -80.5');
     expect(text).not.toContain('36.0370');
     expect(text).not.toContain('-80.5000');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Upstream result-cap disclosure (issue #11) — `pirep` serves at most 400 rows,
+// and the altitude filter runs after that cap, so it can only ever select from
+// the page the cap left behind
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps truncation disclosure', () => {
+  /** A page of distinct reports at one altitude, so a draw can reach the cap. */
+  function page(count: number, altitude_ft: number | null = 8000): NormalizedPirep[] {
+    return Array.from({ length: count }, (_, i) => ({
+      ...minimalPirep,
+      altitude_ft,
+      observed_at: new Date(Date.UTC(2026, 0, 15, 6, i % 60)).toISOString(),
+    }));
+  }
+
+  /** Run the handler and return the enrichment it accumulated. */
+  async function enrichmentFor(input: Record<string, unknown>, reports: NormalizedPirep[]) {
+    mockFetchPireps.mockResolvedValue(reports);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    await aviationGetPireps.handler(aviationGetPireps.input.parse(input), ctx);
+    return getEnrichment(ctx);
+  }
+
+  /** Run the handler over a page that empties and return the error it threw. */
+  async function errorFor(input: Record<string, unknown>, reports: NormalizedPirep[]) {
+    mockFetchPireps.mockResolvedValue(reports);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    try {
+      await aviationGetPireps.handler(aviationGetPireps.input.parse(input), ctx);
+    } catch (e) {
+      return e as { message: string; data?: { recovery?: { hint?: string } } };
+    }
+    throw new Error('handler resolved where it was expected to throw');
+  }
+
+  it('discloses a page cut at the upstream maximum', async () => {
+    expect(
+      await enrichmentFor(
+        { bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 }, hours: 12 },
+        page(AWC_MAX_ROWS),
+      ),
+    ).toMatchObject({ truncated: true, shown: AWC_MAX_ROWS, cap: AWC_MAX_ROWS });
+  });
+
+  it('carries the pre-filter count when the altitude filter narrowed a capped page', async () => {
+    const reports = [...page(AWC_MAX_ROWS - 2, 8000), ...page(2, 33000)];
+
+    expect(
+      await enrichmentFor(
+        { bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 }, altitude_min_ft: 30000 },
+        reports,
+      ),
+    ).toMatchObject({
+      truncated: true,
+      shown: 2,
+      cap: AWC_MAX_ROWS,
+      upstreamRows: AWC_MAX_ROWS,
+    });
+  });
+
+  it('names the levers that narrow before the cap, and not the altitude filter', async () => {
+    const notice = String(
+      (
+        await enrichmentFor(
+          { bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 }, hours: 12 },
+          page(AWC_MAX_ROWS),
+        )
+      ).notice,
+    );
+
+    expect(notice).toContain('bbox');
+    expect(notice).toContain('hours');
+    // The altitude filter runs after the cap, so it can never recover a dropped
+    // report — offering it as a lever would send the caller in a circle.
+    expect(notice).not.toMatch(/altitude_(min|max)_ft(?!.*cannot)/);
+  });
+
+  it('states completeness affirmatively on an uncapped page', async () => {
+    const enrichment = await enrichmentFor({ station_id: 'KSEA' }, [pirep, minimalPirep]);
+
+    expect(enrichment).toMatchObject({ truncated: false, shown: 2 });
+    expect(enrichment).not.toHaveProperty('cap');
+    expect(enrichment).not.toHaveProperty('upstreamRows');
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('omits the pre-filter count when no altitude filter ran', async () => {
+    const enrichment = await enrichmentFor(
+      { bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 }, hours: 12 },
+      page(AWC_MAX_ROWS),
+    );
+
+    expect(enrichment).toMatchObject({ truncated: true });
+    expect(enrichment).not.toHaveProperty('upstreamRows');
+  });
+
+  it('stops claiming an area-wide count when the altitude filter empties a capped page', async () => {
+    const err = await errorFor(
+      { bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 }, altitude_min_ft: 30000 },
+      page(AWC_MAX_ROWS),
+    );
+
+    // The capped page holds 400 rows; the area holds more. Reporting 400 as the
+    // reports "in the area" is the assertion this fix removes.
+    expect(err.message).not.toMatch(/400 report\(s\) were found/);
+    expect(err.data?.recovery?.hint).not.toMatch(/400 PIREP\(s\) exist in the area/);
+    expect(err.message).toMatch(/in part|partial/i);
+    expect(err.data?.recovery?.hint).toContain('bbox');
+  });
+
+  it('still reports the upstream count when an uncapped page empties', async () => {
+    // Characterization — below the cap the count is a fact about the area, and
+    // the fix must not weaken it into a hedge.
+    const err = await errorFor({ station_id: 'KSEA', altitude_min_ft: 30000 }, page(3));
+
+    expect(err.message).toContain('3 report(s) were found at other or unreported altitudes');
+    expect(err.data?.recovery?.hint).toContain('3 PIREP(s) exist in the area');
+  });
+
+  it('leaves an empty upstream result an error rather than a truncation disclosure', async () => {
+    mockFetchPireps.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KSEA' });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_pireps_found' },
+    });
+    expect(getEnrichment(ctx)).not.toHaveProperty('truncated');
+  });
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    mockFetchPireps.mockResolvedValue(page(AWC_MAX_ROWS));
+    const result = await runToolContract(aviationGetPireps, {
+      bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 },
+      hours: 12,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      truncated: true,
+      shown: AWC_MAX_ROWS,
+      cap: AWC_MAX_ROWS,
+    });
+
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain(String(AWC_MAX_ROWS));
+    expect(text).toContain('bbox');
+  });
+
+  it('leaves the pireps payload and its rendering untouched', async () => {
+    mockFetchPireps.mockResolvedValue([pirep]);
+    const result = await runToolContract(aviationGetPireps, { station_id: 'KSEA', hours: 3 });
+
+    expect(result.structuredContent).toMatchObject({
+      pireps: [expect.objectContaining({ altitude_ft: 27000, aircraft_type: 'B737' })],
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('## PIREP — 2026-01-15T18:30:00.000Z');
+    expect(text).toContain('MOD, CAT, OCNL (24,000–28,000 ft)');
   });
 });

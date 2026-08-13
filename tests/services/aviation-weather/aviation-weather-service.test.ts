@@ -1225,3 +1225,68 @@ describe('AviationWeatherService state station lookup', () => {
     expect(fetchWithTimeout).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Advisory request construction (issue #12) — `/airsigmet` defines no type
+// filter and answers HTTP 200 while dropping query keys it does not recognize,
+// so an inert `type=` key reads as a filter that ran
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService advisory request construction', () => {
+  it.each(['sigmet', 'all'] as const)('sends no type filter for %s', async (advisoryType) => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([]));
+    await svc.fetchAdvisories({ advisoryType }, createMockContext());
+
+    const url = lastRequestUrl();
+    expect(url).toContain('/airsigmet?format=json');
+    expect(url).not.toContain('type=');
+    expect(url).not.toContain('types=');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pre-filter row count (issue #11) — the 400-row cap applies to the draw, and
+// the state mode cuts that draw again in here, so the caller cannot recover the
+// drawn size from what it gets back
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService pre-filter row count', () => {
+  it('reports the drawn row count ahead of the state filter', async () => {
+    // KBWI is outside WA and is filtered away, so the returned length is 1
+    // while the draw the cap applied to was 2.
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationKSEA, rawStationKBWI]));
+    const onPreFilterRows = vi.fn();
+    const stations = await svc.fetchStations({ state: 'WA', onPreFilterRows }, createMockContext());
+
+    expect(onPreFilterRows).toHaveBeenCalledWith(2);
+    expect(stations).toHaveLength(1);
+  });
+
+  it('reports a drawn count of zero when the filter empties a non-empty draw', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationKBWI]));
+    const onPreFilterRows = vi.fn();
+    const stations = await svc.fetchStations({ state: 'WA', onPreFilterRows }, createMockContext());
+
+    expect(onPreFilterRows).toHaveBeenCalledWith(1);
+    expect(stations).toHaveLength(0);
+  });
+
+  it('stays silent in the bbox mode, whose draw is returned unfiltered', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationKSEA, rawStationKBWI]));
+    const onPreFilterRows = vi.fn();
+    await svc.fetchStations(
+      { bbox: { minLat: 25, minLon: -125, maxLat: 49, maxLon: -66 }, onPreFilterRows },
+      createMockContext(),
+    );
+
+    expect(onPreFilterRows).not.toHaveBeenCalled();
+  });
+
+  it('stays silent in the station_ids mode, whose draw is returned unfiltered', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationKSEA]));
+    const onPreFilterRows = vi.fn();
+    await svc.fetchStations({ stationIds: ['KSEA'], onPreFilterRows }, createMockContext());
+
+    expect(onPreFilterRows).not.toHaveBeenCalled();
+  });
+});

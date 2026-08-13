@@ -10,7 +10,13 @@
  * Approximate bounding boxes for the 50 US states and DC. The AWC
  * `stationinfo` endpoint has no `state` parameter, so a state query is issued
  * as a bbox draw and the results are filtered client-side on each station's
- * `state` field — an overshooting box only costs extra rows, never accuracy.
+ * `state` field.
+ *
+ * An overshooting box costs accuracy once the draw reaches the upstream row
+ * cap, not merely extra rows: the neighbouring states and territory the box
+ * overlaps consume slots the requested state's stations would otherwise have
+ * filled, and the filter then runs on what is left. A Texas query returns 279
+ * stations where a bbox tiling of the same area reaches 298.
  *
  * US territories (PR, VI, GU, MP, AS) are deliberately absent: AWC leaves
  * `state` empty on their stations and identifies them by `country`, so a bbox

@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
+import { AWC_MAX_ROWS, isUpstreamCapped } from '@/services/aviation-weather/awc-limits.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
 
 const BboxSchema = z
@@ -88,6 +89,13 @@ const PirepCloudLayerSchema = z
 
 /** Radius applied to a station_id search when distance_nm is omitted. */
 const DEFAULT_DISTANCE_NM = 100;
+
+/**
+ * The parameters that narrow a PIREP query before the upstream row cap applies.
+ * The altitude bounds are deliberately absent: they are applied to the page the
+ * cap already returned, so they cannot reach a report the cap dropped.
+ */
+const NARROWING_LEVERS = 'a smaller bbox, a smaller distance_nm, or a shorter hours';
 
 /**
  * Render a vertical extent where either bound may be unreported — shared by the
@@ -251,6 +259,40 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     },
   ],
 
+  enrichment: {
+    truncated: z
+      .boolean()
+      .describe(
+        'True when the upstream page hit the AWC row cap, so reports inside the search area and time window are missing from this result. False affirms the whole window was searched, which a count alone cannot establish.',
+      ),
+    shown: z.number().describe('Reports in this result, counted after any altitude filter.'),
+    cap: z
+      .number()
+      .optional()
+      .describe(
+        'The upstream row maximum that was applied to the page. Present only on a truncated result.',
+      ),
+    upstreamRows: z
+      .number()
+      .optional()
+      .describe(
+        'Reports AWC returned before the altitude filter ran. Present only on a truncated result the filter then narrowed, where the remaining count sits below the cap and so cannot reveal the truncation on its own.',
+      ),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance naming the levers that narrow the query before the cap applies. Present only on a truncated result.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    truncated: { label: 'Truncated at the upstream row cap' },
+    shown: { label: 'Reports returned' },
+    cap: { label: 'Upstream row maximum' },
+    upstreamRows: { label: 'Reports returned before the altitude filter' },
+  },
+
   async handler(input, ctx) {
     if (!input.station_id && !input.bbox) {
       throw ctx.fail(
@@ -330,6 +372,10 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     // Sort by observation time descending
     pireps.sort((a, b) => new Date(b.observed_at).getTime() - new Date(a.observed_at).getTime());
 
+    // The cap applies to the page upstream served, before the altitude filter
+    // selected from it — so it is `rawCount`, never the count left afterwards.
+    const capped = isUpstreamCapped(rawCount);
+
     if (pireps.length === 0) {
       const altFiltered = (altMin != null || altMax != null) && rawCount > 0;
       const altRange =
@@ -341,18 +387,43 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
               ? `below ${altMax.toLocaleString()} ft`
               : null;
 
-      const message = altFiltered
-        ? `No PIREPs in the search area matched the altitude filter (${altRange}). ${rawCount} report(s) were found at other or unreported altitudes.`
-        : `No PIREPs found in the search area for the past ${input.hours} hour(s).`;
+      // A capped page cannot support a claim about the whole area: the filter
+      // only ever saw the rows the cap left behind, so reporting that page's
+      // size as the reports present in the area asserts what was never searched.
+      const cappedAndFiltered = altFiltered && capped;
 
-      const recovery = altFiltered
-        ? `Remove or adjust altitude_min_ft / altitude_max_ft. ${rawCount} PIREP(s) exist in the area at other or unreported altitudes.`
-        : 'Expand the distance_nm or hours parameters, or try a different region. PIREPs are sparse; absence of reports does not mean smooth conditions.';
+      const message = cappedAndFiltered
+        ? `No PIREPs matched the altitude filter (${altRange}) in the part of the search area upstream returned. AWC capped this query at ${AWC_MAX_ROWS} reports, so the area was searched only in part — reports beyond that page were never examined.`
+        : altFiltered
+          ? `No PIREPs in the search area matched the altitude filter (${altRange}). ${rawCount} report(s) were found at other or unreported altitudes.`
+          : `No PIREPs found in the search area for the past ${input.hours} hour(s).`;
+
+      const recovery = cappedAndFiltered
+        ? `Narrow the search until it falls under the ${AWC_MAX_ROWS}-report upstream cap — ${NARROWING_LEVERS} — then reapply the altitude filter. The filter runs after the cap, so adjusting altitude_min_ft / altitude_max_ft alone cannot reach a report the cap dropped.`
+        : altFiltered
+          ? `Remove or adjust altitude_min_ft / altitude_max_ft. ${rawCount} PIREP(s) exist in the area at other or unreported altitudes.`
+          : 'Expand the distance_nm or hours parameters, or try a different region. PIREPs are sparse; absence of reports does not mean smooth conditions.';
 
       throw ctx.fail('no_pireps_found', message, { recovery: { hint: recovery } });
     }
 
-    ctx.log.info('PIREPs retrieved', { count: pireps.length });
+    if (capped) {
+      const narrowed =
+        pireps.length < rawCount
+          ? ` — the ${pireps.length} shown are what survived the altitude filter applied to that capped page`
+          : '';
+      ctx.enrich.truncated({
+        shown: pireps.length,
+        cap: AWC_MAX_ROWS,
+        guidance: `AWC served ${rawCount} reports for this query, its per-request maximum, so reports inside the search area and the ${input.hours}-hour window are missing from this result${narrowed}. Narrow the search — ${NARROWING_LEVERS} — and re-run. The altitude filter runs after the cap and cannot reach a report the cap dropped.`,
+      });
+      // Restating the served count is only informative where the filter moved it.
+      if (pireps.length < rawCount) ctx.enrich({ upstreamRows: rawCount });
+    } else {
+      ctx.enrich({ truncated: false, shown: pireps.length });
+    }
+
+    ctx.log.info('PIREPs retrieved', { count: pireps.length, rawCount });
     return { pireps };
   },
 
