@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** `@cyanheads/aviation-weather-mcp-server`
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.5`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/sdk` ^1.30.0

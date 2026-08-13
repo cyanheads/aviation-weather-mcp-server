@@ -1,6 +1,6 @@
 # aviation-weather-mcp-server - Directory Structure
 
-Generated on: 2026-08-13 11:14:44
+Generated on: 2026-08-13 12:45:02
 
 ```text
 aviation-weather-mcp-server/
@@ -24,6 +24,7 @@ aviation-weather-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md

@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-08-13 · ⚠️ Breaking
+
+TAF weather field changes from a string to raw/decoded (breaking); forecast obscuration and wind shear restored; batch calls now disclose missing stations
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-08-13 · ⚠️ Breaking
 
 Nullable METAR/TAF/PIREP/station outputs replace fabricated zeros (breaking); ceiling now covers obscured skies; cloud heights corrected to AGL
