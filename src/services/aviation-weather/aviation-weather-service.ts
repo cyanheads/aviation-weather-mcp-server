@@ -12,10 +12,13 @@ import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { STATE_BBOXES } from './state-bboxes.js';
 import type {
+  MetarCeilingType,
   NormalizedAdvisory,
+  NormalizedCloudLayer,
   NormalizedIcingLayer,
   NormalizedMetar,
   NormalizedPirep,
+  NormalizedPresentWeather,
   NormalizedStation,
   NormalizedTaf,
   NormalizedTafPeriod,
@@ -103,24 +106,82 @@ function decodeWxString(wxString: string | null | undefined): string | null {
   return `${intensity}${description}`.trim();
 }
 
+/**
+ * Present weather as both the raw group and its decoded reading. TAF carries
+ * only the decoded form; METAR keeps the raw group too, so a compound group the
+ * decoder does not split (`+RA BR`) stays recoverable without re-parsing the
+ * raw observation.
+ */
+function normalizePresentWeather(
+  wxString: string | null | undefined,
+): NormalizedPresentWeather | null {
+  const raw = wxString?.trim();
+  const decoded = decodeWxString(raw);
+  return raw && decoded ? { raw, decoded } : null;
+}
+
 // ---------------------------------------------------------------------------
 // Helper: normalize a raw cloud layer array
 // ---------------------------------------------------------------------------
 
-function normalizeClouds(
-  clouds: RawCloudLayer[] | null | undefined,
-): { cover: string; base_ft: number }[] {
+/**
+ * Aerodrome cloud bases arrive from AWC already in feet AGL (a `BKN030` group
+ * decodes to `base: 3000` above the field). Pass them through unchanged — adding
+ * station elevation would convert a correct AGL height into a wrong MSL one.
+ */
+function normalizeClouds(clouds: RawCloudLayer[] | null | undefined): NormalizedCloudLayer[] {
   if (!clouds || clouds.length === 0) return [];
   return clouds
     .filter((c) => c.base != null)
     .map((c) => ({ cover: c.cover, base_ft: c.base as number }));
 }
 
-/** Compute ceiling (lowest BKN or OVC layer) from normalized cloud layers. */
-function computeCeiling(clouds: { cover: string; base_ft: number }[]): number | null {
-  const ceilingLayers = clouds.filter((c) => c.cover === 'BKN' || c.cover === 'OVC');
-  if (ceilingLayers.length === 0) return null;
-  return Math.min(...ceilingLayers.map((c) => c.base_ft));
+/**
+ * The decoded form of a `VVhhh` group — the sky is obscured and the height is
+ * how far up a pilot can see into it, not a layer bottom.
+ */
+const OBSCURATION_COVER = 'OVX';
+
+/**
+ * Sky covers that constitute a ceiling. FAA AIM 7-1-13, on METAR sky condition:
+ * "A ceiling layer is not designated in the METAR code. For aviation purposes,
+ * the ceiling is the lowest broken or overcast layer, or vertical visibility
+ * into an obscuration." Few and scattered layers are not ceilings.
+ */
+const CEILING_COVERS = new Set(['BKN', 'OVC', OBSCURATION_COVER]);
+
+/**
+ * Convert METAR `vertVis` to feet. This endpoint publishes the `VVhhh` group's
+ * own hundreds-of-feet value — `VV002` arrives as `2` beside a `clouds[].base`
+ * of 200 — despite the AWC schema documenting the field as feet. The TAF
+ * endpoint publishes it in feet, so this conversion is METAR-only: applying it
+ * there, or omitting it here, is wrong by a factor of 100 either way.
+ */
+function verticalVisibilityFeet(vertVis: number | null | undefined): number | null {
+  return vertVis != null ? vertVis * 100 : null;
+}
+
+/**
+ * Ceiling height and kind from the normalized cloud layers, in feet AGL. The
+ * lowest qualifying layer wins regardless of cover. `vertVisFt` backstops an
+ * obscuration AWC published with no layer base, which `normalizeClouds` drops
+ * and would otherwise leave an obscured sky reading as no ceiling at all.
+ */
+function computeCeiling(
+  clouds: NormalizedCloudLayer[],
+  vertVisFt: number | null,
+): { ceiling_ft: number | null; ceiling_type: MetarCeilingType | null } {
+  const layers = clouds.filter((c) => CEILING_COVERS.has(c.cover));
+  if (layers.length === 0) {
+    return vertVisFt != null
+      ? { ceiling_ft: vertVisFt, ceiling_type: 'indefinite' }
+      : { ceiling_ft: null, ceiling_type: null };
+  }
+  const lowest = layers.reduce((a, b) => (b.base_ft < a.base_ft ? b : a));
+  return {
+    ceiling_ft: lowest.base_ft,
+    ceiling_type: lowest.cover === OBSCURATION_COVER ? 'indefinite' : 'measured',
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -151,16 +212,19 @@ function normalizeMetar(raw: RawMetar): NormalizedMetar {
     observed_at: new Date(raw.obsTime * 1000).toISOString(),
     wind: {
       direction_deg: typeof raw.wdir === 'number' ? raw.wdir : null,
-      speed_kt: raw.wspd ?? 0,
+      speed_kt: raw.wspd ?? null,
       gust_kt: raw.wgst ?? null,
     },
     visibility_sm: visib,
-    ceiling_ft: computeCeiling(clouds),
+    // ceiling_ft and ceiling_type are one measurement — a height is meaningless
+    // without knowing whether it was measured or seen up into an obscuration.
+    ...computeCeiling(clouds, verticalVisibilityFeet(raw.vertVis)),
     clouds,
-    temp_c: raw.temp ?? 0,
-    dewpoint_c: raw.dewp ?? 0,
+    present_weather: normalizePresentWeather(raw.wxString),
+    temp_c: raw.temp ?? null,
+    dewpoint_c: raw.dewp ?? null,
     // AWC API returns altim in hPa — convert to inHg (1 hPa = 0.02953 inHg)
-    altimeter_inhg: raw.altim != null ? Math.round(raw.altim * 0.02953 * 100) / 100 : 0,
+    altimeter_inhg: raw.altim != null ? Math.round(raw.altim * 0.02953 * 100) / 100 : null,
     raw_metar: raw.rawOb,
   };
 }
@@ -170,7 +234,10 @@ function normalizeTafPeriod(p: RawTafForecastPeriod): NormalizedTafPeriod {
     p.clouds
       ?.filter((c) => c.base != null)
       .map((c) => ({ cover: c.cover, base_ft: c.base as number, type: c.type ?? null })) ?? [];
-  const visib = p.visib == null ? null : typeof p.visib === 'string' ? p.visib : String(p.visib);
+  // A period carrying no visibility element arrives as an empty string, not
+  // null, so a bare null check leaves it to render as a bare " sm".
+  const rawVisib = p.visib == null ? null : typeof p.visib === 'string' ? p.visib : String(p.visib);
+  const visib = rawVisib?.trim() ? rawVisib : null;
 
   return {
     from: new Date(p.timeFrom * 1000).toISOString(),
@@ -179,7 +246,10 @@ function normalizeTafPeriod(p: RawTafForecastPeriod): NormalizedTafPeriod {
     probability: p.probability ?? null,
     wind: {
       direction_deg: typeof p.wdir === 'number' ? p.wdir : null,
-      speed_kt: p.wspd ?? 0,
+      // A TEMPO or PROB group amending only visibility, weather, or cloud
+      // carries no wind element — 13% of live CONUS periods. `?? 0` turned
+      // every one of them into a forecast calm.
+      speed_kt: p.wspd ?? null,
       gust_kt: p.wgst ?? null,
     },
     visibility_sm: visib,
@@ -203,6 +273,22 @@ function normalizeTaf(raw: RawTaf): NormalizedTaf {
 /** Coerce an empty string or nullish value to null. */
 function strOrNull(v: string | null | undefined): string | null {
   return v?.trim() ? v.trim() : null;
+}
+
+/**
+ * The `/FL` groups that carry no altitude — `/FLUNKN/` (unknown), `/FLDURC/`
+ * (during climb), `/FLDURD/` (during descent). AWC resolves all three to
+ * `fltLvl: 0`, which is indistinguishable from a reported `/FL000/`, so the raw
+ * token is the only discriminator. `fltLvlType` is phase of flight, not an
+ * altitude-validity flag: it reads DURC/DURD on plenty of reports that do carry
+ * a numeric flight level. `/FLSFC/` is excluded too — AWC substitutes the field
+ * elevation in hundreds of feet for it, which is a real altitude.
+ */
+const PIREP_FLIGHT_LEVEL_UNKNOWN = /\/FL\s*(?:UNKN|DURC|DURD)\b/;
+
+/** Upstream encodes an unreported PIREP cloud base or top as 0, not null. */
+function pirepCloudAltitude(value: number | null): number | null {
+  return value == null || value === 0 ? null : value;
 }
 
 function normalizePirep(raw: RawPirep): NormalizedPirep {
@@ -247,20 +333,23 @@ function normalizePirep(raw: RawPirep): NormalizedPirep {
     });
   }
 
-  // Clouds
+  // Clouds — a layer with neither base nor top (CLR, SKC, VMC, IMC) still
+  // carries its cover, so keep it rather than filtering it away.
   const clouds =
     raw.clouds && raw.clouds.length > 0
-      ? raw.clouds
-          .filter((c) => c.base != null && c.top != null)
-          .map((c) => ({ cover: c.cover, base_ft: c.base as number, top_ft: c.top as number }))
+      ? raw.clouds.map((c) => ({
+          cover: c.cover,
+          base_ft: pirepCloudAltitude(c.base),
+          top_ft: pirepCloudAltitude(c.top),
+        }))
       : null;
 
   const altitudeFt =
-    raw.fltLvl != null
-      ? raw.fltLvl < 1000
+    PIREP_FLIGHT_LEVEL_UNKNOWN.test(raw.rawOb) || raw.fltLvl == null
+      ? null
+      : raw.fltLvl < 1000
         ? raw.fltLvl * 100 // flight level (e.g., 270 → 27000)
-        : raw.fltLvl // already in feet for low-altitude reports
-      : 0;
+        : raw.fltLvl; // already in feet for low-altitude reports
 
   const visib =
     raw.visib == null
@@ -278,7 +367,7 @@ function normalizePirep(raw: RawPirep): NormalizedPirep {
     pirep_type: raw.pirepType ?? 'PIREP',
     turbulence,
     icing,
-    clouds: clouds && clouds.length > 0 ? clouds : null,
+    clouds,
     visibility_sm: visib,
     remarks: strOrNull(raw.wxString),
     raw_pirep: raw.rawOb,
@@ -315,7 +404,7 @@ function normalizeStation(raw: RawStationInfo): NormalizedStation {
     name: raw.site,
     lat: raw.lat,
     lon: raw.lon,
-    elevation_ft: raw.elev != null ? metersToFeet(raw.elev) : 0,
+    elevation_ft: raw.elev != null ? metersToFeet(raw.elev) : null,
     state: raw.state ?? '',
     country: raw.country ?? '',
     data_types: raw.siteType ?? [],

@@ -28,15 +28,24 @@ export interface RawMetar {
   reportTime: string; // ISO 8601 string
   slp: number | null;
   temp: number | null;
+  /**
+   * Vertical visibility into an obscuration, in HUNDREDS of feet — a `VV002`
+   * group arrives as `2` alongside a `clouds[].base` of 200. The AWC schema
+   * documents this field as "Vertical visibility in feet" and the live METAR
+   * endpoint disagrees. The TAF endpoint publishes the same field name in feet,
+   * so no conversion may be shared between the two.
+   */
+  vertVis: number | null;
   visib: string | number | null; // '10+', '3', '1/2', or a number from the API
   wdir: number | string | null; // 'VRB' when variable direction
   wgst: number | null;
   wspd: number | null;
+  wxString: string | null; // present weather group, e.g. 'BR', '+RA BR'
 }
 
 export interface RawCloudLayer {
   base: number | null; // base altitude in feet
-  cover: string; // 'FEW', 'SCT', 'BKN', 'OVC', 'SKC', 'CLR', 'OVX'
+  cover: string; // 'FEW', 'SCT', 'BKN', 'OVC', 'SKC', 'CLR', 'CAVOK', 'OVX'
 }
 
 /** Raw TAF forecast period from the AWC API. */
@@ -185,11 +194,34 @@ export interface NormalizedCloudLayer {
   cover: string;
 }
 
+/**
+ * How a ceiling was determined. A broken or overcast layer base is `measured`;
+ * vertical visibility into an obscuration is `indefinite`, which ATIS and AWOS
+ * phraseology state differently ("INDEFINITE CEILING") because the height is
+ * how far a pilot can see up into the obscuring phenomenon, not a layer bottom.
+ */
+export type MetarCeilingType = 'measured' | 'indefinite';
+
+/** Present weather as reported and as decoded. */
+export interface NormalizedPresentWeather {
+  decoded: string;
+  raw: string;
+}
+
+/**
+ * A decoded METAR. The nullable numeric observations (`altimeter_inhg`,
+ * `dewpoint_c`, `temp_c`, `wind.speed_kt`) are null when upstream omitted the
+ * corresponding group — 0 is a real reading for every one of them and must not
+ * stand in for "not reported". `elevation_ft` is a station property rather than
+ * an observation and is always present.
+ */
 export interface NormalizedMetar {
-  altimeter_inhg: number;
+  altimeter_inhg: number | null;
   ceiling_ft: number | null;
+  /** Null exactly when `ceiling_ft` is null. */
+  ceiling_type: MetarCeilingType | null;
   clouds: NormalizedCloudLayer[];
-  dewpoint_c: number;
+  dewpoint_c: number | null;
   elevation_ft: number;
   flight_category: string; // 'VFR' | 'MVFR' | 'IFR' | 'LIFR'
   lat: number;
@@ -197,13 +229,15 @@ export interface NormalizedMetar {
   metar_type: string; // 'METAR' | 'SPECI'
   name: string;
   observed_at: string; // ISO 8601
+  /** Null when the observation carried no weather group. */
+  present_weather: NormalizedPresentWeather | null;
   raw_metar: string;
   station_id: string;
-  temp_c: number;
+  temp_c: number | null;
   visibility_sm: string;
   wind: {
     direction_deg: number | null;
-    speed_kt: number;
+    speed_kt: number | null;
     gust_kt: number | null;
   };
 }
@@ -218,7 +252,8 @@ export interface NormalizedTafPeriod {
   weather: string | null; // decoded wx string
   wind: {
     direction_deg: number | null;
-    speed_kt: number;
+    /** Null when the period carries no wind element; 0 is a forecast calm. */
+    speed_kt: number | null;
     gust_kt: number | null;
   };
 }
@@ -248,15 +283,17 @@ export interface NormalizedIcingLayer {
   type: string | null;
 }
 
+/** A PIREP cloud layer. Upstream encodes an unreported base or top as 0. */
 export interface NormalizedPirepCloudLayer {
-  base_ft: number;
+  base_ft: number | null;
   cover: string;
-  top_ft: number;
+  top_ft: number | null;
 }
 
 export interface NormalizedPirep {
   aircraft_type: string | null;
-  altitude_ft: number;
+  /** Null when the report gave no flight level (`/FLUNKN/`, `/FLDURC/`, `/FLDURD/`). */
+  altitude_ft: number | null;
   clouds: NormalizedPirepCloudLayer[] | null;
   icing: NormalizedIcingLayer[];
   lat: number;
@@ -287,7 +324,8 @@ export interface NormalizedAdvisory {
 export interface NormalizedStation {
   country: string;
   data_types: string[];
-  elevation_ft: number;
+  /** Null when the station carries no elevation upstream; 0 is a sea-level site. */
+  elevation_ft: number | null;
   faa_id: string | null;
   iata_id: string | null;
   icao_id: string | null;

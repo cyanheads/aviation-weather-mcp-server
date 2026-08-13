@@ -5,19 +5,42 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 
 const CloudLayerSchema = z
   .object({
-    cover: z.string().describe('Sky cover code: FEW, SCT, BKN, OVC, SKC, CLR.'),
-    base_ft: z.number().describe('Cloud base altitude in feet MSL.'),
+    cover: z
+      .string()
+      .describe(
+        'Sky cover code: FEW, SCT, BKN, OVC, SKC, CLR, CAVOK, or OVX. OVX is the decoded form of a VVhhh group — the sky is obscured and the base is the vertical visibility into it, not a cloud bottom.',
+      ),
+    base_ft: z.number().describe('Cloud base altitude in feet AGL.'),
   })
   .describe('A reported cloud layer.');
+
+/** Render a numeric observation, or an explicit unknown when upstream omitted it. */
+function measurement(value: number | null, unit: string): string {
+  return value != null ? `${value}${unit}` : 'unknown';
+}
+
+/**
+ * Render the ceiling with its kind. A null ceiling means no broken, overcast,
+ * or obscuration layer was reported — "none", never "clear", which would assert
+ * a sky state the observation does not support (few and scattered layers can
+ * sit above a station with no ceiling).
+ */
+function ceiling(ft: number | null, type: 'measured' | 'indefinite' | null): string {
+  if (ft == null) return 'none';
+  const kind =
+    type === 'indefinite' ? 'indefinite — vertical visibility into an obscuration' : 'measured';
+  return `${ft} ft (${kind})`;
+}
 
 export const aviationGetMetar = tool('aviation_get_metar', {
   title: 'Get METAR Weather Observations',
   description:
-    'Get current weather observations (METARs) for one or more airports. Returns decoded fields — wind direction/speed/gusts, visibility, ceiling, temperature, dewpoint, altimeter, cloud layers — plus the computed flight category (VFR/MVFR/IFR/LIFR) and the raw METAR string. Accepts 1–10 ICAO station IDs (e.g., KSEA, KJFK). Use aviation_find_stations to resolve or verify an ICAO ID, or to discover nearby stations.',
+    'Get current weather observations (METARs) for one or more airports. Returns decoded fields — wind direction/speed/gusts, visibility, ceiling with its kind (measured, or indefinite for vertical visibility into an obscuration), present weather, temperature, dewpoint, altimeter, cloud layers — plus the computed flight category (VFR/MVFR/IFR/LIFR) and the raw METAR string. Accepts 1–10 ICAO station IDs (e.g., KSEA, KJFK). Use aviation_find_stations to resolve or verify an ICAO ID, or to discover nearby stations.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     station_ids: z
@@ -67,7 +90,12 @@ export const aviationGetMetar = tool('aviation_get_metar', {
                   .number()
                   .nullable()
                   .describe('Wind direction in degrees true. Null when variable.'),
-                speed_kt: z.number().describe('Wind speed in knots.'),
+                speed_kt: z
+                  .number()
+                  .nullable()
+                  .describe(
+                    'Wind speed in knots. 0 is calm (a reported 00000KT); null means the observation carried no wind group, so the speed is unknown.',
+                  ),
                 gust_kt: z
                   .number()
                   .nullable()
@@ -81,14 +109,50 @@ export const aviationGetMetar = tool('aviation_get_metar', {
               .number()
               .nullable()
               .describe(
-                'Ceiling in feet MSL — lowest BKN or OVC layer base. Null when sky is clear.',
+                'Ceiling in feet AGL — the lowest broken, overcast, or obscuration layer. Per FAA AIM 7-1-13 the ceiling is the lowest broken or overcast layer, or the vertical visibility into an obscuration; few and scattered layers are never ceilings. Null when the observation reported no such layer.',
+              ),
+            ceiling_type: z
+              .enum(['measured', 'indefinite'])
+              .nullable()
+              .describe(
+                'How the ceiling height was determined: "measured" for a broken or overcast layer base, "indefinite" for vertical visibility into an obscuration (an OVX layer). Null exactly when ceiling_ft is null.',
               ),
             clouds: z
               .array(CloudLayerSchema)
               .describe('All reported cloud layers from lowest to highest.'),
-            temp_c: z.number().describe('Temperature in degrees Celsius.'),
-            dewpoint_c: z.number().describe('Dewpoint in degrees Celsius.'),
-            altimeter_inhg: z.number().describe('Altimeter setting in inches of mercury.'),
+            present_weather: z
+              .object({
+                raw: z
+                  .string()
+                  .describe('Weather group exactly as encoded (e.g., "FG", "-SHRA", "+RA BR").'),
+                decoded: z
+                  .string()
+                  .describe(
+                    'Plain-English reading of the group (e.g., "fog", "light rain showers").',
+                  ),
+              })
+              .nullable()
+              .describe(
+                'Present weather at the station, or null when the observation carried no weather group (a dry, unobscured day).',
+              ),
+            temp_c: z
+              .number()
+              .nullable()
+              .describe(
+                'Temperature in degrees Celsius. 0 is a real reading; null means the observation carried no temperature, so it is unknown.',
+              ),
+            dewpoint_c: z
+              .number()
+              .nullable()
+              .describe(
+                'Dewpoint in degrees Celsius. 0 is a real reading; null means the observation carried no dewpoint, so it is unknown.',
+              ),
+            altimeter_inhg: z
+              .number()
+              .nullable()
+              .describe(
+                'Altimeter setting in inches of mercury, or null when the observation carried no altimeter group (common at stations reporting sea-level pressure only).',
+              ),
             raw_metar: z
               .string()
               .describe(
@@ -139,18 +203,24 @@ export const aviationGetMetar = tool('aviation_get_metar', {
         `**Flight Category:** ${obs.flight_category} | **Type:** ${obs.metar_type} | **Observed:** ${obs.observed_at}`,
       );
       lines.push(
-        `**Location:** ${obs.lat.toFixed(4)}, ${obs.lon.toFixed(4)} | **Elevation:** ${obs.elevation_ft} ft`,
+        `**Location:** ${formatDegrees(obs.lat)}, ${formatDegrees(obs.lon)} | **Elevation:** ${obs.elevation_ft} ft`,
       );
       lines.push('');
 
       const gustStr = obs.wind.gust_kt != null ? ` gusting ${obs.wind.gust_kt} kt` : '';
       const dirStr = obs.wind.direction_deg != null ? `${obs.wind.direction_deg}°` : 'variable';
-      lines.push(`**Wind:** ${dirStr} at ${obs.wind.speed_kt} kt${gustStr}`);
+      const speedStr = obs.wind.speed_kt != null ? `${obs.wind.speed_kt} kt` : 'unknown speed';
+      lines.push(`**Wind:** ${dirStr} at ${speedStr}${gustStr}`);
       lines.push(
-        `**Visibility:** ${obs.visibility_sm} sm | **Ceiling:** ${obs.ceiling_ft != null ? `${obs.ceiling_ft} ft` : 'Clear'}`,
+        `**Visibility:** ${obs.visibility_sm} sm | **Ceiling:** ${ceiling(obs.ceiling_ft, obs.ceiling_type)}`,
       );
+      if (obs.present_weather) {
+        lines.push(
+          `**Present weather:** ${obs.present_weather.raw} (${obs.present_weather.decoded})`,
+        );
+      }
       lines.push(
-        `**Temperature:** ${obs.temp_c}°C | **Dewpoint:** ${obs.dewpoint_c}°C | **Altimeter:** ${obs.altimeter_inhg} inHg`,
+        `**Temperature:** ${measurement(obs.temp_c, '°C')} | **Dewpoint:** ${measurement(obs.dewpoint_c, '°C')} | **Altimeter:** ${measurement(obs.altimeter_inhg, ' inHg')}`,
       );
 
       if (obs.clouds.length > 0) {

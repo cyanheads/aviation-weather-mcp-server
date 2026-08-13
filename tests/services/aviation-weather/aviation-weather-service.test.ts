@@ -21,7 +21,13 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async (importActual) => {
 
 import { fetchWithTimeout } from '@cyanheads/mcp-ts-core/utils';
 import { AviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
-import type { RawMetar, RawPirep, RawStationInfo } from '@/services/aviation-weather/types.js';
+import type {
+  RawMetar,
+  RawPirep,
+  RawStationInfo,
+  RawTaf,
+  RawTafForecastPeriod,
+} from '@/services/aviation-weather/types.js';
 
 /** Build a Response-like stub carrying a JSON body for fetchJson to parse. */
 function jsonResponse(body: unknown): Response {
@@ -71,10 +77,12 @@ const rawMetarKDEN: RawMetar = {
   reportTime: '2026-01-15T18:53:00Z',
   slp: null,
   temp: 5,
+  vertVis: null,
   visib: '10+',
   wdir: 180,
   wgst: null,
   wspd: 8,
+  wxString: null,
 };
 
 /** KSEA raw station info — elev 115 m. */
@@ -132,6 +140,33 @@ const rawStationKBWI: RawStationInfo = {
   wmoId: null,
 };
 
+/** KSEA raw TAF with one base forecast period. */
+const rawTafKSEA: RawTaf = {
+  elev: 115,
+  fcsts: [
+    {
+      clouds: [{ base: 2500, cover: 'BKN', type: null }],
+      fcstChange: null,
+      probability: null,
+      timeFrom: 1768500000,
+      timeTo: 1768521600,
+      visib: '6+',
+      wdir: 180,
+      wgst: null,
+      wspd: 12,
+      wxString: null,
+    },
+  ],
+  icaoId: 'KSEA',
+  issueTime: '2026-01-15T17:30:00Z',
+  lat: 47.4499,
+  lon: -122.3117,
+  name: 'Seattle-Tacoma Intl',
+  rawTAF: 'KSEA 151730Z 1518/1618 18012KT P6SM BKN025',
+  validTimeFrom: 1768500000,
+  validTimeTo: 1768586400,
+};
+
 /** Raw PIREP record — enough to normalize; the URL is what these tests read. */
 const rawPirep: RawPirep = {
   acType: 'B737',
@@ -180,14 +215,449 @@ describe('AviationWeatherService elevation conversion', () => {
     expect(station!.elevation_ft).toBe(377);
   });
 
-  it('falls back to 0 feet when station elevation is null', async () => {
+  it('reports a null station elevation as unknown rather than sea level', async () => {
+    // KKQA (Akutan, AK) carries no elevation upstream. 0 ft is a real sea-level
+    // field, so it cannot double as "not on file".
     vi.mocked(fetchWithTimeout).mockResolvedValue(
       jsonResponse([{ ...rawStationKSEA, elev: null }]),
     );
     const ctx = createMockContext();
     const [station] = await svc.fetchStations({ stationIds: ['KSEA'] }, ctx);
 
+    expect(station!.elevation_ft).toBeNull();
+  });
+
+  it('keeps a sea-level station at 0 feet', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([{ ...rawStationKSEA, elev: 0 }]));
+    const ctx = createMockContext();
+    const [station] = await svc.fetchStations({ stationIds: ['KSEA'] }, ctx);
+
     expect(station!.elevation_ft).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unknown observations vs. genuine zeros (issue #15) — 0 is a real reading for
+// every field here, so it cannot stand in for "upstream reported nothing"
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService METAR unknown vs. genuine zero', () => {
+  /** Normalize one raw METAR through the real service path. */
+  async function normalize(overrides: Partial<RawMetar>) {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([{ ...rawMetarKDEN, ...overrides }]),
+    );
+    const [obs] = await svc.fetchMetar(['KDEN'], 1, createMockContext());
+    return obs!;
+  }
+
+  it('reports a null wind speed as unknown', async () => {
+    // KSLO: `METAR KSLO 130955Z 10SM 24/23 A2989 ...` — no dddssKT group at all.
+    const obs = await normalize({ wspd: null, wdir: null });
+    expect(obs.wind.speed_kt).toBeNull();
+  });
+
+  it('keeps a calm wind at 0 knots', async () => {
+    // Raw `00000KT` — the most common genuine zero in the feed.
+    const obs = await normalize({ wspd: 0, wdir: 0 });
+    expect(obs.wind.speed_kt).toBe(0);
+  });
+
+  it('reports a null temperature as unknown', async () => {
+    const obs = await normalize({ temp: null });
+    expect(obs.temp_c).toBeNull();
+  });
+
+  it('keeps a 0 °C temperature', async () => {
+    // Raw `00/M02` — freezing point, not a missing reading.
+    const obs = await normalize({ temp: 0 });
+    expect(obs.temp_c).toBe(0);
+  });
+
+  it('reports a null dewpoint as unknown', async () => {
+    const obs = await normalize({ dewp: null });
+    expect(obs.dewpoint_c).toBeNull();
+  });
+
+  it('keeps a 0 °C dewpoint', async () => {
+    const obs = await normalize({ dewp: 0 });
+    expect(obs.dewpoint_c).toBe(0);
+  });
+
+  it('reports a null altimeter as unknown', async () => {
+    // Canadian AUTO stations (e.g. CWMJ) report SLP and omit the A#### group.
+    const obs = await normalize({ altim: null });
+    expect(obs.altimeter_inhg).toBeNull();
+  });
+
+  it('converts a reported altimeter from hPa to inHg', async () => {
+    const obs = await normalize({ altim: 1013 });
+    expect(obs.altimeter_inhg).toBe(29.91);
+  });
+
+  it('leaves an all-missing observation with no fabricated readings', async () => {
+    // KACY: `METAR KACY 130954Z A2984 RMK AO2 SLPNO $` — wind, temp, and
+    // dewpoint all absent in one record.
+    const obs = await normalize({ wspd: null, wdir: null, temp: null, dewp: null });
+    expect(obs).toMatchObject({
+      temp_c: null,
+      dewpoint_c: null,
+      wind: { direction_deg: null, speed_kt: null },
+    });
+  });
+
+  it('keeps METAR elevation a plain number at a sea-level field', async () => {
+    // KMSY reports elev 0 and AWC never returned a null METAR elev in any
+    // sampled region, so this field stays non-nullable.
+    const obs = await normalize({ elev: 0 });
+    expect(obs.elevation_ft).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// METAR obscuration and present weather (issue #16) — an obscuration is a
+// ceiling, and this endpoint publishes vertVis in hundreds of feet
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService METAR ceiling', () => {
+  /** Normalize one raw METAR through the real service path. */
+  async function normalize(overrides: Partial<RawMetar>) {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([{ ...rawMetarKDEN, ...overrides }]),
+    );
+    const [obs] = await svc.fetchMetar(['KDEN'], 1, createMockContext());
+    return obs!;
+  }
+
+  it('reads an obscuration as an indefinite ceiling', async () => {
+    // Live KDBQ: `SPECI KDBQ 131018Z AUTO 16004KT 1/4SM FG VV002 21/21 A2990`,
+    // reported LIFR with no broken or overcast layer anywhere in the record.
+    const obs = await normalize({
+      clouds: [{ cover: 'OVX', base: 200 }],
+      vertVis: 2,
+      fltCat: 'LIFR',
+      rawOb: 'SPECI KDBQ 131018Z AUTO 16004KT 1/4SM FG VV002 21/21 A2990 RMK AO2',
+    });
+
+    expect(obs.ceiling_ft).toBe(200);
+    expect(obs.ceiling_type).toBe('indefinite');
+  });
+
+  it('reads vertVis as hundreds of feet, never as feet', async () => {
+    // The AWC schema calls vertVis "Vertical visibility in feet" and the METAR
+    // endpoint disagrees: every VV002 record pairs vertVis 2 with a 200 ft
+    // layer base. Reading it as feet turns a 200 ft ceiling into a 2 ft one.
+    const obs = await normalize({
+      clouds: [],
+      vertVis: 2,
+      rawOb: 'SPECI KGCC 131000Z AUTO 00000KT 1/4SM FG VV002 11/11 A3001 RMK AO2',
+    });
+
+    expect(obs.ceiling_ft).toBe(200);
+    expect(obs.ceiling_type).toBe('indefinite');
+  });
+
+  it.each([
+    ['OVC', 100],
+    ['BKN', 300],
+  ])('reads a %s layer as a measured ceiling', async (cover, base) => {
+    const obs = await normalize({ clouds: [{ cover, base }], vertVis: null });
+
+    expect(obs.ceiling_ft).toBe(base);
+    expect(obs.ceiling_type).toBe('measured');
+  });
+
+  it.each(['FEW', 'SCT'])('does not read a %s layer as a ceiling', async (cover) => {
+    const obs = await normalize({ clouds: [{ cover, base: 200 }], vertVis: null });
+
+    expect(obs.ceiling_ft).toBeNull();
+    expect(obs.ceiling_type).toBeNull();
+  });
+
+  it('reports no ceiling for a clear sky', async () => {
+    const obs = await normalize({ clouds: [], vertVis: null });
+
+    expect(obs.ceiling_ft).toBeNull();
+    expect(obs.ceiling_type).toBeNull();
+  });
+
+  it('takes the lowest qualifying layer when an obscuration sits below a broken layer', async () => {
+    const obs = await normalize({
+      clouds: [
+        { cover: 'OVX', base: 200 },
+        { cover: 'BKN', base: 3000 },
+      ],
+      vertVis: 2,
+    });
+
+    expect(obs.ceiling_ft).toBe(200);
+    expect(obs.ceiling_type).toBe('indefinite');
+  });
+
+  it('takes the lowest qualifying layer when a broken layer sits below an obscuration', async () => {
+    const obs = await normalize({
+      clouds: [
+        { cover: 'BKN', base: 100 },
+        { cover: 'OVX', base: 800 },
+      ],
+      vertVis: 8,
+    });
+
+    expect(obs.ceiling_ft).toBe(100);
+    expect(obs.ceiling_type).toBe('measured');
+  });
+
+  it('falls back to vertVis when the obscuration layer carries no base', async () => {
+    // normalizeClouds drops a layer with no base, which would otherwise leave
+    // the ceiling null and an obscured sky reading as no ceiling at all.
+    const obs = await normalize({ clouds: [{ cover: 'OVX', base: null }], vertVis: 3 });
+
+    expect(obs.ceiling_ft).toBe(300);
+    expect(obs.ceiling_type).toBe('indefinite');
+  });
+
+  it('pairs a null ceiling_type with a null ceiling_ft and never otherwise', async () => {
+    for (const raw of [
+      { clouds: [], vertVis: null },
+      { clouds: [{ cover: 'OVC', base: 900 }], vertVis: null },
+      { clouds: [{ cover: 'OVX', base: 200 }], vertVis: 2 },
+    ]) {
+      const obs = await normalize(raw);
+      expect(obs.ceiling_type === null).toBe(obs.ceiling_ft === null);
+    }
+  });
+});
+
+describe('AviationWeatherService METAR present weather', () => {
+  /** Normalize one raw METAR through the real service path. */
+  async function normalize(overrides: Partial<RawMetar>) {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([{ ...rawMetarKDEN, ...overrides }]),
+    );
+    const [obs] = await svc.fetchMetar(['KDEN'], 1, createMockContext());
+    return obs!;
+  }
+
+  it('carries the raw group alongside its decoded reading', async () => {
+    const obs = await normalize({ wxString: 'FG' });
+
+    expect(obs.present_weather).toEqual({ raw: 'FG', decoded: 'fog' });
+  });
+
+  it('keeps the raw group when the decoder cannot split a compound', async () => {
+    // `+RA BR` is live on the CONUS feed. The decoder handles one group at a
+    // time, so the preserved raw form is what keeps the mist recoverable.
+    const obs = await normalize({ wxString: '+RA BR' });
+
+    expect(obs.present_weather?.raw).toBe('+RA BR');
+    expect(obs.present_weather?.decoded).toContain('heavy');
+  });
+
+  it.each([null, '', '   '])('reports %p present weather as null', async (wxString) => {
+    const obs = await normalize({ wxString });
+
+    expect(obs.present_weather).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TAF forecast wind (issue #15) — a period amending only visibility, weather,
+// or cloud carries no wind element, and `?? 0` turned that into a forecast calm
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService TAF forecast wind', () => {
+  /** Normalize one raw TAF forecast period through the real service path. */
+  async function normalize(overrides: Partial<RawTafForecastPeriod>) {
+    const period = { ...rawTafKSEA.fcsts[0]!, ...overrides };
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([{ ...rawTafKSEA, fcsts: [period] }]),
+    );
+    const [taf] = await svc.fetchTaf(['KSEA'], createMockContext());
+    return taf!.forecast_periods[0]!;
+  }
+
+  it('reports a period with no wind element as unknown, not calm', async () => {
+    // `TAF KCMH ... TEMPO 1310/1313 1/4SM FG` — the group amends visibility
+    // and weather only, so AWC returns wdir and wspd both null.
+    const period = await normalize({ fcstChange: 'TEMPO', wdir: null, wspd: null });
+
+    expect(period.wind.speed_kt).toBeNull();
+    expect(period.wind.direction_deg).toBeNull();
+  });
+
+  it('keeps a forecast calm at 0 knots', async () => {
+    // Raw `00000KT` — 44 of 1617 live CONUS periods forecast exactly this.
+    const period = await normalize({ wdir: 0, wspd: 0 });
+
+    expect(period.wind.speed_kt).toBe(0);
+  });
+
+  it('keeps a variable-direction forecast that carries a real speed', async () => {
+    // Raw `VRB04KT` — wdir arrives as the string 'VRB' beside a real speed.
+    const period = await normalize({ wdir: 'VRB', wspd: 4 });
+
+    expect(period.wind.direction_deg).toBeNull();
+    expect(period.wind.speed_kt).toBe(4);
+  });
+
+  it('passes an ordinary forecast wind through unchanged', async () => {
+    const period = await normalize({ wdir: 180, wspd: 12, wgst: 22 });
+
+    expect(period.wind).toEqual({ direction_deg: 180, speed_kt: 12, gust_kt: 22 });
+  });
+
+  it('reports a period with no visibility element as unknown', async () => {
+    // AWC sends an empty string, not null, for a period carrying no
+    // visibility — 63 of 1622 live CONUS periods. Left as `""` it renders
+    // as a bare " sm" with no value in front of it.
+    const period = await normalize({ visib: '' });
+
+    expect(period.visibility_sm).toBeNull();
+  });
+
+  it('keeps a forecast visibility that upstream actually reported', async () => {
+    const period = await normalize({ visib: '6+' });
+
+    expect(period.visibility_sm).toBe('6+');
+  });
+});
+
+describe('AviationWeatherService PIREP altitude unknown vs. genuine zero', () => {
+  /** Normalize one raw PIREP through the real service path. */
+  async function normalize(overrides: Partial<RawPirep>) {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([{ ...rawPirep, ...overrides }]));
+    const [report] = await svc.fetchPireps(
+      { stationId: 'KSEA', distanceNm: 100, hours: 3 },
+      createMockContext(),
+    );
+    return report!;
+  }
+
+  it.each([
+    ['FLUNKN', 'DAG UA /OV TRM150015/TM 0106/FLUNKN/TP B737/WX DS/RM ZLAWC AWC-WEB'],
+    ['FLDURC', 'CMH UA /OV CMH/TM 0941/FLDURC/TP E75S/SK T012'],
+    ['FLDURD', 'CAK UA /OV CAK/TM 0745/FLDURD/TP C208/SK OVC024'],
+  ])('reports /%s/ as an unknown altitude', async (_token, rawOb) => {
+    // AWC resolves all three to fltLvl 0; only the raw token separates them
+    // from a reported flight level of zero.
+    const report = await normalize({ fltLvl: 0, rawOb });
+    expect(report.altitude_ft).toBeNull();
+  });
+
+  it('keeps a reported /FL000/ at 0 feet', async () => {
+    const report = await normalize({
+      fltLvl: 0,
+      fltLvlType: 'DURD',
+      rawOb: 'EVV UA /OV EVV/TM 0125/FL000/TP E145/TB NEG/RM DURD RY22 EVV',
+    });
+    expect(report.altitude_ft).toBe(0);
+  });
+
+  it('converts /FLSFC/ using the field elevation AWC substitutes', async () => {
+    // KMKE (666 ft) resolves to fltLvl 7 — hundreds of feet, not a sentinel.
+    const report = await normalize({
+      fltLvl: 7,
+      fltLvlType: 'GRND',
+      rawOb: 'MKE UA /OV MKE/TM 1200/FLSFC/TP B738/SK OVC010',
+    });
+    expect(report.altitude_ft).toBe(700);
+  });
+
+  it('keeps the altitude of a DURC report that carries a numeric flight level', async () => {
+    // fltLvlType is phase of flight, not an altitude-validity flag. Note the
+    // space in `/FL 290/` — the raw token is not always tight against FL.
+    const report = await normalize({
+      fltLvl: 290,
+      fltLvlType: 'DURC',
+      rawOb: 'RNO UA /OV SWR/TM 0549/FL 290/TP A380/TB MOD OCNL 280-320/RM DURC ENTERED BY ZOA',
+    });
+    expect(report.altitude_ft).toBe(29000);
+  });
+
+  it('keeps the altitude of a DURD report that carries a numeric flight level', async () => {
+    const report = await normalize({
+      fltLvl: 70,
+      fltLvlType: 'DURD',
+      rawOb: 'ORD UA /OV ORD160030/TM 0702/FL070/TP PC12/TB SMOOTH',
+    });
+    expect(report.altitude_ft).toBe(7000);
+  });
+
+  it('keeps the altitude of an AIREP that carries no /FL token', async () => {
+    // AIREPs encode the level as `F370` with no /FL group anywhere in the text.
+    const report = await normalize({
+      fltLvl: 370,
+      fltLvlType: 'OTHER',
+      pirepType: 'AIREP',
+      rawOb: 'ARP UAL604 3823N 11419W 0859 F370 189/043KT TB OCNL LGT CHOP IC',
+    });
+    expect(report.altitude_ft).toBe(37000);
+  });
+
+  it('reports a null flight level as an unknown altitude', async () => {
+    const report = await normalize({ fltLvl: null });
+    expect(report.altitude_ft).toBeNull();
+  });
+
+  it('passes a low-altitude report through in feet', async () => {
+    const report = await normalize({
+      fltLvl: 1200,
+      rawOb: 'SEA UA /OV KSEA/TM 1530/FL120/TP B737/TB LGT',
+    });
+    expect(report.altitude_ft).toBe(1200);
+  });
+});
+
+describe('AviationWeatherService PIREP cloud layers', () => {
+  /** Normalize one raw PIREP's cloud array through the real service path. */
+  async function normalizeClouds(clouds: RawPirep['clouds']) {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([{ ...rawPirep, clouds }]));
+    const [report] = await svc.fetchPireps(
+      { stationId: 'KSEA', distanceNm: 100, hours: 3 },
+      createMockContext(),
+    );
+    return report!.clouds;
+  }
+
+  it('reports a zero base and top as unknown', async () => {
+    // Raw `SK CLR` arrives as base 0 / top 0 — the pilot gave neither.
+    const clouds = await normalizeClouds([{ cover: 'CLR', base: 0, top: 0 }]);
+    expect(clouds).toEqual([{ cover: 'CLR', base_ft: null, top_ft: null }]);
+  });
+
+  it('keeps a reported base when the top is unknown', async () => {
+    // Raw `SK OVC024` — a base with no top.
+    const clouds = await normalizeClouds([{ cover: 'OVC', base: 2400, top: 0 }]);
+    expect(clouds).toEqual([{ cover: 'OVC', base_ft: 2400, top_ft: null }]);
+  });
+
+  it('keeps a reported top when the base is unknown', async () => {
+    const clouds = await normalizeClouds([{ cover: 'BKN', base: 0, top: 6500 }]);
+    expect(clouds).toEqual([{ cover: 'BKN', base_ft: null, top_ft: 6500 }]);
+  });
+
+  it('passes a fully reported layer through unchanged', async () => {
+    // Raw `SK OVC020-TOP027`.
+    const clouds = await normalizeClouds([{ cover: 'OVC', base: 2000, top: 2700 }]);
+    expect(clouds).toEqual([{ cover: 'OVC', base_ft: 2000, top_ft: 2700 }]);
+  });
+
+  it.each(['CLR', 'SKC', 'VMC', 'IMC'])(
+    'retains a %s marker rather than dropping it for having no altitudes',
+    async (cover) => {
+      const clouds = await normalizeClouds([{ cover, base: 0, top: 0 }]);
+      expect(clouds).toEqual([{ cover, base_ft: null, top_ft: null }]);
+    },
+  );
+
+  it('keeps a null base and top as unknown', async () => {
+    const clouds = await normalizeClouds([{ cover: 'BKN', base: null, top: null }]);
+    expect(clouds).toEqual([{ cover: 'BKN', base_ft: null, top_ft: null }]);
+  });
+
+  it('returns null when the report carried no sky-condition group', async () => {
+    expect(await normalizeClouds(null)).toBeNull();
+    expect(await normalizeClouds([])).toBeNull();
   });
 });
 

@@ -76,6 +76,39 @@ const wasd2: NormalizedStation = {
   data_types: [],
 };
 
+/** KSEA at the coordinates `stationinfo` actually publishes — 5 decimal places. */
+const kseaPrecise: NormalizedStation = { ...ksea, lat: 47.44467, lon: -122.31442 };
+
+/**
+ * Wilbur, WA — `stationinfo` reports its latitude as `47.75419998168945`, a
+ * float representation artifact for a true `47.7542`, and lists no data
+ * products at all.
+ */
+const k2s8: NormalizedStation = {
+  ...ksea,
+  icao_id: 'K2S8',
+  iata_id: null,
+  faa_id: null,
+  name: 'Wilbur',
+  lat: 47.75419998168945,
+  lon: -118.74299621582031,
+  data_types: [],
+};
+
+/** Akutan, AK — AWC carries no elevation for it, so the height is unknown. */
+const kkqa: NormalizedStation = {
+  icao_id: 'KKQA',
+  iata_id: null,
+  faa_id: 'KQA',
+  name: 'Akutan',
+  lat: 54.1338,
+  lon: -165.7789,
+  elevation_ft: null,
+  state: 'AK',
+  country: 'US',
+  data_types: [],
+};
+
 // ---------------------------------------------------------------------------
 // Handler tests
 // ---------------------------------------------------------------------------
@@ -220,6 +253,49 @@ describe('aviationFindStations', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Unknown elevation vs. sea level (issue #15) — 0 ft is a real coastal site, so
+// it cannot double as "no elevation on file"
+// ---------------------------------------------------------------------------
+
+describe('aviationFindStations elevation', () => {
+  it('carries a missing elevation through as null', async () => {
+    mockFetchStations.mockResolvedValue([kkqa]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: ['KKQA'] });
+    const result = await aviationFindStations.handler(input, ctx);
+
+    expect(result.stations[0]!.elevation_ft).toBeNull();
+  });
+
+  it('keeps a sea-level station at 0 ft', async () => {
+    mockFetchStations.mockResolvedValue([wasd2]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ state: 'DC' });
+    const result = await aviationFindStations.handler(input, ctx);
+
+    expect(result.stations[0]!.elevation_ft).toBe(0);
+  });
+
+  it('accepts both shapes against the declared output schema', async () => {
+    mockFetchStations.mockResolvedValue([kkqa, wasd2, ksea]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({
+      bbox: { minLat: 25, minLon: -180, maxLat: 72, maxLon: -66 },
+    });
+    const result = await aviationFindStations.handler(input, ctx);
+
+    expect(result).toEqual(expect.schemaMatching(aviationFindStations.output));
+  });
+
+  it('keeps the elevation description in feet MSL', () => {
+    const description =
+      aviationFindStations.output.shape.stations.element.shape.elevation_ft.description;
+    expect(description).toContain('MSL');
+    expect(description).not.toContain('AGL');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // State validation (issue #20)
 // ---------------------------------------------------------------------------
 
@@ -353,9 +429,58 @@ describe('aviationFindStations.format', () => {
     const text = (blocks[0] as { type: string; text: string }).text;
 
     expect(text).toContain('Washington DC');
-    expect(text).toContain('38.8700, -77.0200');
+    expect(text).toContain('38.87, -77.02');
     expect(text).toContain('DC, US');
     // No identifier of any kind exists — the IDs label must not render empty.
     expect(text).not.toMatch(/^\*\*IDs:\*\*\s*$/m);
+  });
+
+  // Issue #14 — content[] must state the same location structuredContent does.
+  it('renders a coordinate at the resolution upstream published', () => {
+    const blocks = aviationFindStations.format!({ stations: [kseaPrecise] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('**Location:** 47.44467, -122.31442');
+  });
+
+  it('collapses a float representation artifact rather than printing it', () => {
+    const blocks = aviationFindStations.format!({ stations: [k2s8] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('47.7542, -118.742996');
+    expect(text).not.toContain('47.75419998168945');
+  });
+
+  it('does not pad a low-precision coordinate', () => {
+    const blocks = aviationFindStations.format!({ stations: [wasd2] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).not.toContain('38.8700');
+    expect(text).not.toContain('-77.0200');
+  });
+
+  it('renders an empty data_types as an explicit no-products state', () => {
+    // 55 of 139 stations in one live bbox carry no products. Dropping the line
+    // made that indistinguishable from a renderer that skipped it.
+    const blocks = aviationFindStations.format!({ stations: [wasd2] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('**Data types:** none listed');
+  });
+
+  it('renders a missing elevation as unknown, not 0 ft', () => {
+    const blocks = aviationFindStations.format!({ stations: [kkqa] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('**Elevation:** unknown');
+    expect(text).not.toContain('0 ft');
+  });
+
+  it('renders a sea-level station as 0 ft', () => {
+    const blocks = aviationFindStations.format!({ stations: [wasd2] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('**Elevation:** 0 ft');
+    expect(text).not.toContain('unknown');
   });
 });

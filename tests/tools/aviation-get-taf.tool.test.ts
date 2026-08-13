@@ -89,6 +89,36 @@ const sparseTaf: NormalizedTaf = {
   raw_taf: 'KLAX 151200Z 1512/1612 27008KT CAVOK',
 };
 
+/**
+ * A TEMPO group that amends only visibility and weather — it carries no wind
+ * element at all, so `wdir` and `wspd` both arrive null. 215 of 1617 live CONUS
+ * forecast periods look like this.
+ */
+const windlessPeriod: NormalizedTafPeriod = {
+  from: '2026-01-15T22:00:00.000Z',
+  to: '2026-01-16T02:00:00.000Z',
+  change_type: 'TEMPO',
+  probability: null,
+  wind: { direction_deg: null, speed_kt: null, gust_kt: null },
+  visibility_sm: '1',
+  weather: 'mist',
+  clouds: [],
+};
+
+/** A period genuinely forecasting calm — raw `00000KT`. */
+const calmPeriod: NormalizedTafPeriod = {
+  ...basePeriod,
+  wind: { direction_deg: 0, speed_kt: 0, gust_kt: null },
+};
+
+/** Render one forecast period and return its text block. */
+function render(period: NormalizedTafPeriod): string {
+  const blocks = aviationGetTaf.format!({
+    forecasts: [{ ...kseaTaf, forecast_periods: [period] }],
+  });
+  return (blocks[0] as { type: string; text: string }).text;
+}
+
 // ---------------------------------------------------------------------------
 // Handler tests
 // ---------------------------------------------------------------------------
@@ -153,6 +183,21 @@ describe('aviationGetTaf', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Output-schema datum (issue #13) — TAF cloud bases are aerodrome heights, AGL
+// ---------------------------------------------------------------------------
+
+describe('aviationGetTaf output datum', () => {
+  it('describes forecast cloud bases in feet AGL', () => {
+    const description =
+      aviationGetTaf.output.shape.forecasts.element.shape.forecast_periods.element.shape.clouds
+        .element.shape.base_ft.description;
+
+    expect(description).toContain('AGL');
+    expect(description).not.toContain('MSL');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Format tests
 // ---------------------------------------------------------------------------
 
@@ -207,5 +252,115 @@ describe('aviationGetTaf.format', () => {
     const blocks = aviationGetTaf.format!({ forecasts: [varWindTaf] });
     const text = (blocks[0] as { type: string; text: string }).text;
     expect(text).toContain('variable');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unforecast wind vs. forecast calm (issue #15) — 13% of live forecast periods
+// amend only visibility, weather, or cloud and carry no wind element
+// ---------------------------------------------------------------------------
+
+describe('aviationGetTaf wind', () => {
+  it('carries a period with no wind element through as null', async () => {
+    mockFetchTaf.mockResolvedValue([{ ...kseaTaf, forecast_periods: [windlessPeriod] }]);
+    const ctx = createMockContext({ errors: aviationGetTaf.errors });
+    const input = aviationGetTaf.input.parse({ station_ids: ['KSEA'] });
+    const result = await aviationGetTaf.handler(input, ctx);
+
+    expect(result.forecasts[0]!.forecast_periods[0]!.wind).toMatchObject({
+      speed_kt: null,
+      direction_deg: null,
+    });
+  });
+
+  it('keeps a forecast calm at 0 knots', async () => {
+    mockFetchTaf.mockResolvedValue([{ ...kseaTaf, forecast_periods: [calmPeriod] }]);
+    const ctx = createMockContext({ errors: aviationGetTaf.errors });
+    const input = aviationGetTaf.input.parse({ station_ids: ['KSEA'] });
+    const result = await aviationGetTaf.handler(input, ctx);
+
+    expect(result.forecasts[0]!.forecast_periods[0]!.wind.speed_kt).toBe(0);
+  });
+
+  it('accepts both shapes against the declared output schema', async () => {
+    mockFetchTaf.mockResolvedValue([
+      { ...kseaTaf, forecast_periods: [windlessPeriod, calmPeriod, basePeriod] },
+    ]);
+    const ctx = createMockContext({ errors: aviationGetTaf.errors });
+    const input = aviationGetTaf.input.parse({ station_ids: ['KSEA'] });
+    const result = await aviationGetTaf.handler(input, ctx);
+
+    expect(result).toEqual(expect.schemaMatching(aviationGetTaf.output));
+  });
+
+  it('renders an unforecast wind explicitly rather than as a calm', () => {
+    const text = render(windlessPeriod);
+
+    expect(text).toContain('**Wind:** not specified');
+    expect(text).not.toContain('at 0 kt');
+    expect(text).not.toContain('variable at');
+  });
+
+  it('renders a forecast calm as 0 kt', () => {
+    const text = render(calmPeriod);
+
+    expect(text).toContain('at 0 kt');
+    expect(text).not.toContain('not specified');
+  });
+
+  it('names the unknown state in the wind speed description', () => {
+    const description =
+      aviationGetTaf.output.shape.forecasts.element.shape.forecast_periods.element.shape.wind.shape
+        .speed_kt.description ?? '';
+
+    expect(description).toMatch(/null/);
+    expect(description).toMatch(/calm|0/);
+  });
+
+  it('admits null on the wind speed and direction fields', () => {
+    const wind =
+      aviationGetTaf.output.shape.forecasts.element.shape.forecast_periods.element.shape.wind.shape;
+
+    expect(wind.speed_kt.safeParse(null).success).toBe(true);
+    expect(wind.speed_kt.safeParse(0).success).toBe(true);
+    expect(wind.direction_deg.safeParse(null).success).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unreported states (issue #14) — a dropped line is indistinguishable from a
+// renderer that skipped the value
+// ---------------------------------------------------------------------------
+
+describe('aviationGetTaf.format unreported states', () => {
+  it('renders an unspecified visibility rather than dropping the line', () => {
+    const text = render({ ...basePeriod, visibility_sm: null });
+
+    expect(text).toContain('**Visibility:** not specified');
+  });
+
+  it('renders unspecified weather rather than dropping the line', () => {
+    const text = render({ ...basePeriod, weather: null });
+
+    expect(text).toContain('**Weather:** not specified');
+  });
+
+  it('renders an empty cloud array the way aviation_get_metar does', () => {
+    const text = render({ ...basePeriod, clouds: [] });
+
+    expect(text).toContain('**Clouds:** Clear');
+  });
+
+  it('renders a probability of 0 rather than treating it as absent', () => {
+    // The old `period.probability ?` guard was falsy on 0 and dropped it.
+    const text = render({ ...tempoPeriod, probability: 0 });
+
+    expect(text).toContain('(0%)');
+  });
+
+  it('still omits the probability label when none was forecast', () => {
+    const text = render({ ...basePeriod, probability: null });
+
+    expect(text).not.toContain('%)');
   });
 });

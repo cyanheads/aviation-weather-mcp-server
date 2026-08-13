@@ -10,7 +10,7 @@ import { getAviationWeatherService } from '@/services/aviation-weather/aviation-
 const TafCloudLayerSchema = z
   .object({
     cover: z.string().describe('Sky cover code: FEW, SCT, BKN, OVC, SKC, CLR.'),
-    base_ft: z.number().describe('Cloud base altitude in feet MSL.'),
+    base_ft: z.number().describe('Cloud base altitude in feet AGL.'),
     type: z
       .string()
       .nullable()
@@ -37,8 +37,15 @@ const ForecastPeriodSchema = z
         direction_deg: z
           .number()
           .nullable()
-          .describe('Forecast wind direction in degrees true. Null when variable.'),
-        speed_kt: z.number().describe('Forecast wind speed in knots.'),
+          .describe(
+            'Forecast wind direction in degrees true. Null when the forecast said VRB (variable), and also when the period carries no wind element at all — speed_kt is null in that second case and a number in the first.',
+          ),
+        speed_kt: z
+          .number()
+          .nullable()
+          .describe(
+            'Forecast wind speed in knots. 0 is a forecast calm (a 00000KT group); null means the period amends only visibility, weather, or cloud and carries no wind element, so the wind is unknown rather than calm.',
+          ),
         gust_kt: z.number().nullable().describe('Forecast gust speed in knots, or null if none.'),
       })
       .describe('Forecast wind conditions for this period.'),
@@ -133,25 +140,33 @@ export const aviationGetTaf = tool('aviation_get_taf', {
 
       for (const period of taf.forecast_periods) {
         const changeLabel = period.change_type ? `**${period.change_type}** ` : '';
-        const probLabel = period.probability ? ` (${period.probability}%)` : '';
+        // A forecast probability of 0 is a value, not an absence — a truthiness
+        // guard here would drop it.
+        const probLabel = period.probability != null ? ` (${period.probability}%)` : '';
         lines.push(`### ${changeLabel}${period.from} → ${period.to}${probLabel}`);
 
-        const gustStr = period.wind.gust_kt != null ? ` gusting ${period.wind.gust_kt} kt` : '';
-        const dirStr =
-          period.wind.direction_deg != null ? `${period.wind.direction_deg}°` : 'variable';
-        lines.push(`**Wind:** ${dirStr} at ${period.wind.speed_kt} kt${gustStr}`);
+        // A period with no wind element has no direction to call variable and
+        // no speed to call calm. Both come from the same absent group.
+        if (period.wind.speed_kt != null) {
+          const gustStr = period.wind.gust_kt != null ? ` gusting ${period.wind.gust_kt} kt` : '';
+          const dirStr =
+            period.wind.direction_deg != null ? `${period.wind.direction_deg}°` : 'variable';
+          lines.push(`**Wind:** ${dirStr} at ${period.wind.speed_kt} kt${gustStr}`);
+        } else {
+          lines.push('**Wind:** not specified');
+        }
 
-        if (period.visibility_sm != null) {
-          lines.push(`**Visibility:** ${period.visibility_sm} sm`);
-        }
-        if (period.weather) {
-          lines.push(`**Weather:** ${period.weather}`);
-        }
+        lines.push(
+          `**Visibility:** ${period.visibility_sm != null ? `${period.visibility_sm} sm` : 'not specified'}`,
+        );
+        lines.push(`**Weather:** ${period.weather ?? 'not specified'}`);
         if (period.clouds.length > 0) {
           const cloudStr = period.clouds
             .map((c) => `${c.cover} @ ${c.base_ft} ft${c.type ? ` (${c.type})` : ''}`)
             .join(', ');
           lines.push(`**Clouds:** ${cloudStr}`);
+        } else {
+          lines.push('**Clouds:** Clear');
         }
         lines.push('');
       }

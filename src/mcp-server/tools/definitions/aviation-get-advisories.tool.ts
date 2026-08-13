@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
 
@@ -151,23 +152,30 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
     const lines: string[] = [`**${result.advisories.length} active advisory(ies)**\n`];
     for (const a of result.advisories) {
       lines.push(`## ${a.advisory_type}: ${a.series_id} — ${a.hazard}`);
-      if (a.severity != null) lines.push(`**Severity:** ${a.severity}`);
+      // Severity is populated on convective SIGMETs and null on AIRMETs, so a
+      // dropped line reads as a severity the renderer skipped.
+      lines.push(`**Severity:** ${a.severity != null ? a.severity : 'not reported'}`);
       lines.push(`**Issued by:** ${a.issued_by} | **Valid:** ${a.valid_from} → ${a.valid_to}`);
 
-      const altLow = a.altitude_low_ft != null ? `${a.altitude_low_ft.toLocaleString()} ft` : 'SFC';
+      // A bound the advisory never stated is not SFC or UNL. Those name real
+      // conditions — the hazard reaching the ground, or having no top — and
+      // asserting either from a null claims what the issuing office did not.
+      const altLow =
+        a.altitude_low_ft != null ? `${a.altitude_low_ft.toLocaleString()} ft` : 'not specified';
       const altHigh =
-        a.altitude_high_ft != null ? `${a.altitude_high_ft.toLocaleString()} ft` : 'UNL';
+        a.altitude_high_ft != null ? `${a.altitude_high_ft.toLocaleString()} ft` : 'not specified';
       lines.push(`**Altitude:** ${altLow} – ${altHigh}`);
 
-      if (a.movement) {
-        const movDir =
-          a.movement.direction_deg != null ? `${a.movement.direction_deg}°` : 'stationary';
-        const movSpd = a.movement.speed_kt != null ? ` at ${a.movement.speed_kt} kt` : '';
-        lines.push(`**Movement:** ${movDir}${movSpd}`);
-      }
+      const movDir =
+        a.movement?.direction_deg != null ? `${a.movement.direction_deg}°` : 'unreported direction';
+      const movSpd =
+        a.movement?.speed_kt != null ? `${a.movement.speed_kt} kt` : 'unreported speed';
+      lines.push(`**Movement:** ${a.movement ? `${movDir} at ${movSpd}` : 'not reported'}`);
 
       if (a.polygon.length > 0) {
-        const pts = a.polygon.map((p) => `${p.lat.toFixed(2)},${p.lon.toFixed(2)}`).join(' → ');
+        const pts = a.polygon
+          .map((p) => `${formatDegrees(p.lat)},${formatDegrees(p.lon)}`)
+          .join(' → ');
         lines.push(`**Polygon (${a.polygon.length} pts):** ${pts}`);
       }
 

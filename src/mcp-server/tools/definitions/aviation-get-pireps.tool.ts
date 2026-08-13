@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
 
@@ -69,14 +70,41 @@ const IcingLayerSchema = z
 
 const PirepCloudLayerSchema = z
   .object({
-    cover: z.string().describe('Cloud cover code (e.g., FEW, SCT, BKN, OVC).'),
-    base_ft: z.number().describe('Cloud base altitude in feet MSL.'),
-    top_ft: z.number().describe('Cloud top altitude in feet MSL.'),
+    cover: z
+      .string()
+      .describe(
+        'Cloud cover code: FEW, SCT, BKN, OVC, SKC, or CLR. The field also carries the flight-condition markers VMC and IMC, which describe the flight environment rather than a cloud layer and arrive with no base or top.',
+      ),
+    base_ft: z
+      .number()
+      .nullable()
+      .describe('Cloud base altitude in feet MSL, or null if the pilot reported no base.'),
+    top_ft: z
+      .number()
+      .nullable()
+      .describe('Cloud top altitude in feet MSL, or null if the pilot reported no top.'),
   })
-  .describe('A cloud layer with base and top altitudes.');
+  .describe('A cloud layer, whose base and top are each present only if reported.');
 
 /** Radius applied to a station_id search when distance_nm is omitted. */
 const DEFAULT_DISTANCE_NM = 100;
+
+/**
+ * Render a vertical extent where either bound may be unreported — shared by the
+ * cloud, turbulence, and icing layers, which all carry the same pair. Each
+ * available bound renders on its own, so a layer reporting only a base keeps
+ * that base instead of losing it to a range that cannot be drawn. A layer with
+ * neither bound renders nothing; that is the common case, and an empty range
+ * would be a placeholder standing in for an altitude nobody reported.
+ */
+function altitudeExtent(base_ft: number | null, top_ft: number | null): string {
+  if (base_ft != null && top_ft != null) {
+    return `${base_ft.toLocaleString()}–${top_ft.toLocaleString()} ft`;
+  }
+  if (base_ft != null) return `${base_ft.toLocaleString()} ft base, top unknown`;
+  if (top_ft != null) return `base unknown, ${top_ft.toLocaleString()} ft top`;
+  return '';
+}
 
 export const aviationGetPireps = tool('aviation_get_pireps', {
   title: 'Get Pilot Reports (PIREPs)',
@@ -112,12 +140,16 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       .number()
       .int()
       .optional()
-      .describe('Filter by minimum altitude in feet MSL (e.g., 18000 for FL180). Optional.'),
+      .describe(
+        'Filter by minimum altitude in feet MSL (e.g., 18000 for FL180). Reports with an unknown altitude (altitude_ft null) cannot be shown to satisfy a bound and are dropped whenever either bound is set. Optional.',
+      ),
     altitude_max_ft: z
       .number()
       .int()
       .optional()
-      .describe('Filter by maximum altitude in feet MSL (e.g., 35000 for FL350). Optional.'),
+      .describe(
+        'Filter by maximum altitude in feet MSL (e.g., 35000 for FL350). Reports with an unknown altitude (altitude_ft null) cannot be shown to satisfy a bound and are dropped whenever either bound is set. Optional.',
+      ),
   }),
   output: z.object({
     pireps: z
@@ -127,7 +159,12 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
             observed_at: z.string().describe('Observation time in ISO 8601 format (UTC).'),
             lat: z.number().describe('Latitude of the PIREP location in decimal degrees.'),
             lon: z.number().describe('Longitude of the PIREP location in decimal degrees.'),
-            altitude_ft: z.number().describe('Reported altitude in feet MSL.'),
+            altitude_ft: z
+              .number()
+              .nullable()
+              .describe(
+                'Reported altitude in feet MSL, or null when the pilot gave no flight level (raw /FLUNKN/, /FLDURC/, or /FLDURD/). A raw /FL000/ is a reported flight level of zero and returns 0.',
+              ),
             aircraft_type: z
               .string()
               .nullable()
@@ -138,15 +175,17 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
             turbulence: z
               .array(TurbulenceLayerSchema)
               .describe(
-                'Turbulence layers reported. Empty array if no turbulence encountered (NEG).',
+                'Turbulence layers reported. An explicit negative report is a layer with intensity NEG; an empty array means the PIREP carried no turbulence group, so the pilot said nothing either way.',
               ),
             icing: z
               .array(IcingLayerSchema)
-              .describe('Icing layers reported. Empty array if no icing encountered (NEG).'),
+              .describe(
+                'Icing layers reported. An explicit negative report is a layer with intensity NEG; an empty array means the PIREP carried no icing group, so the pilot said nothing either way.',
+              ),
             clouds: z
               .array(PirepCloudLayerSchema)
               .nullable()
-              .describe('Cloud layers with base and top altitudes, or null if not reported.'),
+              .describe('Cloud layers, or null if the PIREP carried no sky-condition group.'),
             visibility_sm: z
               .number()
               .nullable()
@@ -278,8 +317,15 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
 
     const rawCount = pireps.length;
 
-    if (altMin != null) pireps = pireps.filter((p) => p.altitude_ft >= altMin);
-    if (altMax != null) pireps = pireps.filter((p) => p.altitude_ft <= altMax);
+    // A report whose altitude is unknown cannot be shown to satisfy a bound, so
+    // either bound drops it. Both bounds behave the same way — the old zero
+    // sentinel made altitude_min_ft discard these and altitude_max_ft keep them.
+    if (altMin != null) {
+      pireps = pireps.filter((p) => p.altitude_ft != null && p.altitude_ft >= altMin);
+    }
+    if (altMax != null) {
+      pireps = pireps.filter((p) => p.altitude_ft != null && p.altitude_ft <= altMax);
+    }
 
     // Sort by observation time descending
     pireps.sort((a, b) => new Date(b.observed_at).getTime() - new Date(a.observed_at).getTime());
@@ -296,11 +342,11 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
               : null;
 
       const message = altFiltered
-        ? `No PIREPs in the search area matched the altitude filter (${altRange}). ${rawCount} report(s) were found at other altitudes.`
+        ? `No PIREPs in the search area matched the altitude filter (${altRange}). ${rawCount} report(s) were found at other or unreported altitudes.`
         : `No PIREPs found in the search area for the past ${input.hours} hour(s).`;
 
       const recovery = altFiltered
-        ? `Remove or adjust altitude_min_ft / altitude_max_ft. ${rawCount} PIREP(s) exist in the area at other altitudes.`
+        ? `Remove or adjust altitude_min_ft / altitude_max_ft. ${rawCount} PIREP(s) exist in the area at other or unreported altitudes.`
         : 'Expand the distance_nm or hours parameters, or try a different region. PIREPs are sparse; absence of reports does not mean smooth conditions.';
 
       throw ctx.fail('no_pireps_found', message, { recovery: { hint: recovery } });
@@ -315,37 +361,34 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     for (const p of result.pireps) {
       lines.push(`## ${p.pirep_type} — ${p.observed_at}`);
       lines.push(
-        `**Location:** ${p.lat.toFixed(4)}, ${p.lon.toFixed(4)} | **Altitude:** ${p.altitude_ft.toLocaleString()} ft`,
+        `**Location:** ${formatDegrees(p.lat)}, ${formatDegrees(p.lon)} | **Altitude:** ${p.altitude_ft != null ? `${p.altitude_ft.toLocaleString()} ft` : 'unknown'}`,
       );
       if (p.aircraft_type) lines.push(`**Aircraft:** ${p.aircraft_type}`);
 
       if (p.turbulence.length > 0) {
         lines.push('**Turbulence:**');
         for (const t of p.turbulence) {
-          const altStr =
-            t.base_ft != null && t.top_ft != null
-              ? ` (${t.base_ft.toLocaleString()}–${t.top_ft.toLocaleString()} ft)`
-              : '';
+          const extent = altitudeExtent(t.base_ft, t.top_ft);
           const details = [t.intensity, t.type, t.frequency].filter(Boolean).join(', ');
-          lines.push(`  - ${details}${altStr}`);
+          lines.push(`  - ${details}${extent ? ` (${extent})` : ''}`);
         }
       }
 
       if (p.icing.length > 0) {
         lines.push('**Icing:**');
         for (const i of p.icing) {
-          const altStr =
-            i.base_ft != null && i.top_ft != null
-              ? ` (${i.base_ft.toLocaleString()}–${i.top_ft.toLocaleString()} ft)`
-              : '';
+          const extent = altitudeExtent(i.base_ft, i.top_ft);
           const details = [i.intensity, i.type].filter(Boolean).join(', ');
-          lines.push(`  - ${details}${altStr}`);
+          lines.push(`  - ${details}${extent ? ` (${extent})` : ''}`);
         }
       }
 
       if (p.clouds && p.clouds.length > 0) {
         const cloudStr = p.clouds
-          .map((c) => `${c.cover} ${c.base_ft.toLocaleString()}–${c.top_ft.toLocaleString()} ft`)
+          .map((c) => {
+            const extent = altitudeExtent(c.base_ft, c.top_ft);
+            return extent ? `${c.cover} ${extent}` : c.cover;
+          })
           .join(', ');
         lines.push(`**Clouds:** ${cloudStr}`);
       }

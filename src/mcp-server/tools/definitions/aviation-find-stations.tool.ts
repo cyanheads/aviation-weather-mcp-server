@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
 import { isSupportedState } from '@/services/aviation-weather/state-bboxes.js';
@@ -64,7 +65,12 @@ export const aviationFindStations = tool('aviation_find_stations', {
             name: z.string().describe('Human-readable site name.'),
             lat: z.number().describe('Latitude in decimal degrees.'),
             lon: z.number().describe('Longitude in decimal degrees.'),
-            elevation_ft: z.number().describe('Station elevation in feet MSL.'),
+            elevation_ft: z
+              .number()
+              .nullable()
+              .describe(
+                'Station elevation in feet MSL. 0 is a sea-level site; null means no elevation is on file upstream, so it is unknown.',
+              ),
             state: z
               .string()
               .describe('US state abbreviation, or empty string for non-US stations.'),
@@ -192,14 +198,16 @@ export const aviationFindStations = tool('aviation_find_stations', {
       // Some AWC sites (mesonet stations, DC's WASD2) carry no identifier at all.
       if (ids) lines.push(`**IDs:** ${ids}`);
       lines.push(
-        `**Location:** ${s.lat.toFixed(4)}, ${s.lon.toFixed(4)} | **Elevation:** ${s.elevation_ft} ft`,
+        `**Location:** ${formatDegrees(s.lat)}, ${formatDegrees(s.lon)} | **Elevation:** ${s.elevation_ft != null ? `${s.elevation_ft} ft` : 'unknown'}`,
       );
       if (s.state || s.country) {
         lines.push(`**Region:** ${[s.state, s.country].filter(Boolean).join(', ')}`);
       }
-      if (s.data_types.length > 0) {
-        lines.push(`**Data types:** ${s.data_types.join(', ')}`);
-      }
+      // An empty list is the answer for 55 of 139 stations in one live bbox —
+      // dropping the line makes it read as products that were simply not shown.
+      lines.push(
+        `**Data types:** ${s.data_types.length > 0 ? s.data_types.join(', ') : 'none listed'}`,
+      );
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

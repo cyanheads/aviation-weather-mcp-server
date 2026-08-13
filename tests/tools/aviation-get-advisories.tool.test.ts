@@ -191,6 +191,23 @@ describe('aviationGetAdvisories', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Output-schema datum (issue #13) — SIGMET/AIRMET vertical extents are
+// flight-level references and stay MSL, unlike aerodrome cloud heights
+// ---------------------------------------------------------------------------
+
+describe('aviationGetAdvisories output datum', () => {
+  const advisory = aviationGetAdvisories.output.shape.advisories.element.shape;
+
+  it.each(['altitude_low_ft', 'altitude_high_ft'] as const)(
+    'keeps the %s description in feet MSL',
+    (field) => {
+      expect(advisory[field].description).toContain('MSL');
+      expect(advisory[field].description).not.toContain('AGL');
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Format tests
 // ---------------------------------------------------------------------------
 
@@ -227,5 +244,93 @@ describe('aviationGetAdvisories.format', () => {
     const text = (blocks[0] as { type: string; text: string }).text;
     expect(text).toContain(sigmet.valid_from);
     expect(text).toContain(sigmet.valid_to);
+  });
+
+  it('renders both altitude bounds when the advisory stated them', () => {
+    const blocks = aviationGetAdvisories.format!({ advisories: [sigmet] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('5,000 ft');
+    expect(text).toContain('25,000 ft');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Null states (issue #14) — a bound the advisory never stated must not render
+// as a named condition asserting where the hazard begins or ends
+// ---------------------------------------------------------------------------
+
+describe('aviationGetAdvisories.format null states', () => {
+  /** Render one advisory and return its text block. */
+  function render(advisory: NormalizedAdvisory): string {
+    const blocks = aviationGetAdvisories.format!({ advisories: [advisory] });
+    return (blocks[0] as { type: string; text: string }).text;
+  }
+
+  it('does not claim SFC for an unstated altitude floor', () => {
+    // All 20 advisories in one live sweep carried altitude_low_ft: null while
+    // stating a top. SFC asserts the hazard reaches the ground.
+    const text = render({ ...sigmet, altitude_low_ft: null });
+
+    expect(text).not.toContain('SFC');
+    expect(text).toContain('25,000 ft');
+  });
+
+  it('does not claim UNL for an unstated altitude ceiling', () => {
+    const text = render({ ...sigmet, altitude_high_ft: null });
+
+    expect(text).not.toContain('UNL');
+    expect(text).toContain('5,000 ft');
+  });
+
+  it('renders both unstated bounds without inventing either', () => {
+    const text = render(airmet);
+
+    expect(text).not.toContain('SFC');
+    expect(text).not.toContain('UNL');
+  });
+
+  it('renders a null severity as an explicit unreported state', () => {
+    // Severity is populated on convective SIGMETs and null on AIRMETs, so a
+    // dropped line reads as an AIRMET whose severity was simply not rendered.
+    const text = render(airmet);
+
+    expect(text).toContain('**Severity:** not reported');
+  });
+
+  it('renders a null movement as an explicit unreported state', () => {
+    const text = render(airmet);
+
+    expect(text).toContain('**Movement:** not reported');
+  });
+
+  it('does not call an unreported movement direction stationary', () => {
+    const text = render({ ...sigmet, movement: { direction_deg: null, speed_kt: 20 } });
+
+    expect(text).not.toContain('stationary');
+    expect(text).toContain('20 kt');
+  });
+
+  it('renders a movement whose speed was not reported without inventing one', () => {
+    const text = render({ ...sigmet, movement: { direction_deg: 270, speed_kt: null } });
+
+    expect(text).toContain('270°');
+    expect(text).not.toMatch(/at \d+ kt/);
+  });
+
+  it('renders polygon vertices at the resolution upstream published', () => {
+    // airsigmet publishes 3 decimals on 201 of 224 live values; toFixed(2)
+    // moved such a vertex by up to ~1 km.
+    const text = render({
+      ...sigmet,
+      polygon: [
+        { lat: 30.536, lon: -88.9 },
+        { lat: 30.495, lon: -88.087 },
+      ],
+    });
+
+    expect(text).toContain('30.536,-88.9');
+    expect(text).toContain('30.495,-88.087');
+    expect(text).not.toContain('30.54');
   });
 });

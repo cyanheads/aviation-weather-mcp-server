@@ -71,6 +71,57 @@ const minimalPirep: NormalizedPirep = {
   raw_pirep: 'KPDX UA /OV KPDX /TM 1700 /FL080 /TP UNKN /SK NEG',
 };
 
+/**
+ * A report encoded `/FLDURD/` — the pilot gave no flight level, so the altitude
+ * is unknown rather than ground level. The OVC024 layer has a base and no top.
+ */
+const unknownAltitudePirep: NormalizedPirep = {
+  observed_at: '2026-01-15T16:00:00.000Z',
+  lat: 41.0,
+  lon: -81.4,
+  altitude_ft: null,
+  aircraft_type: 'C208',
+  pirep_type: 'PIREP',
+  turbulence: [],
+  icing: [],
+  clouds: [{ cover: 'OVC', base_ft: 2400, top_ft: null }],
+  visibility_sm: null,
+  remarks: null,
+  raw_pirep: 'CAK UA /OV CAK/TM 0745/FLDURD/TP C208/SK OVC024',
+};
+
+/** A `SK CLR` report — the cover is the whole message; there is no layer to bound. */
+const clearSkyPirep: NormalizedPirep = {
+  observed_at: '2026-01-15T15:00:00.000Z',
+  lat: 41.9,
+  lon: -87.9,
+  altitude_ft: 11000,
+  aircraft_type: 'B753',
+  pirep_type: 'PIREP',
+  turbulence: [{ base_ft: null, top_ft: null, intensity: 'NEG', type: null, frequency: null }],
+  icing: [],
+  clouds: [{ cover: 'CLR', base_ft: null, top_ft: null }],
+  visibility_sm: null,
+  remarks: null,
+  raw_pirep: 'ORD UA /OV JOT290013/TM 0925/FL110/TP B753/SK CLR/TB NEG',
+};
+
+/** A reported `/FL000/` — a flight level of zero, not a missing altitude. */
+const groundLevelPirep: NormalizedPirep = {
+  observed_at: '2026-01-15T14:00:00.000Z',
+  lat: 38.0,
+  lon: -87.5,
+  altitude_ft: 0,
+  aircraft_type: 'E145',
+  pirep_type: 'PIREP',
+  turbulence: [{ base_ft: null, top_ft: null, intensity: 'NEG', type: null, frequency: null }],
+  icing: [],
+  clouds: null,
+  visibility_sm: null,
+  remarks: null,
+  raw_pirep: 'EVV UA /OV EVV/TM 0125/FL000/TP E145/TB NEG/RM DURD RY22 EVV',
+};
+
 // ---------------------------------------------------------------------------
 // Handler tests
 // ---------------------------------------------------------------------------
@@ -417,6 +468,155 @@ describe('aviationGetPireps altitude range', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Unknown altitude (issue #15) — an unreported flight level is not ground
+// level, and it cannot satisfy either altitude bound
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps unknown altitude', () => {
+  it('returns an unreported altitude as null', async () => {
+    mockFetchPireps.mockResolvedValue([unknownAltitudePirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KCAK' });
+    const result = await aviationGetPireps.handler(input, ctx);
+
+    expect(result.pireps[0]!.altitude_ft).toBeNull();
+  });
+
+  it('returns a reported /FL000/ as 0', async () => {
+    mockFetchPireps.mockResolvedValue([groundLevelPirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KEVV' });
+    const result = await aviationGetPireps.handler(input, ctx);
+
+    expect(result.pireps[0]!.altitude_ft).toBe(0);
+  });
+
+  it('keeps unknown-altitude reports when no altitude bound is set', async () => {
+    mockFetchPireps.mockResolvedValue([pirep, unknownAltitudePirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KSEA' });
+    const result = await aviationGetPireps.handler(input, ctx);
+
+    expect(result.pireps).toHaveLength(2);
+  });
+
+  it('drops unknown-altitude reports under altitude_min_ft', async () => {
+    mockFetchPireps.mockResolvedValue([pirep, unknownAltitudePirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KSEA', altitude_min_ft: 1000 });
+    const result = await aviationGetPireps.handler(input, ctx);
+
+    expect(result.pireps).toHaveLength(1);
+    expect(result.pireps[0]!.altitude_ft).toBe(27000);
+  });
+
+  it('drops unknown-altitude reports under altitude_max_ft too', async () => {
+    // The zero sentinel used to make altitude_max_ft silently keep these while
+    // altitude_min_ft silently discarded them. Both bounds now agree.
+    mockFetchPireps.mockResolvedValue([minimalPirep, unknownAltitudePirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KSEA', altitude_max_ft: 40000 });
+    const result = await aviationGetPireps.handler(input, ctx);
+
+    expect(result.pireps).toHaveLength(1);
+    expect(result.pireps[0]!.altitude_ft).toBe(8000);
+  });
+
+  it('keeps a reported /FL000/ under an altitude_max_ft bound', async () => {
+    mockFetchPireps.mockResolvedValue([groundLevelPirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KEVV', altitude_max_ft: 5000 });
+    const result = await aviationGetPireps.handler(input, ctx);
+
+    expect(result.pireps[0]!.altitude_ft).toBe(0);
+  });
+
+  it('reports unreported altitudes in the empty-result recovery hint', async () => {
+    mockFetchPireps.mockResolvedValue([unknownAltitudePirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KSEA', altitude_min_ft: 1000 });
+
+    let thrown: unknown;
+    try {
+      await aviationGetPireps.handler(input, ctx);
+    } catch (e) {
+      thrown = e;
+    }
+    const err = thrown as { message: string; data?: { recovery?: { hint?: string } } };
+    expect(err.message).toContain('other or unreported altitudes');
+    expect(err.data?.recovery?.hint).toContain('other or unreported altitudes');
+  });
+
+  it('accepts null and zero altitudes against the declared output schema', async () => {
+    mockFetchPireps.mockResolvedValue([unknownAltitudePirep, groundLevelPirep, clearSkyPirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KSEA' });
+    const result = await aviationGetPireps.handler(input, ctx);
+
+    expect(result).toEqual(expect.schemaMatching(aviationGetPireps.output));
+  });
+
+  it('documents how each altitude bound treats an unknown altitude', () => {
+    const input = aviationGetPireps.input.shape;
+    expect(input.altitude_min_ft.description).toMatch(/altitude_ft null/);
+    expect(input.altitude_max_ft.description).toMatch(/altitude_ft null/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Output-schema language (issues #24 and #13)
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps output schema language', () => {
+  const report = aviationGetPireps.output.shape.pireps.element.shape;
+  const cloudLayer = report.clouds.unwrap().element.shape;
+
+  it.each(['turbulence', 'icing'] as const)(
+    'does not read an empty %s array as a negative report',
+    (field) => {
+      // A PIREP that explicitly reports nothing populates the array with a NEG
+      // layer; an empty array means the group was absent from the report.
+      const description = report[field].description ?? '';
+      expect(description).toContain('NEG');
+      expect(description).not.toMatch(/Empty array if no \w+ encountered/);
+    },
+  );
+
+  it('names the cover codes the field actually emits', () => {
+    const description = cloudLayer.cover.description ?? '';
+    for (const code of ['FEW', 'SCT', 'BKN', 'OVC', 'SKC', 'CLR', 'VMC', 'IMC']) {
+      expect(description).toContain(code);
+    }
+  });
+
+  it('flags that some cover values are not cloud layers', () => {
+    expect(cloudLayer.cover.description).toMatch(/rather than a cloud layer/);
+  });
+
+  it.each(['altitude_ft', 'turbulence', 'icing', 'clouds'] as const)(
+    'keeps PIREP heights on the %s branch in feet MSL',
+    (field) => {
+      // Pilots read altitude off the altimeter, so PIREP heights are MSL —
+      // unlike the aerodrome cloud heights on METAR and TAF.
+      const descriptions =
+        field === 'altitude_ft'
+          ? [report.altitude_ft.description]
+          : field === 'clouds'
+            ? [cloudLayer.base_ft.description, cloudLayer.top_ft.description]
+            : [
+                report[field].element.shape.base_ft.description,
+                report[field].element.shape.top_ft.description,
+              ];
+
+      for (const description of descriptions) {
+        expect(description).toContain('MSL');
+        expect(description).not.toContain('AGL');
+      }
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Input schema surface
 // ---------------------------------------------------------------------------
 
@@ -486,5 +686,160 @@ describe('aviationGetPireps.format', () => {
     const text = (blocks[0] as { type: string; text: string }).text;
     expect(text).toContain('PIREP');
     expect(text).toContain(minimalPirep.raw_pirep);
+  });
+
+  it('renders cloud layers with a base and top as a range', () => {
+    const blocks = aviationGetPireps.format!({ pireps: [pirep] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('BKN 8,000–15,000 ft');
+  });
+
+  // A content[]-only client sees nothing but this text, so an unknown value has
+  // to read as unknown rather than as a measurement of zero.
+  it('renders an unreported altitude as unknown, not 0 ft', () => {
+    const blocks = aviationGetPireps.format!({ pireps: [unknownAltitudePirep] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('**Altitude:** unknown');
+    expect(text).not.toContain('**Altitude:** 0 ft');
+  });
+
+  it('renders a reported /FL000/ altitude as 0 ft', () => {
+    const blocks = aviationGetPireps.format!({ pireps: [groundLevelPirep] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('**Altitude:** 0 ft');
+    expect(text).not.toContain('unknown');
+  });
+
+  it('names the unknown top of a layer that reported only a base', () => {
+    const blocks = aviationGetPireps.format!({ pireps: [unknownAltitudePirep] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('OVC 2,400 ft base, top unknown');
+    expect(text).not.toContain('–0 ft');
+  });
+
+  it('names the unknown base of a layer that reported only a top', () => {
+    const report: NormalizedPirep = {
+      ...unknownAltitudePirep,
+      clouds: [{ cover: 'BKN', base_ft: null, top_ft: 6500 }],
+    };
+    const blocks = aviationGetPireps.format!({ pireps: [report] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('BKN base unknown, 6,500 ft top');
+  });
+
+  it.each(['CLR', 'SKC', 'VMC', 'IMC'])('renders a %s marker with no altitude range', (cover) => {
+    const report: NormalizedPirep = {
+      ...clearSkyPirep,
+      clouds: [{ cover, base_ft: null, top_ft: null }],
+    };
+    const blocks = aviationGetPireps.format!({ pireps: [report] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain(`**Clouds:** ${cover}`);
+    expect(text).not.toContain('0–0 ft');
+    expect(text).not.toMatch(/\bnull\b/);
+  });
+
+  it('renders an explicit NEG turbulence layer rather than omitting it', () => {
+    // An empty array means the group was absent; a NEG layer is the pilot
+    // saying they hit nothing. The two must not render the same.
+    const blocks = aviationGetPireps.format!({ pireps: [clearSkyPirep] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('**Turbulence:**');
+    expect(text).toContain('NEG');
+  });
+
+  it('omits the turbulence heading when the report carried no such group', () => {
+    const blocks = aviationGetPireps.format!({ pireps: [minimalPirep] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).not.toContain('**Turbulence:**');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One-sided hazard bounds and coordinate precision (issue #14) — a layer that
+// reported one bound loses it when the renderer demands both
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps.format hazard altitude bounds', () => {
+  /** Render one report and return its text block. */
+  function render(report: NormalizedPirep): string {
+    const blocks = aviationGetPireps.format!({ pireps: [report] });
+    return (blocks[0] as { type: string; text: string }).text;
+  }
+
+  it('renders a turbulence layer that reported only a base', () => {
+    // Live: `LAX UA /OV CYNDI/TM 0700/FL180/TP B737/TB LGT 180`.
+    const text = render({
+      ...pirep,
+      turbulence: [{ base_ft: 18000, top_ft: null, intensity: 'LGT', type: null, frequency: null }],
+      icing: [],
+      clouds: null,
+    });
+
+    expect(text).toContain('18,000 ft base');
+  });
+
+  it('renders an icing layer that reported only a top', () => {
+    // Live: `AKO UA /OV AKO227028/TM 0242/FL170/TP B739/... /IC NEG BLO 170/`.
+    const text = render({
+      ...pirep,
+      turbulence: [],
+      icing: [{ base_ft: null, top_ft: 14000, intensity: 'MOD', type: null }],
+      clouds: null,
+    });
+
+    expect(text).toContain('14,000 ft top');
+  });
+
+  it('renders no altitude text for a layer that reported neither bound', () => {
+    // The common case — 107 of 111 first-layer turbulence reports in a live
+    // CONUS sweep carried neither bound. This is the guard against a renderer
+    // that fabricates an empty range to fill the slot.
+    const text = render({
+      ...pirep,
+      turbulence: [{ base_ft: null, top_ft: null, intensity: 'NEG', type: null, frequency: null }],
+      icing: [],
+      clouds: null,
+    });
+
+    expect(text).toContain('- NEG');
+    expect(text).not.toContain('()');
+    expect(text).not.toMatch(/\bunknown\b/);
+  });
+
+  it('keeps a fully bounded layer rendering as a range', () => {
+    const text = render(pirep);
+
+    expect(text).toContain('(24,000–28,000 ft)');
+    expect(text).toContain('(10,000–14,000 ft)');
+  });
+
+  it('renders a bound of 0 rather than reading it as absent', () => {
+    // Surface-based layers arrive with base_ft 0. A truthiness guard here would
+    // drop a real ground-level bound and render the layer as unlocated.
+    const text = render({
+      ...pirep,
+      turbulence: [],
+      icing: [{ base_ft: 0, top_ft: 12000, intensity: 'LGT', type: 'RIME' }],
+      clouds: [{ cover: 'BKN', base_ft: 0, top_ft: 4000 }],
+    });
+
+    expect(text).toContain('(0–12,000 ft)');
+    expect(text).toContain('BKN 0–4,000 ft');
+  });
+
+  it('renders coordinates at the resolution upstream published', () => {
+    const text = render({ ...pirep, lat: 42.6129, lon: -84.5665 });
+
+    expect(text).toContain('**Location:** 42.6129, -84.5665');
+  });
+
+  it('does not pad a low-precision coordinate', () => {
+    const text = render({ ...pirep, lat: 36.037, lon: -80.5 });
+
+    expect(text).toContain('36.037, -80.5');
+    expect(text).not.toContain('36.0370');
+    expect(text).not.toContain('-80.5000');
   });
 });
