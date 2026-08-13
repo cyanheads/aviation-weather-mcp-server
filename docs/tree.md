@@ -1,6 +1,6 @@
 # aviation-weather-mcp-server - Directory Structure
 
-Generated on: 2026-08-13 12:45:02
+Generated on: 2026-08-13 14:31:26
 
 ```text
 aviation-weather-mcp-server/
@@ -25,6 +25,7 @@ aviation-weather-mcp-server/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
+│   ├── 0.4.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -150,6 +151,7 @@ aviation-weather-mcp-server/
 │   ├── services/
 │   │   └── aviation-weather/
 │   │       ├── aviation-weather-service.ts
+│   │       ├── awc-limits.ts
 │   │       ├── bbox.ts
 │   │       ├── state-bboxes.ts
 │   │       └── types.ts

@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-08-13 · ⚠️ Breaking
+
+aviation_get_advisories rejects AIRMET requests instead of answering with SIGMETs (breaking); aviation_find_stations and aviation_get_pireps disclose results capped at AWC's 400-row maximum
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-08-13 · ⚠️ Breaking
 
 TAF weather field changes from a string to raw/decoded (breaking); forecast obscuration and wind shear restored; batch calls now disclose missing stations
