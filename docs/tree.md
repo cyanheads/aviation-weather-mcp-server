@@ -1,6 +1,6 @@
 # aviation-weather-mcp-server - Directory Structure
 
-Generated on: 2026-08-13 14:31:26
+Generated on: 2026-08-25 09:26:16
 
 ```text
 aviation-weather-mcp-server/
@@ -171,7 +171,8 @@ aviation-weather-mcp-server/
 │       ├── aviation-get-metar.tool.test.ts
 │       ├── aviation-get-pireps.tool.test.ts
 │       ├── aviation-get-taf.tool.test.ts
-│       └── format-degrees.test.ts
+│       ├── format-degrees.test.ts
+│       └── tool-input-contract.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

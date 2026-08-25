@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-08-25
+
+Adopts @cyanheads/mcp-ts-core 0.12.3 and MCP SDK v2: an argument key no tool schema declares is now rejected by name instead of silently dropped, and .env.example pins MCP_SESSION_MODE=stateless to match the Docker image.
+
 ## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-08-13 · ⚠️ Breaking
 
 aviation_get_advisories rejects AIRMET requests instead of answering with SIGMETs (breaking); aviation_find_stations and aviation_get_pireps disclose results capped at AWC's 400-row maximum
