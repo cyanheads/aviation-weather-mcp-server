@@ -8,7 +8,7 @@
 |:-----|:------------|:-----------|:------------|
 | `aviation_get_metar` | Current weather observations for one or more airports. Returns decoded fields (wind direction/speed/gusts, visibility, ceiling and its kind, present weather, temp/dewpoint, altimeter, cloud layers) plus the computed flight category (VFR/MVFR/IFR/LIFR) and the raw METAR string. Accepts 1–10 ICAO station IDs. | `station_ids: string[]`, `hours?: number (1–12, default 1)` | `readOnlyHint: true, idempotentHint: true` |
 | `aviation_get_taf` | Terminal Aerodrome Forecast for one or more airports. Returns each forecast period with valid times, wind, visibility, decoded weather, and cloud layers, plus the raw TAF string. Accepts 1–4 ICAO station IDs. | `station_ids: string[]` | `readOnlyHint: true, idempotentHint: true` |
-| `aviation_get_pireps` | Recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence/icing/cloud reports with altitude, aircraft type, intensity, and the raw pirep string. | `station_id?: string`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `distance_nm?: number (station_id only, 100 when omitted)`, `hours?: number (1–12, default 3)` | `readOnlyHint: true, idempotentHint: true` |
+| `aviation_get_pireps` | Recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence/icing/cloud reports with altitude, aircraft type, intensity, and the raw pirep string. | `station_id?: string`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `distance_nm?: number (station_id only, 100 when omitted)`, `hours?: number (1–12, default 3)`, `altitude_min_ft?: number`, `altitude_max_ft?: number`, `min_intensity?: 'lgt' \| 'mod' \| 'sev'` | `readOnlyHint: true, idempotentHint: true` |
 | `aviation_get_advisories` | Active domestic SIGMETs for a region. Returns each advisory with hazard type (CONVECTIVE, TURBULENCE, ICING, IFR), severity, altitude range, valid period, polygon coordinates, and raw text. Accepts optional hazard filter or bounding box. AIRMETs are not served — a request for one is rejected. | `hazard?: enum`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `advisory_type?: 'sigmet' \| 'airmet' \| 'all'` | `readOnlyHint: true, idempotentHint: true` |
 | `aviation_find_stations` | Resolve an airport or weather reporting station by ICAO ID, or discover stations within a bounding box or US state. Returns ICAO/IATA/FAA IDs, coordinates, elevation, and available data types. | `station_ids?: string[]`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `state?: string (2-letter)` | `readOnlyHint: true, idempotentHint: true, openWorldHint: false` |
 
@@ -88,7 +88,7 @@ Each step is independently testable.
 | Station | find by ICAO IDs, find by bbox, find by US state | `GET /stationinfo` |
 | METAR | get current/recent by ICAO IDs | `GET /metar?ids=&format=json&hours=` |
 | TAF | get current by ICAO IDs | `GET /taf?ids=&format=json` |
-| PIREP | list recent by station + distance, or by bbox | `GET /pirep?id=&format=json&distance=&age=` |
+| PIREP | list recent by station + distance, or by bbox; narrowed upstream by altitude band and minimum intensity | `GET /pirep?id=&format=json&distance=&age=&level=&inten=` |
 | AIRSIGMET | list active, filtered client-side by hazard and/or bbox | `GET /airsigmet?format=json` |
 
 ---
@@ -199,17 +199,20 @@ distance_nm: z.number().int().min(10).max(500).optional().describe('Search radiu
 hours: z.number().int().min(1).max(12).default(3).describe('How far back to look.')
 altitude_min_ft: z.number().int().optional().describe('Filter by minimum altitude in feet MSL (e.g., 18000 for FL180).')
 altitude_max_ft: z.number().int().optional().describe('Filter by maximum altitude in feet MSL (e.g., 35000 for FL350).')
+min_intensity: z.enum(['lgt', 'mod', 'sev']).optional().describe('Return only reports carrying at least one turbulence or icing layer at this intensity or above. Selects reports, not layers.')
 ```
 
 Note: `station_id` or `bbox` is required (mutually exclusive, validate in handler).
 
 `distance_nm` carries no schema default — the handler must tell an omitted value from an explicit one to reject `bbox` + `distance_nm`, so the 100 nm fallback is applied on the `station_id` path instead.
 
+`min_intensity` maps to the upstream `inten` and is sent as given; the advertised enum is lowercase, and a different casing is rejected by the schema rather than coerced, so the error names the valid options. The altitude bounds have no upstream counterpart of the same shape — `level` is a centre point with a fixed ±3,000 ft band, not a range — so they stay the caller-facing contract and the handler derives a `level` centre from them where the resulting band contains the whole request. See decision 19.
+
 **Output schema (per PIREP):**
 ```
 observed_at: string          // ISO 8601 from obsTime
 lat / lon: number
-altitude_ft: number | null   // fltLvl * 100 (flight level to feet); null when the raw report gave no flight level
+altitude_ft: number | null   // fltLvl * 100 (flight level to feet); null when the raw flight-level group carries no usable altitude
 aircraft_type: string | null // acType
 pirep_type: 'PIREP' | 'AIREP'
 turbulence: {               // API reports up to 2 layers (tbBas1/tbTop1/tbInt1/tbType1/tbFreq1 + tbBas2/...)
@@ -222,9 +225,9 @@ turbulence: {               // API reports up to 2 layers (tbBas1/tbTop1/tbInt1/
 icing: {                    // API reports up to 2 layers (icgBas1/icgTop1/icgInt1/icgType1 + icgBas2/...)
   base_ft: number | null,
   top_ft: number | null,
-  intensity: string,
-  type: string | null
-}[]                          // array — include both layers when reported, omit empty ones
+  intensity: string,         // always a clean code; a concatenated value marks a synthesized layer
+  type: string | null        // icgType1: 'RIME', 'MIXED', 'CLEAR'; empty string upstream → null
+}[]                          // array — layers AWC synthesized are dropped, per layer
 clouds: { cover: string, base_ft: number | null, top_ft: number | null }[] | null
 visibility_sm: number | null
 remarks: string | null       // wxString or remarks
@@ -232,6 +235,8 @@ raw_pirep: string            // rawOb
 ```
 
 `cover` also carries `SKC`, `CLR`, and the flight-condition markers `VMC`/`IMC`, which arrive with `base: 0, top: 0` — a layer with neither bound is kept for its cover rather than dropped. An empty `turbulence`/`icing` array means the report carried no such group; an explicit negative report is a layer with intensity `NEG`.
+
+Each icing layer is admitted on its own: AWC marks a layer it synthesized by concatenating type text onto the intensity code, and such a layer is dropped rather than cleaned up — see decision 20. `turbulence` needs no equivalent: its intensities are clean codes throughout.
 
 **Error contract:**
 ```
@@ -251,12 +256,12 @@ truncated:    boolean         // always — true when the page hit the 400-row u
 shown:        number          // always — reports returned, after any altitude filter
 cap:          number          // only when truncated — the upstream row maximum applied
 upstreamRows: number          // only when the altitude filter narrowed a truncated page
-notice:       string          // only when truncated — names bbox, distance_nm, and hours as the levers
+notice:       string          // only when truncated — names the narrowing levers the query has not already used
 ```
 
-Detection reads the row count upstream served, before the altitude filter selects from it. `fetchPireps` applies no client-side filter of its own, so that count is the length the handler receives; the altitude filter runs afterwards in the handler, which is why the disclosure is computed there and not from the returned count.
+Detection reads the row count upstream served, before the altitude filter selects from it. `fetchPireps` applies no client-side filter of its own, so that count is the length the handler receives; the altitude filter runs afterwards in the handler, which is why the disclosure is computed there and not from the returned count. The `level` and `inten` parameters narrow what AWC *draws*, so the count stays the drawn row count and the disclosure keeps describing AWC's own page — see decision 19.
 
-When a capped page is then emptied by the altitude filter, `no_pireps_found` says the area was searched only in part and points at the same narrowing levers. It does not report the capped page's row count as the reports present in the area — that count describes the page, not the area, and the filter never saw beyond it.
+When a capped page is then emptied by the altitude filter, `no_pireps_found` says the area was searched only in part and points at the same narrowing levers. It does not report the capped page's row count as the reports present in the area — that count describes the page, not the area, and the filter never saw beyond it. An empty draw under an upstream narrowing gets its own message, since the query never asked for the whole area to begin with.
 
 ### `aviation_get_advisories`
 
@@ -380,7 +385,9 @@ A live sweep against a fixed bbox with `distance` at 1, 10, 50, 100, 200, 500 an
 **10. An unavailable numeric observation is null, never 0.**
 0 is a plausible aviation reading for every affected field — calm wind, a freezing temperature, a sea-level station — so it cannot double as "upstream reported nothing". Two upstream mechanisms feed the ambiguity and need different handling. METAR `wspd`/`temp`/`dewp`/`altim` and station `elev` arrive as genuine nulls, so the `?? 0` fallbacks became `?? null`. PIREP `fltLvl` and cloud `base`/`top` instead arrive as a literal `0`, which no null guard can catch.
 
-For PIREP altitude the discriminator is the raw `/FL…/` token, not the numeric value and not `fltLvlType`. `fltLvl: 0` alone cannot separate `/FLDURD/` (no altitude given) from `/FL000/` (a reported flight level of zero); both occur in the same snapshot. `fltLvlType` is phase of flight, and plenty of DURC/DURD reports carry a real numeric level. `/FLSFC/` is left alone — AWC substitutes the field elevation in hundreds of feet, which the existing ×100 conversion renders correctly.
+For PIREP altitude the discriminator is the raw `/FL…/` group, not the numeric value and not `fltLvlType`. `fltLvl: 0` alone cannot separate `/FLDURD/` (no altitude given) from `/FL000/` (a reported flight level of zero); both occur in the same snapshot. `fltLvlType` is phase of flight, and plenty of DURC/DURD reports carry a real numeric level. `/FLSFC/` is left alone — AWC substitutes the field elevation in hundreds of feet, which the existing ×100 conversion renders correctly.
+
+The group is read by whether it round-trips to the value AWC produced, not by matching a list of tokens — see decision 19.
 
 Once altitude is nullable, `altitude_min_ft`/`altitude_max_ft` must choose explicitly rather than inherit a choice from the sentinel: an unknown altitude cannot be shown to satisfy a bound, so either bound drops it. The zero sentinel previously made the two bounds disagree — `min` discarded these reports, `max` kept them.
 
@@ -440,6 +447,36 @@ Detection is `drawn rows >= 400`, read before any client-side filter — the ret
 
 The two tools' empty-result errors are deliberately asymmetric. `no_pireps_found` distinguishes a capped page, because an altitude band selecting nothing out of a cut window is ordinary and the old message reported that page's size as an area-wide count. `station_not_found` carries no such branch: reaching it from a capped draw needs a state whose bbox fills all 400 rows without one of the state's own stations among them, and a sweep of all 51 boxes finds Texas the only one that caps at all, keeping 279. Adding the branch would guard a state that cannot occur — leave it out rather than restoring it for symmetry.
 
+**19. A PIREP flight level is trusted only where the raw group corroborates it, and the narrowing AWC can express is sent upstream.**
+Two changes on the same premise: upstream's free-text fields are read for what they can actually establish, and the query is narrowed where the narrowing still counts.
+
+*The zero sentinel is settled by a round-trip, not a token list.* Decision 10 established the raw `/FL…/` group as the discriminator and enumerated the three tokens sampling had found. The enumeration cannot hold — the field is pilot-entered free text, and a 1,236-report live corpus carries call signs (`/FLB78X/`), station identifiers (`/FLKGRR/`), aircraft types (`/FLP28A/`), transpositions (`/FLDRD/`), and cloud groups (`/FLBKN0/`), none of them in the list and all resolving to `fltLvl: 0`. A shape test of "not digits and not `SFC`" does not hold either, and fails in both directions. It misses `/FL2130/`, `/FL1000/`, `/FL4000/`, and `/FL0303/` — all digits, all resolving to `fltLvl: 0`, four of them against six non-numeric cases in the same corpus, so the numeric failure is comparably common rather than a corner. And it destroys `/FL030-000/`, which is neither digits nor `SFC` and which AWC parsed correctly to the midpoint `fltLvl: 15`.
+
+What separates the two is whether the group round-trips: a group AWC read produces the value it names, so a `fltLvl` of 0 is a reading only where the group is a zero-valued digit string. The test is therefore scoped to `fltLvl === 0` and cannot touch a report with any other altitude, which is what keeps `/FL030-000/` intact. `/FLSFC/` stays excluded on its own terms — the substituted field elevation is a real altitude, and it is genuinely 0 at a sea-level field. A report with no `/FL` group at all (an AIREP encodes `F370` instead) has nothing to contradict its value and keeps it.
+
+*Altitude and intensity are pushed to AWC.* Both filters previously ran on the page the 400-row cap had already cut, so they could only subtract from what survived truncation. `/pirep` declares `level` and `inten`, and filtering before the cap changes which reports exist to filter: a CONUS box at `age=12` returns a capped 400 rows holding 41 reports in the FL160–220 band, where the same query with `level=190` returns 217 rows — uncapped — with 199 in that band.
+
+`level` is not a range. AWC documents it as "Level +-3000' to search", and `level=190` draws exactly FL160–220 against the live endpoint, so it does not map onto `altitude_min_ft`/`altitude_max_ft`. It composes with them instead: where a centre exists whose upstream band contains the requested one, the existing client-side filter trims that superset to the exact range. Exposing `level` directly was rejected — it would give the tool two ways to say one thing, and the upstream band width is an implementation detail of how the request is built rather than a contract the caller should learn. The client-side filter still runs after the upstream one, which is also what keeps the `fltLvl: 0` reports `level` admits out of a bounded result.
+
+Fitting the 6,000 ft width is necessary but not sufficient, because the centre is a whole flight level. Rounding shifts the band by up to 50 ft, so a near-full-width request can be left with a sliver outside what gets drawn: 17,950–23,950 ft rounds to `level=210`, which draws FL180–240 and misses the bottom 50 ft. Reports in a sliver go undrawn rather than trimmed, which is a silent loss rather than a filter — so the centre is computed and then checked, and a band that does not contain both bounds is not pushed at all. That containment check is the whole test: a band wider than 6,000 ft has no centre that holds it and fails the same check, so there is no separate width guard beside it. A wider band, a single bound, and a sliver all behave exactly as before.
+
+`inten` has no existing input to compose with, so `min_intensity` is a new one. It selects **reports**, not layers: a live `inten=mod` draw returns reports whose layers include `NEG` and `SEV` alongside the `MOD` that matched, so the description says so — a caller reading it as a layer filter would see a `NEG` layer in a moderate-turbulence result and conclude the tool is broken.
+
+Neither parameter changes what the cap disclosure means. They narrow what AWC draws, so the drawn row count decision 18 reads is still AWC's own page size, and `truncated` still reports that page rather than a post-filter count.
+
+**20. A synthesized icing layer is dropped rather than repaired, and the test is per layer.**
+AWC's decoder adds an icing layer to reports whose text never mentioned ice — `NEGclr`, an empty type, and bounds borrowed from elsewhere in the same record. A live `BNA UA /OV BNA/TM 2134/FL330/TP B763/SK SKC/TB NEG/RM ZME62` carries no `/IC` group at all yet arrives with icing bounds of `330`/`600`, which are its own `SK SKC` cloud layer — so normalization published a reported icing layer spanning 33,000–60,000 ft for a report that never mentioned ice. That is worse than an empty result: the empty array already means "the pilot said nothing either way", and a synthesized default contradicts it on a safety-relevant field where clear and rime ice are handled differently.
+
+*The concatenation is the marker, and dropping is the only honest response to it.* Across a 1,900-report corpus every `icgInt` value is either a clean code — `NEG` 122, `LGT` 79, `MOD` 13, `TRC` 5, `LGT-MOD` 4 — or the concatenated `NEGclr`, 126 of them. Stripping the suffix and keeping the layer is the tempting repair and it is the wrong one: the suffix is the layer's *only* tell, so a stripped layer publishes borrowed bounds as `NEG (24,000–60,000 ft)`, indistinguishable from a pilot's observation, where the raw form at least announced itself as odd. Removing the sole disclosure a bad row carries is a regression even when the row was already bad. Dropping is also the safe direction under decision 13: an omitted negative report costs the caller a "no ice reported", while a kept synthetic one asserts an altitude band nobody flew.
+
+*The test is per layer, not per report.* Every concatenation in the corpus sits in the second slot — `icgInt1` is a clean code in all 223 of its occurrences — and 18 of them ride on reports whose first slot is a genuine reading, so a report-level test publishes the synthetic layer beside the real one. One report carries a concatenated second layer as its *only* icing (`TIX … /IC +8C`, an undecodable stray temperature), where a report-level test would publish a wholly invented negative report.
+
+*One mechanism, not two.* A raw-text `/IC`-group gate was the first shape of this fix and earns no place beside the per-layer test: every layer on a report carrying no icing group is concatenated, 108 of 108, so the gate catches a strict subset of the same 126 and would never fire on anything the layer test missed. Two mechanisms guarding one concern is maintenance cost with no coverage behind it.
+
+Two-part ranges carry no trailing lowercase run and are preserved unsplit, matching turbulence. Genuine second layers exist and survive — a live `icgInt2` of `LGT`/`MIXED` and one of `MOD`/`MIXED`, both clean codes.
+
+Turbulence is untouched. Its intensities were clean codes across the same corpus, and its bounds keep a zero: `tbBas1: 0` occurs on reports whose raw range reads `030-SFC` or `SFC-060` — a genuine surface-based chop layer — so mirroring the cloud-layer zero-as-unknown rule onto it would fabricate an unknown out of a correct reading. The one class of zero icing bound observed (`icgBas2: 0`) sits entirely on synthesized layers and disappears with the rule above, so no separate zero rule is needed for icing either.
+
 ---
 
 ## Known Limitations
@@ -447,7 +484,7 @@ The two tools' empty-result errors are deliberately asymmetric. `no_pireps_found
 - **Coverage:** METAR/TAF are global; PIREPs and SIGMETs are US-centric (AWC is a US NWS product).
 - **Recency:** METARs are typically 20–60 min old. TAFs are 6–30 hour forecasts. PIREPs are real-time but sparse. Advisory set reflects only currently active products.
 - **No historical archive:** The API serves recent observations only (`hours` parameter up to 12 for METAR). No multi-day historical queries.
-- **400-row result cap:** Every endpoint returns at most 400 entries and offers no pagination surface. `aviation_find_stations` (bbox and state modes) and `aviation_get_pireps` can reach it; both disclose a capped result and name the levers that narrow the query before the cap applies. The other three tools' input limits keep them well below it. See decision 18.
+- **400-row result cap:** Every endpoint returns at most 400 entries and offers no pagination surface. `aviation_find_stations` (bbox and state modes) and `aviation_get_pireps` can reach it; both disclose a capped result and name the levers that narrow the query before the cap applies. `aviation_get_pireps` also pushes `min_intensity` and, where the requested band fits the upstream ±3,000 ft width, the altitude bounds — so those queries reach the cap less often to begin with (decision 19). The other three tools' input limits keep them well below it. See decision 18.
 - **Not an official briefing:** This data does not constitute a regulatory-compliant preflight weather briefing. Pilots flying IFR or in controlled airspace must use an authorized source.
 - **AIRSIGMET scope:** The endpoint serves domestic SIGMETs only and cannot return an AIRMET, so `aviation_get_advisories` rejects an AIRMET request rather than answering it (see decision 2); G-AIRMET and textual AIRMET support is tracked in #29. During fair-weather periods no SIGMETs may be active — absence of results is a valid state, not an error.
 - **Empty cloud arrays are ambiguous:** AWC does not encode a clear sky as a layer — a METAR reporting `CLR` and one carrying no sky-condition group at all both arrive as `clouds: []`. Both currently render as `Clear`, which overstates the second case and is the one place the "never state what the structured result does not support" rule above is not yet honored. Separating them requires inspecting the raw observation; tracked in #27.
@@ -464,6 +501,8 @@ The two tools' empty-result errors are deliberately asymmetric. `no_pireps_found
 - `hours=N` — lookback window for `metar` and `taf` (METAR: 1–12 typical)
 - `age=N` — lookback window ("Hours Back") for `pirep`; that endpoint has no `hours` parameter and silently ignores one
 - `distance=N` — radius in nautical miles around the `id` center point for PIREP searches; ignored when the search is a bbox
+- `level=N` — for `pirep`, a flight-level centre searched with a fixed ±3,000 ft band ("Level +-3000' to search"), not a range: `level=190` returns FL160–220. Applies in both the radial and bbox modes, and admits reports whose flight level did not parse
+- `inten=lgt|mod|sev` — for `pirep`, minimum hazard intensity. Selects whole reports carrying at least one turbulence or icing layer at that intensity or above, so a matching report still carries its lighter layers
 
 **Every endpoint returns at most 400 entries.** The limit is stated under Restrictions in the API documentation, alongside a request-pacing guideline of no more than 1 request/min per thread. The OpenAPI schema declares no `page`, `offset`, `limit`, or cursor parameter on any endpoint and does not mention the cap, so a client parsing the schema cannot learn the limit exists — a capped page is detectable only by counting the rows returned. `stationinfo` accepts only `ids`, `bbox`, and `format`, which leaves a smaller bounding box as its single narrowing lever.
 

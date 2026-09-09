@@ -49,7 +49,15 @@ const tools = [
   {
     name: 'aviation_get_pireps',
     def: aviationGetPireps,
-    keys: ['altitude_max_ft', 'altitude_min_ft', 'bbox', 'distance_nm', 'hours', 'station_id'],
+    keys: [
+      'altitude_max_ft',
+      'altitude_min_ft',
+      'bbox',
+      'distance_nm',
+      'hours',
+      'min_intensity',
+      'station_id',
+    ],
     full: {
       station_id: 'KSEA',
       bbox,
@@ -57,6 +65,7 @@ const tools = [
       hours: 6,
       altitude_min_ft: 18000,
       altitude_max_ft: 35000,
+      min_intensity: 'mod',
     },
   },
   {

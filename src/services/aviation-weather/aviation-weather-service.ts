@@ -395,15 +395,80 @@ function strOrNull(v: string | null | undefined): string | null {
 }
 
 /**
- * The `/FL` groups that carry no altitude — `/FLUNKN/` (unknown), `/FLDURC/`
- * (during climb), `/FLDURD/` (during descent). AWC resolves all three to
- * `fltLvl: 0`, which is indistinguishable from a reported `/FL000/`, so the raw
- * token is the only discriminator. `fltLvlType` is phase of flight, not an
- * altitude-validity flag: it reads DURC/DURD on plenty of reports that do carry
- * a numeric flight level. `/FLSFC/` is excluded too — AWC substitutes the field
- * elevation in hundreds of feet for it, which is a real altitude.
+ * The raw `/FL…/` group's value. The group is not always tight against `FL`
+ * (`/FL 290/` occurs), and an AIREP carries no group at all — it encodes the
+ * level as a bare `F370` — so a report with no match is a report this
+ * discriminator has nothing to say about.
  */
-const PIREP_FLIGHT_LEVEL_UNKNOWN = /\/FL\s*(?:UNKN|DURC|DURD)\b/;
+const PIREP_FLIGHT_LEVEL_GROUP = /\/FL\s*([^/\s]*)/;
+
+/**
+ * Whether a `fltLvl` of 0 is a reported flight level or AWC's could-not-parse
+ * sentinel, read from the raw group that produced it.
+ *
+ * AWC leaves `fltLvl: 0` both for a genuine `/FL000/` and for any group its
+ * decoder could not read, so the numeric value cannot separate them, and
+ * `fltLvlType` is phase of flight rather than an altitude-validity flag — it
+ * reads DURC/DURD on plenty of reports carrying a real numeric level. The raw
+ * group can separate them: a group AWC parsed round-trips to the value it
+ * produced, so a zero backed by a zero-valued group is a reading and a zero
+ * backed by anything else is not. What lands in the group is pilot-entered free
+ * text, so the set of ways it fails is open-ended rather than a token list to
+ * keep growing — live draws carry call signs (`/FLB78X/`), station identifiers
+ * (`/FLKGRR/`), transpositions (`/FLDRD/`), and, just as often, plain digits
+ * outside the flight-level range (`/FL2130/`, `/FL4000/`), which is why this
+ * reads the group's *value* rather than its shape.
+ *
+ * Two exclusions keep good data. `/FLSFC/` is left alone — AWC substitutes the
+ * field elevation in hundreds of feet there, so its zero is a sea-level field
+ * rather than a failure to parse. And a nonzero `fltLvl` is never questioned,
+ * however the group is spelled: AWC resolves `/FL030-000/` to the midpoint
+ * `fltLvl: 15`, and reading that group's shape alone would discard an altitude
+ * upstream successfully decoded.
+ */
+function isReportedFlightLevelZero(rawOb: string): boolean {
+  const group = PIREP_FLIGHT_LEVEL_GROUP.exec(rawOb)?.[1];
+  if (group == null || group.toUpperCase() === 'SFC') return true;
+  return /^\d+$/.test(group) && Number(group) === 0;
+}
+
+/** Reported altitude in feet MSL, or null when the flight level is unknown. */
+function pirepAltitudeFeet(raw: RawPirep): number | null {
+  const { fltLvl } = raw;
+  if (fltLvl == null) return null;
+  if (fltLvl === 0) return isReportedFlightLevelZero(raw.rawOb) ? 0 : null;
+  // Below 1000 the value is a flight level (270 → 27,000 ft); at or above it
+  // AWC has already published feet.
+  return fltLvl < 1000 ? fltLvl * 100 : fltLvl;
+}
+
+/**
+ * Whether an upstream icing intensity is AWC's decoder default rather than a
+ * reading taken from the report.
+ *
+ * AWC synthesizes an icing layer — `NEGclr`, an empty type, and bounds borrowed
+ * from elsewhere in the same record — on reports that never mentioned ice, and
+ * marks it by concatenating type text onto the intensity code. Intensity codes
+ * are uppercase, so a trailing lowercase run is never part of one; matching
+ * that shape rather than the one observed spelling keeps the next one from
+ * having to be enumerated.
+ *
+ * The concatenation is the layer's only tell, so the layer is dropped rather
+ * than cleaned up. Stripping the suffix and keeping it would publish borrowed
+ * bounds as a pilot's observation — a synthetic layer reading as a real one,
+ * where the raw form at least announced itself as odd.
+ *
+ * The test is per layer, not per report. Across a 1,900-report live corpus
+ * every concatenation sits in the second slot and 18 of them ride on reports
+ * whose first slot is a genuine reading, so a report-level test publishes the
+ * synthetic layer alongside the real one. It also subsumes a raw-text `/IC`
+ * gate: every layer on a report carrying no icing group is concatenated, so
+ * that gate catches a strict subset — 108 layers against this test's 126 — and
+ * earns no place beside it.
+ */
+function isFabricatedIcingLayer(intensity: string): boolean {
+  return /[a-z]+$/.test(intensity);
+}
 
 /** Upstream encodes an unreported PIREP cloud base or top as 0, not null. */
 function pirepCloudAltitude(value: number | null): number | null {
@@ -433,21 +498,24 @@ function normalizePirep(raw: RawPirep): NormalizedPirep {
     });
   }
 
-  // Build icing layers — omit entries with empty intensity
+  // Build icing layers — omit entries with empty intensity, and entries AWC
+  // synthesized rather than read off the report
   const icing: NormalizedIcingLayer[] = [];
-  if (raw.icgInt1?.trim()) {
+  const icgInt1 = raw.icgInt1?.trim();
+  const icgInt2 = raw.icgInt2?.trim();
+  if (icgInt1 && !isFabricatedIcingLayer(icgInt1)) {
     icing.push({
       base_ft: typeof raw.icgBas1 === 'number' ? raw.icgBas1 * 100 : null,
       top_ft: typeof raw.icgTop1 === 'number' ? raw.icgTop1 * 100 : null,
-      intensity: raw.icgInt1,
+      intensity: icgInt1,
       type: strOrNull(raw.icgType1),
     });
   }
-  if (raw.icgInt2?.trim()) {
+  if (icgInt2 && !isFabricatedIcingLayer(icgInt2)) {
     icing.push({
       base_ft: typeof raw.icgBas2 === 'number' ? raw.icgBas2 * 100 : null,
       top_ft: typeof raw.icgTop2 === 'number' ? raw.icgTop2 * 100 : null,
-      intensity: raw.icgInt2,
+      intensity: icgInt2,
       type: strOrNull(raw.icgType2),
     });
   }
@@ -463,13 +531,6 @@ function normalizePirep(raw: RawPirep): NormalizedPirep {
         }))
       : null;
 
-  const altitudeFt =
-    PIREP_FLIGHT_LEVEL_UNKNOWN.test(raw.rawOb) || raw.fltLvl == null
-      ? null
-      : raw.fltLvl < 1000
-        ? raw.fltLvl * 100 // flight level (e.g., 270 → 27000)
-        : raw.fltLvl; // already in feet for low-altitude reports
-
   const visib =
     raw.visib == null
       ? null
@@ -481,7 +542,7 @@ function normalizePirep(raw: RawPirep): NormalizedPirep {
     observed_at: new Date(raw.obsTime * 1000).toISOString(),
     lat: raw.lat,
     lon: raw.lon,
-    altitude_ft: altitudeFt,
+    altitude_ft: pirepAltitudeFeet(raw),
     aircraft_type: raw.acType ?? null,
     pirep_type: raw.pirepType ?? 'PIREP',
     turbulence,
@@ -645,6 +706,11 @@ export class AviationWeatherService {
    * The pirep endpoint names its lookback `age` ("Hours Back"), unlike the
    * metar/taf endpoints' `hours`, and silently drops query keys it does not
    * recognize rather than rejecting them.
+   *
+   * `level` and `minIntensity` narrow the query upstream, where the 400-row cap
+   * applies, rather than after it. Both compose with either search mode and
+   * with each other. `level` is a centre in flight levels with the fixed
+   * ±3,000 ft band AWC documents, not a range — see `pushablePirepLevel`.
    */
   async fetchPireps(
     params: {
@@ -652,6 +718,8 @@ export class AviationWeatherService {
       bbox?: { minLat: number; minLon: number; maxLat: number; maxLon: number };
       distanceNm?: number;
       hours: number;
+      level?: number;
+      minIntensity?: 'lgt' | 'mod' | 'sev';
     },
     ctx: Context,
   ): Promise<NormalizedPirep[]> {
@@ -664,11 +732,16 @@ export class AviationWeatherService {
     } else {
       throw serviceUnavailable('Either stationId or bbox is required for PIREPs');
     }
+    // FL000 is a real centre, so the level check is against null, not falsiness.
+    if (params.level != null) url += `&level=${params.level}`;
+    if (params.minIntensity) url += `&inten=${params.minIntensity}`;
     ctx.log.debug('Fetching PIREPs', {
       stationId: params.stationId,
       hasBbox: !!params.bbox,
       distanceNm: params.distanceNm,
       hours: params.hours,
+      level: params.level,
+      minIntensity: params.minIntensity,
     });
     const raw = await this.fetchJson<RawPirep[]>(url, ctx);
     if (!Array.isArray(raw)) return [];

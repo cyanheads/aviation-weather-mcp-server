@@ -469,6 +469,171 @@ describe('aviationGetPireps altitude range', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Upstream narrowing (issue #32) — the altitude band is pushed to AWC as a
+// `level` centre when it fits the fixed ±3,000 ft width, and min_intensity is
+// forwarded as `inten`; both run before the row cap
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps upstream narrowing', () => {
+  const bbox = { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 };
+
+  /**
+   * Run the handler and return the params object handed to the service. The
+   * assertions here are about the request that went out, so an altitude band
+   * the fixture report falls outside of is not a failure — the empty-result
+   * error is raised after the call these tests read.
+   */
+  async function paramsFor(input: Record<string, unknown>) {
+    mockFetchPireps.mockResolvedValue([pirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    try {
+      await aviationGetPireps.handler(aviationGetPireps.input.parse(input), ctx);
+    } catch {
+      // Intentionally ignored — see above.
+    }
+    return mockFetchPireps.mock.calls[0]![0];
+  }
+
+  it('sends the band centre as a flight level, not feet', async () => {
+    const params = await paramsFor({
+      bbox,
+      altitude_min_ft: 18000,
+      altitude_max_ft: 20000,
+    });
+    expect(params).toMatchObject({ level: 190 });
+  });
+
+  it.each([
+    ['a band exactly at the upstream width', 16000, 22000, 190],
+    ['a degenerate band of equal bounds', 27000, 27000, 270],
+    ['a band centred on the surface', 0, 3000, 15],
+    ['a band whose centre needs rounding', 18000, 20100, 191],
+  ])('pushes %s', async (_label, altitude_min_ft, altitude_max_ft, level) => {
+    expect(await paramsFor({ bbox, altitude_min_ft, altitude_max_ft })).toMatchObject({ level });
+  });
+
+  it.each([
+    ['a band wider than the upstream width', { altitude_min_ft: 10000, altitude_max_ft: 30000 }],
+    ['a lower bound alone', { altitude_min_ft: 18000 }],
+    ['an upper bound alone', { altitude_max_ft: 20000 }],
+    ['no altitude bound at all', {}],
+  ])('sends no level for %s', async (_label, bounds) => {
+    expect(await paramsFor({ bbox, ...bounds })).not.toHaveProperty('level');
+  });
+
+  it.each([
+    ['a near-full-width band with a half-flight-level centre', 17950, 23950],
+    ['the same shape lower down', 4950, 10950],
+  ])('sends no level for %s, whose rounded band would miss a sliver', async (_l, min, max) => {
+    // Rounding the centre to a whole flight level shifts the band by up to
+    // 50 ft. A centre of FL210 for 17,950–23,950 ft draws FL180–240 and leaves
+    // the bottom 50 ft undrawn, so reports there would vanish rather than be
+    // trimmed. Only a centre whose band contains the whole request is sent.
+    expect(
+      await paramsFor({ bbox, altitude_min_ft: min, altitude_max_ft: max }),
+    ).not.toHaveProperty('level');
+  });
+
+  it('forwards min_intensity as the upstream intensity value', async () => {
+    expect(await paramsFor({ bbox, min_intensity: 'mod' })).toMatchObject({
+      minIntensity: 'mod',
+    });
+  });
+
+  it('sends no intensity when min_intensity is omitted', async () => {
+    expect(await paramsFor({ bbox })).not.toHaveProperty('minIntensity');
+  });
+
+  it('pushes both levers in the radial mode as well', async () => {
+    expect(
+      await paramsFor({
+        station_id: 'KDEN',
+        distance_nm: 200,
+        altitude_min_ft: 18000,
+        altitude_max_ft: 20000,
+        min_intensity: 'sev',
+      }),
+    ).toMatchObject({ stationId: 'KDEN', distanceNm: 200, level: 190, minIntensity: 'sev' });
+  });
+
+  it('computes no level from an inverted range — the guard fires first', async () => {
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      bbox,
+      altitude_min_ft: 20000,
+      altitude_max_ft: 18000,
+    });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_altitude_range' },
+    });
+    expect(mockFetchPireps).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing_location', {}],
+    ['conflicting_location', { station_id: 'KSEA', bbox }],
+    ['conflicting_distance', { bbox, distance_nm: 150 }],
+  ])('keeps %s ahead of any filter work', async (reason, input) => {
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const parsed = aviationGetPireps.input.parse({
+      ...input,
+      altitude_min_ft: 18000,
+      altitude_max_ft: 20000,
+      min_intensity: 'mod',
+    });
+
+    await expect(aviationGetPireps.handler(parsed, ctx)).rejects.toMatchObject({
+      data: { reason },
+    });
+    expect(mockFetchPireps).not.toHaveBeenCalled();
+  });
+
+  it('still applies the client-side altitude filter after the upstream band', async () => {
+    // The ±3,000 ft band admits FL160–220 for level=190; a report at 21,000 ft
+    // survives upstream and must still be trimmed to the requested 18–20k range.
+    const inBand = { ...pirep, altitude_ft: 21000 };
+    mockFetchPireps.mockResolvedValue([pirep, inBand, unknownAltitudePirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      bbox,
+      altitude_min_ft: 18000,
+      altitude_max_ft: 20000,
+    });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_pireps_found' },
+    });
+  });
+
+  it('still drops a null-altitude report the upstream band admitted', async () => {
+    // `level` admits reports whose flight level did not parse; the client-side
+    // filter is what keeps them out of a bounded result.
+    mockFetchPireps.mockResolvedValue([{ ...pirep, altitude_ft: 19000 }, unknownAltitudePirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      bbox,
+      altitude_min_ft: 18000,
+      altitude_max_ft: 20000,
+    });
+    const result = await aviationGetPireps.handler(input, ctx);
+
+    expect(result.pireps).toHaveLength(1);
+    expect(result.pireps[0]!.altitude_ft).toBe(19000);
+  });
+
+  it('describes min_intensity as selecting reports rather than layers', () => {
+    const description = aviationGetPireps.input.shape.min_intensity.description ?? '';
+    expect(description).toMatch(/report/i);
+    expect(description).toMatch(/lighter layers/i);
+  });
+
+  it('names min_intensity in the tool description', () => {
+    expect(aviationGetPireps.description).toContain('min_intensity');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Unknown altitude (issue #15) — an unreported flight level is not ground
 // level, and it cannot satisfy either altitude bound
 // ---------------------------------------------------------------------------
@@ -592,6 +757,18 @@ describe('aviationGetPireps output schema language', () => {
 
   it('flags that some cover values are not cloud layers', () => {
     expect(cloudLayer.cover.description).toMatch(/rather than a cloud layer/);
+  });
+
+  it('describes the unknown altitude by the rule rather than by an example token', () => {
+    // The three-token list read as exhaustive; the field goes null for any
+    // group AWC could not resolve, whatever it happens to spell.
+    const description = report.altitude_ft.description ?? '';
+    expect(description).not.toMatch(/\/FLUNKN\/, \/FLDURC\/, or \/FLDURD\//);
+    expect(description).toMatch(/\/FL000\//);
+  });
+
+  it('says an icing layer reflects a reported group rather than an upstream default', () => {
+    expect(report.icing.description ?? '').toMatch(/raw report/i);
   });
 
   it.each(['altitude_ft', 'turbulence', 'icing', 'clouds'] as const)(
@@ -754,6 +931,32 @@ describe('aviationGetPireps.format', () => {
     const blocks = aviationGetPireps.format!({ pireps: [minimalPirep] });
     const text = (blocks[0] as { type: string; text: string }).text;
     expect(text).not.toContain('**Turbulence:**');
+  });
+
+  it('omits the icing heading for a report AWC defaulted an icing layer onto', () => {
+    // The upstream NEGclr placeholder no longer reaches normalization, so the
+    // report arrives with an empty array and renders no icing section at all.
+    const blocks = aviationGetPireps.format!({ pireps: [clearSkyPirep] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).not.toContain('**Icing:**');
+  });
+
+  it('renders a split intensity without the concatenated token', () => {
+    const split: NormalizedPirep = {
+      ...pirep,
+      icing: [{ base_ft: null, top_ft: null, intensity: 'NEG', type: null }],
+    };
+    const blocks = aviationGetPireps.format!({ pireps: [split] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('**Icing:**');
+    expect(text).toContain('- NEG');
+    expect(text).not.toContain('NEGclr');
+  });
+
+  it('renders an icing type beside its intensity when one was reported', () => {
+    const blocks = aviationGetPireps.format!({ pireps: [pirep] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+    expect(text).toContain('LGT, RIME');
   });
 });
 
@@ -957,12 +1160,91 @@ describe('aviationGetPireps truncation disclosure', () => {
   });
 
   it('still reports the upstream count when an uncapped page empties', async () => {
-    // Characterization — below the cap the count is a fact about the area, and
-    // the fix must not weaken it into a hedge.
+    // Characterization — a single bound pushes no level, so the draw is the
+    // whole area and the count is a fact about it. The fix must not weaken
+    // this into a hedge.
     const err = await errorFor({ station_id: 'KSEA', altitude_min_ft: 30000 }, page(3));
 
     expect(err.message).toContain('3 report(s) were found at other or unreported altitudes');
     expect(err.data?.recovery?.hint).toContain('3 PIREP(s) exist in the area');
+  });
+
+  it('stops claiming an area-wide count when the draw was narrowed upstream', async () => {
+    // An 18,001–18,099 ft band pushes level=181, so AWC drew only FL151–211.
+    // The rows that came back describe that band; the area holds more.
+    const err = await errorFor(
+      {
+        bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 },
+        altitude_min_ft: 18001,
+        altitude_max_ft: 18099,
+      },
+      page(197, 30000),
+    );
+
+    expect(err.message).not.toMatch(/197 report\(s\) were found at other or unreported altitudes/);
+    expect(err.data?.recovery?.hint).not.toMatch(/197 PIREP\(s\) exist in the area/);
+    expect(err.message).toMatch(/FL181/);
+  });
+
+  it('names the intensity filter when it narrowed the draw that then emptied', async () => {
+    const err = await errorFor(
+      {
+        bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 },
+        altitude_min_ft: 18001,
+        altitude_max_ft: 18099,
+        min_intensity: 'mod',
+      },
+      page(21, 30000),
+    );
+
+    expect(err.message).toMatch(/MOD/);
+    expect(err.data?.recovery?.hint).toContain('min_intensity');
+  });
+
+  it('does not tell a caller to narrow a band already pushed upstream', async () => {
+    // A 48 ft band is sent as level=181. Offering "an altitude band 6,000 ft
+    // or narrower" as the remaining lever asks for what was already done, and
+    // saying the filter ran after the cap is false for this query.
+    const err = await errorFor(
+      {
+        bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 },
+        altitude_min_ft: 18001,
+        altitude_max_ft: 18049,
+      },
+      page(AWC_MAX_ROWS, 30000),
+    );
+    const hint = String(err.data?.recovery?.hint);
+
+    expect(hint).not.toMatch(/6,000 ft or narrower/);
+    expect(hint).not.toMatch(/applied after the cap/);
+    expect(hint).toContain('bbox');
+  });
+
+  it('still offers the altitude band as a lever when none was pushed', async () => {
+    const err = await errorFor(
+      { bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 }, altitude_min_ft: 30000 },
+      page(AWC_MAX_ROWS, 8000),
+    );
+
+    expect(String(err.data?.recovery?.hint)).toMatch(/6,000 ft or narrower/);
+  });
+
+  it('drops min_intensity from the lever list once the caller has set it', async () => {
+    const notice = String(
+      (
+        await enrichmentFor(
+          {
+            bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 },
+            hours: 12,
+            min_intensity: 'mod',
+          },
+          page(AWC_MAX_ROWS),
+        )
+      ).notice,
+    );
+
+    expect(notice).toContain('bbox');
+    expect(notice).not.toMatch(/, min_intensity/);
   });
 
   it('leaves an empty upstream result an error rather than a truncation disclosure', async () => {

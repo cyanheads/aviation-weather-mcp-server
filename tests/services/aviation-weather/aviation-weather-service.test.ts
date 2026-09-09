@@ -1049,6 +1049,248 @@ describe('AviationWeatherService PIREP altitude unknown vs. genuine zero', () =>
     });
     expect(report.altitude_ft).toBe(1200);
   });
+
+  // -------------------------------------------------------------------------
+  // Malformed flight-level groups (issue #25) — the recognized token set was an
+  // enumeration of a free-text field, so each draw of the endpoint turns up
+  // members it does not hold.
+  // -------------------------------------------------------------------------
+
+  it.each([
+    ['a call sign', 'FLB78X', 'ORD UA /OV ORD360010/TM 2146/FLB78X/TP VMC/TB NEG'],
+    ['an aircraft type', 'FLP28A', 'FPR UA /OV FPR280001/TM 2028/FLP28A/TP P28A/SK OVC025'],
+    ['a station identifier', 'FLKGRR', 'GRR UA /OV KGRR/TM 1904/FLKGRR/TP C56X/SK OVC UNKN-TOP040'],
+    ['a cloud group', 'FLBKN0', 'BUF UA /OV BUF/TM 1830/FLBKN0/TP C172/SK BKN030'],
+    ['a transposed DURD', 'FLDRD', 'SAV UA /OV SAV190005/TM 2010/FLDRD/TP GLF5/SK BKN020'],
+  ])('reports %s bled into the group as an unknown altitude (/%s/)', async (_l, _t, rawOb) => {
+    const report = await normalize({ fltLvl: 0, rawOb });
+    expect(report.altitude_ft).toBeNull();
+  });
+
+  it.each([
+    ['a time', 'FL2130', 'MCO UA /OV MCO360007/TM 2130/FL2130/TP B737/RM SMOOTH ON FINAL RWY 17L'],
+    ['feet where a flight level belongs', 'FL1000', 'FMY UA /OV FMY/TM 2037/FL1000/TP C560'],
+    ['a four-digit altitude', 'FL4000', 'MTC UA /OV MTC150015/TM 1802/FL4000/TP AS65/WX 3-4 VIS'],
+    ['a zero-padded four-digit altitude', 'FL0303', 'TOL UA /OV FZI/TM 1907/FL0303/TP EC35'],
+  ])(
+    'reports %s as an unknown altitude even though the group is all digits (/%s/)',
+    async (_l, _t, rawOb) => {
+      // The case a digits-vs-not-digits shape test misses. AWC could not read
+      // these either and left fltLvl 0, which renders as a surface observation
+      // exactly as a non-numeric token does.
+      const report = await normalize({ fltLvl: 0, rawOb });
+      expect(report.altitude_ft).toBeNull();
+    },
+  );
+
+  it('keeps a flight-level range AWC resolved to its midpoint', async () => {
+    // `/FL030-000/` is neither all digits nor SFC, and AWC parsed it anyway:
+    // fltLvl 15 is the midpoint of FL030 and FL000. Reading the group's shape
+    // alone would discard an altitude upstream successfully decoded.
+    const report = await normalize({
+      fltLvl: 15,
+      fltLvlType: 'DURD',
+      rawOb: 'JNU UA /OV JNU /TM 0054 /FL030-000 /TP PC12 /SK OVC030 /TB OCNL LGT',
+    });
+    expect(report.altitude_ft).toBe(1500);
+  });
+
+  it('keeps a /FLSFC/ report at a sea-level field, where the substituted elevation is 0', async () => {
+    // The SFC exclusion does not turn on the value: AWC substitutes field
+    // elevation there, and a sea-level field's elevation is a genuine 0.
+    const report = await normalize({
+      fltLvl: 0,
+      fltLvlType: 'GRND',
+      rawOb: 'ACY UA /OV ACY/TM 1200/FLSFC/TP C172/SK OVC010',
+    });
+    expect(report.altitude_ft).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PIREP icing layers (issue #26) — AWC emits a default icing layer on reports
+// whose raw text never mentioned icing
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService PIREP icing layers', () => {
+  /** Normalize one raw PIREP through the real service path. */
+  async function normalize(overrides: Partial<RawPirep>) {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([{ ...rawPirep, ...overrides }]));
+    const [report] = await svc.fetchPireps(
+      { stationId: 'KSEA', distanceNm: 100, hours: 3 },
+      createMockContext(),
+    );
+    return report!;
+  }
+
+  it('drops the fabricated layer on a report whose raw text carries no /IC group', async () => {
+    // AWC borrows the report's own cloud layer for the bounds; the pilot said
+    // nothing about icing at all.
+    const report = await normalize({
+      rawOb: 'BNA UA /OV BNA/TM 2134/FL330/TP B763/SK SKC/TB NEG/RM ZME62',
+      icgInt2: 'NEGclr',
+      icgType2: '',
+      icgBas2: 330,
+      icgTop2: 600,
+    });
+    expect(report.icing).toEqual([]);
+  });
+
+  it('drops a fabricated second layer whose base is 0, bounds and all', async () => {
+    const report = await normalize({
+      rawOb: 'PBI UA /OV DJT320012/TM 2100/FLDURD/TP C441/WX FV10SM',
+      icgInt2: 'NEGclr',
+      icgBas2: 0,
+      icgTop2: 600,
+    });
+    expect(report.icing).toEqual([]);
+  });
+
+  it('drops the fabricated second layer while keeping the genuine first one', async () => {
+    // The raw text mentions icing exactly once, so the /IC group accounts for
+    // icgInt1 alone; the concatenated icgInt2 is a layer AWC added, with bounds
+    // borrowed from the report itself. A report-level gate would keep both, and
+    // stripping the suffix would leave the invented layer indistinguishable
+    // from the real one.
+    const report = await normalize({
+      rawOb: 'MTJ UA /OV MTJ/TM 1930/FL120/TP GLF5/SK SKC/TB OCNL LGT-MOD BLO 160/IC NEG/RM DURD',
+      icgInt1: 'NEG',
+      icgType1: '',
+      icgBas1: null,
+      icgTop1: null,
+      icgInt2: 'NEGclr',
+      icgType2: '',
+      icgBas2: 240,
+      icgTop2: 600,
+    });
+    expect(report.icing).toEqual([{ base_ft: null, top_ft: null, intensity: 'NEG', type: null }]);
+  });
+
+  it('publishes no icing at all when the only layer is a concatenated one', async () => {
+    // The raw icing group is a stray temperature AWC could not decode, so
+    // icgInt1 is empty and the concatenated icgInt2 would be the whole array.
+    // Keeping it publishes a negative icing report the pilot never made.
+    const report = await normalize({
+      rawOb: 'TIX UA /OV INDIA/TM 2026/FL110/TP EPIC/WX CLR/TB SMOOTH/IC +8C',
+      icgInt1: '',
+      icgInt2: 'NEGclr',
+      icgType2: '',
+      icgBas2: null,
+      icgTop2: null,
+    });
+    expect(report.icing).toEqual([]);
+  });
+
+  it('keeps a genuine second layer, which arrives as a clean code', async () => {
+    const report = await normalize({
+      rawOb: 'PSM UA /OV PSM/TM 1905/FL200/TP E75L/TA M11/IC TRACE LGT MX 200',
+      icgInt1: 'TRC',
+      icgType1: '',
+      icgBas1: 200,
+      icgTop1: null,
+      icgInt2: 'LGT',
+      icgType2: 'MIXED',
+      icgBas2: 200,
+      icgTop2: null,
+    });
+    expect(report.icing).toEqual([
+      { base_ft: 20000, top_ft: null, intensity: 'TRC', type: null },
+      { base_ft: 20000, top_ft: null, intensity: 'LGT', type: 'MIXED' },
+    ]);
+  });
+
+  it('never publishes a concatenated intensity', async () => {
+    const report = await normalize({
+      rawOb: 'SDF UA /OV EWO180020/TM 1919/FL050/TP P32R/SK SKC/TB LGT CHOP/IC NEG',
+      icgInt1: 'NEG',
+      icgInt2: 'NEGclr',
+      icgBas2: 50,
+      icgTop2: 600,
+    });
+    expect(report.icing.map((i) => i.intensity)).not.toContain('NEGclr');
+    expect(report.icing.every((i) => !/[a-z]/.test(i.intensity))).toBe(true);
+  });
+
+  it('passes a clean single-part report through unchanged', async () => {
+    const report = await normalize({
+      rawOb: 'LAX UA /OV 3718N 12348W/TM 2201/FL260/TP B38M/IC LGT RIME 220-250',
+      icgInt1: 'LGT',
+      icgType1: 'RIME',
+      icgBas1: 220,
+      icgTop1: 250,
+    });
+    expect(report.icing).toEqual([
+      { base_ft: 22000, top_ft: 25000, intensity: 'LGT', type: 'RIME' },
+    ]);
+  });
+
+  it('preserves a two-part intensity range unsplit', async () => {
+    const report = await normalize({
+      rawOb: 'DEN UA /OV DEN/TM 1900/FL180/TP C560/IC LGT-MOD RIME 160-200',
+      icgInt1: 'LGT-MOD',
+      icgType1: 'RIME',
+      icgBas1: 160,
+      icgTop1: 200,
+    });
+    expect(report.icing[0]?.intensity).toBe('LGT-MOD');
+  });
+
+  it('keeps both layers of a genuine two-layer icing report', async () => {
+    const report = await normalize({
+      rawOb: 'ABQ UA /OV ABQ270055/TM 0731/FL230/TP PC12/IC MOD RIME/IC LGT MX',
+      icgInt1: 'MOD',
+      icgType1: 'RIME',
+      icgBas1: 200,
+      icgTop1: 230,
+      icgInt2: 'LGT',
+      icgType2: 'MIXED',
+      icgBas2: 230,
+      icgTop2: 260,
+    });
+    expect(report.icing).toEqual([
+      { base_ft: 20000, top_ft: 23000, intensity: 'MOD', type: 'RIME' },
+      { base_ft: 23000, top_ft: 26000, intensity: 'LGT', type: 'MIXED' },
+    ]);
+  });
+
+  it('keeps a genuine explicit negative report as a NEG layer', async () => {
+    const report = await normalize({
+      rawOb: 'DSM UA /OV DSM200020/TM 1044/FL150/TP A319/TB NEG/IC NEG/RM DURC',
+      icgInt1: 'NEG',
+      icgType1: '',
+      icgBas1: null,
+      icgTop1: null,
+    });
+    expect(report.icing).toEqual([{ base_ft: null, top_ft: null, intensity: 'NEG', type: null }]);
+  });
+
+  it('leaves turbulence untouched, including its compound intensities', async () => {
+    const report = await normalize({
+      rawOb: 'JFK UA /OV JFK/TM 1200/FL350/TP B772/TB MOD-SEV CAT 330-370',
+      tbInt1: 'MOD-SEV',
+      tbType1: 'CAT',
+      tbBas1: 330,
+      tbTop1: 370,
+      tbInt2: 'LGT-MOD',
+      tbBas2: 300,
+      tbTop2: 330,
+    });
+    expect(report.turbulence.map((t) => t.intensity)).toEqual(['MOD-SEV', 'LGT-MOD']);
+  });
+
+  it('keeps a turbulence base of 0 as a surface-based layer, not an unknown', async () => {
+    // Raw `030-SFC` — a chop layer from the surface up to 3,000 ft. Mirroring
+    // the cloud-layer zero-as-unknown rule here would fabricate an unknown out
+    // of a correctly reported ground-level bound.
+    const report = await normalize({
+      rawOb: 'AGC UUA /OV AGC/TM 2016/FL030/TP P28A/TB LGT CHOP 030-SFC',
+      tbInt1: 'LGT',
+      tbType1: 'CHOP',
+      tbBas1: 0,
+      tbTop1: 30,
+    });
+    expect(report.turbulence[0]).toMatchObject({ base_ft: 0, top_ft: 3000 });
+  });
 });
 
 describe('AviationWeatherService PIREP cloud layers', () => {
@@ -1147,6 +1389,68 @@ describe('AviationWeatherService request construction', () => {
     const url = lastRequestUrl();
     expect(url).toContain('bbox=25,-125,49,-66');
     expect(url).not.toContain('distance=');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PIREP upstream narrowing (issue #32) — `level` and `inten` run before the
+// 400-row cap, where the client-side altitude filter runs after it
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService PIREP upstream narrowing', () => {
+  const bbox = { minLat: 25, minLon: -125, maxLat: 49, maxLon: -66 };
+
+  beforeEach(() => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawPirep]));
+  });
+
+  it('sends level in a station-centered search', async () => {
+    await svc.fetchPireps(
+      { stationId: 'KDEN', distanceNm: 200, hours: 12, level: 190 },
+      createMockContext(),
+    );
+    expect(lastRequestUrl()).toMatch(queryParam('level', 190));
+  });
+
+  it('sends level in a bbox search', async () => {
+    await svc.fetchPireps({ bbox, hours: 12, level: 100 }, createMockContext());
+    expect(lastRequestUrl()).toMatch(queryParam('level', 100));
+  });
+
+  it('sends inten in a station-centered search', async () => {
+    await svc.fetchPireps(
+      { stationId: 'KDEN', distanceNm: 200, hours: 12, minIntensity: 'mod' },
+      createMockContext(),
+    );
+    expect(lastRequestUrl()).toMatch(queryParam('inten', 'mod'));
+  });
+
+  it('sends inten in a bbox search', async () => {
+    await svc.fetchPireps({ bbox, hours: 12, minIntensity: 'sev' }, createMockContext());
+    expect(lastRequestUrl()).toMatch(queryParam('inten', 'sev'));
+  });
+
+  it('sends both together', async () => {
+    await svc.fetchPireps(
+      { bbox, hours: 12, level: 190, minIntensity: 'mod' },
+      createMockContext(),
+    );
+    const url = lastRequestUrl();
+    expect(url).toMatch(queryParam('level', 190));
+    expect(url).toMatch(queryParam('inten', 'mod'));
+  });
+
+  it('sends neither when neither was asked for', async () => {
+    await svc.fetchPireps({ bbox, hours: 12 }, createMockContext());
+    const url = lastRequestUrl();
+    expect(url).not.toContain('level=');
+    expect(url).not.toContain('inten=');
+  });
+
+  it('sends a level of 0 rather than dropping it as falsy', async () => {
+    // FL000 is a real centre — a band of 0–3,000 ft rounds to it.
+    await svc.fetchPireps({ bbox, hours: 12, level: 0 }, createMockContext());
+    expect(lastRequestUrl()).toMatch(queryParam('level', 0));
   });
 });
 
