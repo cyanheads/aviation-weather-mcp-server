@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.2](changelog/0.4.x/0.4.2.md) — 2026-09-09
+
+aviation_get_pireps: a malformed flight-level group no longer reports altitude 0, a synthesized icing layer is dropped instead of published, and altitude/intensity filters are pushed upstream of the 400-row cap via a new min_intensity input.
+
 ## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-08-25
 
 Adopts @cyanheads/mcp-ts-core 0.12.3 and MCP SDK v2: an argument key no tool schema declares is now rejected by name instead of silently dropped, and .env.example pins MCP_SESSION_MODE=stateless to match the Docker image.

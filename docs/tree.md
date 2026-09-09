@@ -1,6 +1,6 @@
 # aviation-weather-mcp-server - Directory Structure
 
-Generated on: 2026-08-25 09:26:16
+Generated on: 2026-09-09 22:01:47
 
 ```text
 aviation-weather-mcp-server/
@@ -116,6 +116,8 @@ aviation-weather-mcp-server/
 │   │   │   └── server-json.md
 │   │   └── SKILL.md
 │   ├── release-and-publish/
+│   │   └── SKILL.md
+│   ├── release-pr-review/
 │   │   └── SKILL.md
 │   ├── report-issue-framework/
 │   │   └── SKILL.md

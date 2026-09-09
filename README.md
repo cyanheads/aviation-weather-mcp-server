@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -83,9 +83,10 @@ Search for recent Pilot Reports by station+radius or bounding box.
 
 - `station_id` + `distance_nm` (10–500 nm, 100 when omitted) for radial search around an airport
 - `bbox` for geographic area search — useful for en-route corridor checks; `distance_nm` has no meaning here and is rejected alongside it
-- `altitude_min_ft` / `altitude_max_ft` filters to isolate reports at cruise altitude, either bound alone or both (min must not exceed max)
-- Turbulence and icing arrays include up to two layers per report (as reported by the API)
-- Every result states whether the upstream 400-row cap cut it, naming `bbox`, `distance_nm`, and `hours` as the levers that narrow a query before the cap applies — the altitude filter runs after it and cannot recover a dropped report
+- `altitude_min_ft` / `altitude_max_ft` filters to isolate reports at cruise altitude, either bound alone or both (min must not exceed max). Both bounds together, spanning 6,000 ft or less, fit the API's own search width and are sent to it, so the band narrows the search rather than only trimming the result; a single bound or a wider span trims the result alone
+- `min_intensity` (`lgt` / `mod` / `sev`) restricts the search to reports carrying a turbulence or icing layer at that intensity or above — it selects reports, not layers, so a matching report still carries its lighter layers
+- Turbulence and icing arrays include up to two layers per report. Icing layers the API synthesized for a report that never mentioned ice are dropped, so an icing layer always reflects something the pilot reported
+- Every result states whether the upstream 400-row cap cut it, naming the levers that narrow a query before the cap applies — and only the ones the query has not already used
 - Note: absence of PIREPs does not mean smooth conditions — they are sparse by nature
 
 ---
