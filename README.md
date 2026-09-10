@@ -33,7 +33,7 @@ Five tools covering aviation weather — station lookup, current observations, t
 
 | Tool | Description |
 |:-----|:------------|
-| `aviation_find_stations` | Resolve airports and weather stations by ICAO ID, bounding box, or US state. Returns ICAO/IATA/FAA IDs, coordinates, elevation, and available data types. |
+| `aviation_find_stations` | Resolve airports and weather stations by identifier, bounding box, or US state. Returns ICAO/IATA/FAA IDs, coordinates, elevation, and available data types. |
 | `aviation_get_metar` | Get current weather observations (METARs) for one or more airports. Returns decoded wind, visibility, ceiling, present weather, temp/dewpoint, altimeter, cloud layers, flight category (VFR/MVFR/IFR/LIFR), and the raw METAR string. |
 | `aviation_get_taf` | Get Terminal Aerodrome Forecasts for one or more airports. Returns each forecast period with valid times, surface wind, low-level wind shear, visibility, decoded weather, cloud layers, and vertical visibility into a forecast obscuration, plus the raw TAF string. |
 | `aviation_get_pireps` | Get recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, and the raw PIREP string. |
