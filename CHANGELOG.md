@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.6](changelog/0.4.x/0.4.6.md) — 2026-09-09
+
+aviation_preflight_brief accepts optional departure time, cruise altitude, and route waypoints to narrow its TAF, PIREP, and advisories steps; station calls now chunk to each tool's limit, and its ICAO identifier arguments are validated against the same 4-letter pattern the weather tools enforce.
+
 ## [0.4.5](changelog/0.4.x/0.4.5.md) — 2026-09-09
 
 aviation_get_pireps and aviation_find_stations gain a response-size limit, and aviation_find_stations trims and correctly describes its station identifiers.
