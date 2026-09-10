@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -99,10 +99,11 @@ Search for recent Pilot Reports by station+radius or bounding box.
 List currently active domestic SIGMETs.
 
 - `advisory_type` filter: `sigmet` or `all` (default) — both return the active SIGMET set
-- `hazard` filter: `CONVECTIVE`, `TURBULENCE`, `ICING`, `IFR`
-- `bbox` filter applied client-side (AWC API returns all active advisories; the tool filters by polygon overlap)
+- `hazard` filter: `CONVECTIVE`, `TURBULENCE`, `ICING`, `IFR` — sent to the AWC endpoint's own `hazard` parameter, so the matching is done by AWC against however it spells the class
+- `bbox` filter applied client-side (the AWC endpoint defines no bbox parameter; the tool filters by polygon overlap)
 - AIRMETs are not served. The upstream feed carries domestic SIGMETs only, so `advisory_type: airmet` and the `MTN OBSCN`, `SURFACE WIND`, and `LLWS` hazards are rejected with guidance rather than answered with SIGMETs or an empty array
 - During fair-weather periods, no SIGMETs may be active — an empty result is a valid state, not an error
+- An empty result names what emptied it: nothing active anywhere, no advisory carrying the requested hazard, or none intersecting the requested `bbox` — so a filter that needs broadening is not mistaken for quiet weather
 
 ---
 

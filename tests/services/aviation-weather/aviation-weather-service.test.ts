@@ -22,6 +22,7 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async (importActual) => {
 import { fetchWithTimeout } from '@cyanheads/mcp-ts-core/utils';
 import { AviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 import type {
+  RawAirSigmet,
   RawMetar,
   RawPirep,
   RawStationInfo,
@@ -182,6 +183,46 @@ const rawPirep: RawPirep = {
   receiptTime: '2026-01-15T18:30:00Z',
   visib: null,
   wxString: null,
+};
+
+/**
+ * A convective domestic SIGMET over the upper Midwest. Shaped after a live
+ * `/airsigmet` row: `CONVECTIVE` is the only `hazard` value any draw taken
+ * against this endpoint has carried.
+ */
+const rawAirSigmetBOSW0: RawAirSigmet = {
+  airSigmetType: 'SIGMET',
+  altitudeHi1: 25000,
+  altitudeLow1: 5000,
+  coords: [
+    { lat: 42.0, lon: -90.0 },
+    { lat: 44.0, lon: -90.0 },
+    { lat: 44.0, lon: -87.0 },
+    { lat: 42.0, lon: -87.0 },
+  ],
+  hazard: 'CONVECTIVE',
+  icaoId: 'KKCI',
+  movementDir: 270,
+  movementSpd: 20,
+  rawAirSigmet: 'KKCI SIGW 151800 CONVECTIVE SIGMET BOSW0',
+  seriesId: 'BOSW0',
+  severity: 3,
+  validTimeFrom: 1768500000,
+  validTimeTo: 1768514400,
+};
+
+/** A second advisory, over northern California — the bbox tests need two. */
+const rawAirSigmetSFOT0: RawAirSigmet = {
+  ...rawAirSigmetBOSW0,
+  coords: [
+    { lat: 37.0, lon: -122.0 },
+    { lat: 38.0, lon: -122.0 },
+    { lat: 38.0, lon: -120.0 },
+  ],
+  hazard: 'IFR',
+  rawAirSigmet: 'KKCI SIGT0 IFR CONDS',
+  seriesId: 'SFOT0',
+  severity: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -1546,6 +1587,198 @@ describe('AviationWeatherService advisory request construction', () => {
     expect(url).toContain('/airsigmet?format=json');
     expect(url).not.toContain('type=');
     expect(url).not.toContain('types=');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Advisory hazard narrowing (issue #30) — the hazard goes to `/airsigmet`'s own
+// `hazard` parameter, so AWC matches its own record vocabulary and no
+// client-side string comparison is left to collide with it
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService advisory hazard narrowing', () => {
+  it.each([
+    ['CONVECTIVE', 'conv'],
+    ['TURBULENCE', 'turb'],
+    ['ICING', 'ice'],
+    ['IFR', 'ifr'],
+  ] as const)('sends %s upstream as hazard=%s', async (hazard, upstream) => {
+    // The tool's enum spelling is not a value `/airsigmet` accepts: a live
+    // probe answers HTTP 400 `Invalid value for hazard` for `CONVECTIVE` and
+    // `TURBULENCE`, and HTTP 204 for `conv`/`turb`/`ice`/`ifr`. The mapping is
+    // what keeps every value the tool can send one the endpoint's own enum
+    // takes.
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([]));
+    await svc.fetchAdvisories({ advisoryType: 'all', hazard }, createMockContext());
+
+    expect(lastRequestUrl()).toMatch(queryParam('hazard', upstream));
+  });
+
+  it('sends no hazard key when no hazard was requested', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([]));
+    await svc.fetchAdvisories({ advisoryType: 'all' }, createMockContext());
+
+    expect(lastRequestUrl()).not.toContain('hazard=');
+  });
+
+  it('returns a hazard-scoped draw whose record spelling differs from the request', async () => {
+    // The failure this replaces: the filter required the record value to
+    // *contain* the requested one, so a shorter upstream token emptied the
+    // result. AWC's own schema declares `AirSigmetJSON.hazard` a bare string
+    // with no enum, and its sibling products spell the same class both ways
+    // (`ISigmetJSON` examples `TURB`, `GairmetJSON` examples `IFR`), so no
+    // spelling can be assumed. AWC now does the matching.
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([{ ...rawAirSigmetBOSW0, hazard: 'TURB' }]),
+    );
+    const advisories = await svc.fetchAdvisories(
+      { advisoryType: 'all', hazard: 'TURBULENCE' },
+      createMockContext(),
+    );
+
+    expect(advisories).toHaveLength(1);
+    expect(advisories[0]!.hazard).toBe('TURB');
+  });
+
+  it('keeps a matching record spelling working unchanged', async () => {
+    // CONVECTIVE is the only value with live data to regress against — 16 of 16
+    // rows in every draw taken during this work carried it.
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawAirSigmetBOSW0]));
+    const advisories = await svc.fetchAdvisories(
+      { advisoryType: 'all', hazard: 'CONVECTIVE' },
+      createMockContext(),
+    );
+
+    expect(advisories.map((a) => a.hazard)).toEqual(['CONVECTIVE']);
+  });
+
+  it('returns the draw untouched when no hazard was requested', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([rawAirSigmetBOSW0, { ...rawAirSigmetBOSW0, hazard: 'IFR', seriesId: 'SFOT0' }]),
+    );
+    const advisories = await svc.fetchAdvisories({ advisoryType: 'all' }, createMockContext());
+
+    expect(advisories.map((a) => a.hazard)).toEqual(['CONVECTIVE', 'IFR']);
+  });
+
+  it('keeps an empty upstream result an empty array, not an error', async () => {
+    // HTTP 204 is the endpoint's empty-result signal for a hazard with nothing
+    // active, and fair weather is a valid state.
+    vi.mocked(fetchWithTimeout).mockResolvedValue({
+      status: 204,
+      text: async () => '',
+    } as unknown as Response);
+    const advisories = await svc.fetchAdvisories(
+      { advisoryType: 'all', hazard: 'ICING' },
+      createMockContext(),
+    );
+
+    expect(advisories).toEqual([]);
+  });
+
+  it('leaves the bbox filter client-side and out of the query string', async () => {
+    // `/airsigmet` defines no bbox parameter — decision 6 — so the overlap test
+    // stays in here whatever happens to the hazard axis.
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([rawAirSigmetBOSW0, rawAirSigmetSFOT0]),
+    );
+    const advisories = await svc.fetchAdvisories(
+      { advisoryType: 'all', bbox: { minLat: 36, minLon: -123, maxLat: 39, maxLon: -119 } },
+      createMockContext(),
+    );
+
+    expect(lastRequestUrl()).not.toContain('bbox=');
+    expect(advisories.map((a) => a.series_id)).toEqual(['SFOT0']);
+  });
+
+  it('composes an upstream hazard with a client-side bbox', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([rawAirSigmetBOSW0, rawAirSigmetSFOT0]),
+    );
+    const advisories = await svc.fetchAdvisories(
+      {
+        advisoryType: 'all',
+        hazard: 'IFR',
+        bbox: { minLat: 36, minLon: -123, maxLat: 39, maxLon: -119 },
+      },
+      createMockContext(),
+    );
+
+    const url = lastRequestUrl();
+    expect(url).toMatch(queryParam('hazard', 'ifr'));
+    expect(url).not.toContain('bbox=');
+    expect(advisories.map((a) => a.series_id)).toEqual(['SFOT0']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Advisory pre-filter row count (issue #33) — the hazard narrows the draw
+// upstream, so what reaches the bbox filter is already the drawn set; the
+// caller cannot recover that size from a bbox-emptied result
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService advisory pre-filter row count', () => {
+  it('reports the drawn row count ahead of the bbox filter', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([rawAirSigmetBOSW0, rawAirSigmetSFOT0]),
+    );
+    const onPreFilterRows = vi.fn();
+    const advisories = await svc.fetchAdvisories(
+      {
+        advisoryType: 'all',
+        bbox: { minLat: 36, minLon: -123, maxLat: 39, maxLon: -119 },
+        onPreFilterRows,
+      },
+      createMockContext(),
+    );
+
+    expect(onPreFilterRows).toHaveBeenCalledWith(2);
+    expect(advisories).toHaveLength(1);
+  });
+
+  it('reports the drawn count when the bbox empties a non-empty draw', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawAirSigmetBOSW0]));
+    const onPreFilterRows = vi.fn();
+    const advisories = await svc.fetchAdvisories(
+      {
+        advisoryType: 'all',
+        bbox: { minLat: 36, minLon: -123, maxLat: 39, maxLon: -119 },
+        onPreFilterRows,
+      },
+      createMockContext(),
+    );
+
+    expect(onPreFilterRows).toHaveBeenCalledWith(1);
+    expect(advisories).toHaveLength(0);
+  });
+
+  it('reports the drawn count with no bbox to filter it', async () => {
+    // Unlike `fetchStations`, whose three modes differ in whether a client-side
+    // filter runs at all, this is one draw and one optional filter — reporting
+    // the draw either way keeps the caller's attribution a single branch.
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawAirSigmetBOSW0]));
+    const onPreFilterRows = vi.fn();
+    await svc.fetchAdvisories({ advisoryType: 'all', onPreFilterRows }, createMockContext());
+
+    expect(onPreFilterRows).toHaveBeenCalledWith(1);
+  });
+
+  it('reports a drawn count of zero for an empty hazard-scoped draw', async () => {
+    // AWC applied the hazard filter, so nothing was drawn to filter further —
+    // the bbox never got a chance to be the cause.
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([]));
+    const onPreFilterRows = vi.fn();
+    await svc.fetchAdvisories(
+      {
+        advisoryType: 'all',
+        hazard: 'TURBULENCE',
+        bbox: { minLat: 36, minLon: -123, maxLat: 39, maxLon: -119 },
+        onPreFilterRows,
+      },
+      createMockContext(),
+    );
+
+    expect(onPreFilterRows).toHaveBeenCalledWith(0);
   });
 });
 

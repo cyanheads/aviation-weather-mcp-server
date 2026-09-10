@@ -6,7 +6,11 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
-import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
+import {
+  getAviationWeatherService,
+  isSigmetHazard,
+  type SigmetHazard,
+} from '@/services/aviation-weather/aviation-weather-service.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
 
 const BboxSchema = z
@@ -34,12 +38,39 @@ const PolygonPointSchema = z
   .describe('A polygon vertex as a lat/lon coordinate pair.');
 
 /**
- * Hazard values naming AIRMET-family phenomena. `/airsigmet` enumerates exactly
- * four hazard classes — conv, turb, ice, ifr — so no row it serves can carry
- * any of these, and filtering on one returned an empty array that read as "this
- * hazard is not active" rather than "this tool cannot answer that".
+ * Why an empty result is empty, named from the stage that produced it.
+ *
+ * Two counts settle it. `drawn` is what AWC served — already narrowed by the
+ * hazard, which AWC applies — and the returned length is what survived the
+ * bbox overlap test. A draw of zero was emptied before the bbox ran, so the box is
+ * never blamed for one; a non-empty draw that returns nothing was emptied by
+ * the box alone. Reading the drawn count rather than the returned one is the
+ * same rule cap detection follows (decision 18).
+ *
+ * The hazard branch stops short of claiming other advisories are active. AWC
+ * answers the same HTTP 204 for a hazard class with nothing active and for a
+ * feed with nothing active at all, so once the hazard is applied upstream the
+ * counts in hand cannot separate them — naming the filter the caller applied is
+ * what the draw supports, and dropping it is the recovery either way.
  */
-const AIRMET_ONLY_HAZARDS = new Set(['MTN OBSCN', 'SURFACE WIND', 'LLWS']);
+function emptyDrawNotice(
+  drawn: number,
+  hazard: SigmetHazard | undefined,
+  hasBbox: boolean,
+): string {
+  if (drawn > 0) {
+    const scope = hazard ? ` carrying the ${hazard} hazard` : '';
+    return `AWC drew ${drawn} active advisory(ies)${scope}, but no polygon intersects the requested bbox. They are active elsewhere, not absent — widen the bbox, or drop it to see all ${drawn}.`;
+  }
+  if (hazard) {
+    const bboxNote = hasBbox ? ' The bbox never applied: the draw was already empty.' : '';
+    return `No active domestic SIGMET carries the ${hazard} hazard. AWC applied that filter to the feed, so this result says nothing about the other hazard classes.${bboxNote} Drop the hazard filter to see the whole active set.`;
+  }
+  const bboxNote = hasBbox
+    ? ' The bbox is not the cause — the unfiltered feed itself is empty.'
+    : '';
+  return `No domestic SIGMETs are active anywhere right now. This is the normal fair-weather result rather than a filtering artifact.${bboxNote}`;
+}
 
 export const aviationGetAdvisories = tool('aviation_get_advisories', {
   title: 'Get Active Aviation Advisories (SIGMETs)',
@@ -57,7 +88,7 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       .enum(['CONVECTIVE', 'TURBULENCE', 'ICING', 'IFR', 'MTN OBSCN', 'SURFACE WIND', 'LLWS'])
       .optional()
       .describe(
-        'Optional hazard filter. CONVECTIVE, TURBULENCE, ICING, and IFR match the four hazard classes the domestic SIGMET feed carries. MTN OBSCN, SURFACE WIND, and LLWS are AIRMET-family phenomena with no upstream counterpart here and are rejected rather than returning an empty result.',
+        'Optional hazard filter, applied upstream by AWC. CONVECTIVE, TURBULENCE, ICING, and IFR are the four hazard classes the domestic SIGMET feed carries, and an empty result under one of them means no advisory of that class is active — it says nothing about the others. MTN OBSCN, SURFACE WIND, and LLWS are AIRMET-family phenomena with no upstream counterpart here and are rejected rather than returning an empty result.',
       ),
     bbox: BboxSchema.optional(),
   }),
@@ -122,6 +153,15 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
         'Active advisories matching the filter criteria. May be empty during fair weather periods.',
       ),
   }),
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Present only when the result is empty, naming the stage that emptied it: no domestic SIGMETs are active at all, none carry the requested hazard, or none intersect the requested bbox — and which filter to broaden. A hazard-scoped empty draw states only that no advisory carries that hazard; AWC applies the hazard filter, so the response cannot say whether other classes are active.',
+      ),
+  },
+
   errors: [
     {
       reason: 'invalid_bbox',
@@ -157,7 +197,12 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       );
     }
 
-    if (input.hazard && AIRMET_ONLY_HAZARDS.has(input.hazard)) {
+    // `/airsigmet` enumerates exactly four hazard classes, so no row it serves
+    // can carry any of the rest — filtering on one returned an empty array that
+    // read as "this hazard is not active" rather than "this tool cannot answer
+    // that". Narrowing here is also what lets a `SigmetHazard` reach the
+    // service, so every value it can send upstream is one AWC's enum accepts.
+    if (input.hazard && !isSigmetHazard(input.hazard)) {
       throw ctx.fail(
         'airmet_not_served',
         `Hazard "${input.hazard}" is not served: it is an AIRMET-family phenomenon, and the upstream feed behind this tool carries domestic SIGMETs only.`,
@@ -172,16 +217,30 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
     });
 
     const svc = getAviationWeatherService();
+    // The bbox filter runs inside the service, so the size of the draw it cut
+    // reaches here only through this channel.
+    let drawnRows: number | undefined;
     const advisories = await svc.fetchAdvisories(
       {
         advisoryType: input.advisory_type,
         ...(input.hazard ? { hazard: input.hazard } : {}),
         ...(input.bbox ? { bbox: input.bbox } : {}),
+        onPreFilterRows: (rows) => {
+          drawnRows = rows;
+        },
       },
       ctx,
     );
 
-    ctx.log.info('Advisories retrieved', { count: advisories.length });
+    // The count arrives only when AWC served a readable array, so an undefined
+    // one is no draw at all rather than a draw of zero. With nothing observed
+    // there is no stage to name, and defaulting it to zero would assert a
+    // fair-weather sky the tool never saw.
+    if (advisories.length === 0 && drawnRows !== undefined) {
+      ctx.enrich.notice(emptyDrawNotice(drawnRows, input.hazard, input.bbox != null));
+    }
+
+    ctx.log.info('Advisories retrieved', { count: advisories.length, drawnRows });
     return { advisories };
   },
 

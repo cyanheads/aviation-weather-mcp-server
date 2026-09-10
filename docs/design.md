@@ -89,7 +89,7 @@ Each step is independently testable.
 | METAR | get current/recent by ICAO IDs | `GET /metar?ids=&format=json&hours=` |
 | TAF | get current by ICAO IDs | `GET /taf?ids=&format=json` |
 | PIREP | list recent by station + distance, or by bbox; narrowed upstream by altitude band and minimum intensity | `GET /pirep?id=&format=json&distance=&age=&level=&inten=` |
-| AIRSIGMET | list active, filtered client-side by hazard and/or bbox | `GET /airsigmet?format=json` |
+| AIRSIGMET | list active, narrowed upstream by hazard and client-side by bbox | `GET /airsigmet?format=json&hazard=` |
 
 ---
 
@@ -293,7 +293,7 @@ polygon: { lat: number, lon: number }[]   // coords array
 raw_text: string             // rawAirSigmet
 ```
 
-**Design note on bbox filtering:** The API does not natively filter by bbox — it returns all active advisories. The service fetches all and the handler filters by polygon/bbox overlap (point-in-polygon or bounding-box intersection). For now a simple bbox intersection check is sufficient.
+**Design note on filtering:** The two filters sit on opposite sides of the request. `hazard` maps to `/airsigmet`'s own `hazard` parameter (`CONVECTIVE` → `conv`, `TURBULENCE` → `turb`, `ICING` → `ice`, `IFR` → `ifr`), so AWC does the matching against its own record vocabulary — see decision 23. `bbox` has no upstream counterpart and stays a client-side bounding-box intersection against each advisory's `coords` polygon — see decision 6.
 
 **Error contract:**
 ```
@@ -301,7 +301,16 @@ raw_text: string             // rawAirSigmet
 { reason: 'airmet_not_served', code: ValidationError, when: 'advisory_type "airmet", or a hazard naming an AIRMET-family phenomenon (MTN OBSCN, SURFACE WIND, LLWS)', recovery: 'Use advisory_type "sigmet"/"all" and the CONVECTIVE, TURBULENCE, ICING, or IFR hazards; AIRMET information lives on the G-AIRMET and textual AIRMET products this tool does not read.' }
 ```
 
-An empty result is not an error — fair weather is a valid state, so no `no_advisories` reason exists. `invalid_bbox` is checked ahead of `airmet_not_served`, so a malformed box is reported before the unsupported product. The rejection is raised in the handler rather than by narrowing the Zod enum, so the caller receives the typed reason and recovery instead of a transport-level `-32602`; `advisory_type` keeps all three enum members for that reason, and so the parameter remains the discriminator when AIRMET-family sources are added (#29).
+An empty result is not an error — fair weather is a valid state, so no `no_advisories` reason exists; the empty path carries an enrichment notice instead (decision 23). `invalid_bbox` is checked ahead of `airmet_not_served`, so a malformed box is reported before the unsupported product. The rejection is raised in the handler rather than by narrowing the Zod enum, so the caller receives the typed reason and recovery instead of a transport-level `-32602`; `advisory_type` keeps all three enum members for that reason, and so the parameter remains the discriminator when AIRMET-family sources are added (#29).
+
+The `airmet_not_served` guard also does the type narrowing. `isSigmetHazard` is a type predicate over the four hazards that map to an upstream token, so only a `SigmetHazard` reaches `fetchAdvisories` — which is what makes the rejection a compile-time requirement rather than a convention, and leaves no reachable path on which AWC could answer `400 Invalid value for hazard`. `advisoryType`'s `'sigmet' | 'all'` union does the same job for the product axis.
+
+**Enrichment contract** (see decision 23):
+```
+notice: string               // only on an empty result — the stage that emptied it, and the filter to broaden
+```
+
+No `truncated`/`cap` pair joins it. Only two of the five tools can reach the 400-row cap and this is not one of them; were the pair added, detection would read the drawn row count the way decision 18 requires — the count this notice already reports.
 
 ### `aviation_find_stations`
 
@@ -382,8 +391,10 @@ Validation lives in the handler rather than a schema `z.enum()`: an enum mismatc
 **5. PIREPs use `icaoId: "KWBC"` for the center — not the station queried.**
 All PIREP responses have `icaoId` set to `KWBC` (the collection center), not the station the search was centered on. The actual location is in `lat`/`lon`. This is a quirk of the API and should be documented in the service layer.
 
-**6. Advisories bbox filtering is client-side.**
-The AIRSIGMET endpoint doesn't support bbox filtering in the API itself. The service fetches all active advisories and filters by bounding-box overlap against `coords` polygons. This is acceptable because the set of active advisories is typically small (<50).
+**6. Advisories bbox filtering is client-side, and it is the only filter that stays here.**
+The AIRSIGMET endpoint doesn't support bbox filtering in the API itself — its parameter list is `format`, the deprecated `types`, `hazard`, and `level`, with no bbox among them. The service fetches the active advisories and filters by bounding-box overlap against `coords` polygons. This is acceptable because the active advisory set is small: 16 rows in every draw taken during decision 23's verification, across twelve draws over eight minutes.
+
+The hazard axis is not in the same position — `/airsigmet` does define a `hazard` parameter, so that filter is applied upstream (decision 23). The two are not a matched pair to keep symmetric: one has an upstream parameter and one does not, so the split follows what AWC actually defines.
 
 **7. Prompt included despite read-only server.**
 The `aviation_preflight_brief` prompt earns its place: a preflight briefing has a well-established structure (METAR → TAF → PIREPs → advisories) that agents frequently get wrong by omitting steps. The prompt encodes the correct sequence and synthesis pattern.
@@ -511,6 +522,19 @@ Decision 17 kept the weather tools' `missing` flat and their notice cause-free: 
 
 *The whole-batch miss stays an error.* When nothing resolves, AWC answers HTTP 204, the service maps it to an empty array, and `station_not_found` fires with its recovery hint before any reconciliation runs — as do `missing_search_criteria`, `conflicting_location`, `invalid_bbox`, and `invalid_state`, in their existing order.
 
+**23. The advisory hazard is matched by AWC, and an empty result names the stage that emptied it.**
+Two changes on one premise: the tool should not have to know how AWC spells a hazard, and a caller should not have to guess why nothing came back.
+
+*The hazard filter moved upstream, which removes the comparison rather than tightening it.* The client-side test required the record's value to **contain** the caller's — `a.hazard.toUpperCase().includes(requested)` — so a shorter upstream token could not match a longer request, and `'TURB'.includes('TURBULENCE')` is `false`. On a hazard surface the resulting empty array reads as "this hazard is not active" rather than as a filter that could not match. The vocabulary that would settle it is not observable and not documented: `AirSigmetJSON.hazard` is a bare `type: string` with `CONVECTIVE` as its only example and no enum, and AWC does not use one convention across its own products — `ISigmetJSON` examples `hazard` as `TURB` while `GairmetJSON` examples it as `IFR`, so no sibling schema licenses an inference. Sampling cannot close it either: across twelve unfiltered draws over eight minutes, all 16 rows in every draw carried `CONVECTIVE` — 192 rows, 16 distinct `seriesId`s, no rotation — while `hazard=turb`, `=ice`, and `=ifr` answered HTTP 204 on all twelve.
+
+`/airsigmet`'s own `hazard` parameter is what sidesteps it. Its schema enumerates `conv | turb | ice | ifr`, and the live endpoint honors them: `hazard=conv` returns exactly the rows the unfiltered draw returns (byte-identical, all twelve draws, since all 16 were convective), the other three return 204, and an unrecognized value returns `400 {"status":"error","error":"Invalid value for hazard"}`. AWC owns the mapping from its filter value to whatever spelling it stores, so the record vocabulary stops being load-bearing for correctness — it is now a documentation gap rather than a defect waiting on weather. **The mapping is a correctness requirement, and skipping it fails in two different directions.** Passing the tool's own enum through verbatim would be rejected for half its values and honored for the other half: `hazard=CONVECTIVE` and `hazard=TURBULENCE` answer 400, while `ICING` and `IFR` answer 204, matched case-insensitively against the documented `ifr` and the undocumented `icing`. So a wrong token in the first two rows is loud — a 400 the framework classifies `InvalidParams` from its status ladder — and a wrong token in the latter two is silent, reading as fair weather for as long as the typo lives. That asymmetry is the argument for the URL assertions in the service test: they are the only gate on the `ICING` and `IFR` rows, since the endpoint will not reject a mistake in either. The four values are mapped, and `isSigmetHazard` narrows the type so nothing else can reach the request. (The live endpoint also accepts three undocumented values — `icing`, `ts`, and `all` — all 204 or unfiltered. They are not used: the documented enum is the surface AWC commits to.)
+
+*The bbox does not follow, and the split is not an inconsistency.* `/airsigmet` defines no bbox parameter (decision 6). Pushing the axis that has an upstream parameter and keeping the one that does not is the whole rule.
+
+*The empty draw is disclosed by stage, decision 22's rule rather than decision 17's.* Decision 17 keeps the weather tools' missing state flat because AWC omits a batch row identically for three causes and separating them would cost a second request and still fail. Decision 22 names a cause on `aviation_find_stations` because exactly one remains and it is assertable. This tool sits between them: an empty result has more than one nameable state, and the two counts that separate them are already in hand — the drawn row count, reported through `onPreFilterRows` the way `fetchStations` reports its own, and the length after the bbox overlap test. A draw of zero was emptied before the bbox ran, so the box is never blamed for one; a non-empty draw returning nothing was emptied by the box alone, and the notice states the drawn count, which is the same count decision 18 reads for cap detection and never the returned one. The count is reported only once a readable array is in hand, so its absence is not a draw of zero — it is no draw at all, the shape a malformed upstream body produces. Nothing is asserted there: an unobserved sky has no stage to name, and defaulting the missing count to zero would have manufactured the fair-weather claim out of silence.
+
+*One boundary the upstream move created, and the notice stays inside it.* AWC answers the same HTTP 204 for a hazard class with nothing active and for a feed with nothing active at all. Once the hazard is applied upstream, one draw cannot tell those apart. The shape #33 was written against — the hazard narrowing a full draw client-side, with the pre-hazard count free — no longer exists. So the hazard branch asserts only what it can: no active domestic SIGMET carries the requested class, and this result says nothing about the others. It does not claim advisories are active elsewhere. Resolving that would take a second, unfiltered draw on every hazard-scoped empty result, against AWC's published guidance of no more than one request per minute per thread, to sharpen a message whose recovery ("drop the hazard filter") is identical either way. The bbox branch has no such limit and does state its count, since the draw it describes was actually served.
+
 ---
 
 ## Known Limitations
@@ -520,7 +544,8 @@ Decision 17 kept the weather tools' `missing` flat and their notice cause-free: 
 - **No historical archive:** The API serves recent observations only (`hours` parameter up to 12 for METAR). No multi-day historical queries.
 - **400-row result cap:** Every endpoint returns at most 400 entries and offers no pagination surface. `aviation_find_stations` (bbox and state modes) and `aviation_get_pireps` can reach it; both disclose a capped result and name the levers that narrow the query before the cap applies. `aviation_get_pireps` also pushes `min_intensity` and, where the requested band fits the upstream ±3,000 ft width, the altitude bounds — so those queries reach the cap less often to begin with (decision 19). The other three tools' input limits keep them well below it. See decision 18.
 - **Not an official briefing:** This data does not constitute a regulatory-compliant preflight weather briefing. Pilots flying IFR or in controlled airspace must use an authorized source.
-- **AIRSIGMET scope:** The endpoint serves domestic SIGMETs only and cannot return an AIRMET, so `aviation_get_advisories` rejects an AIRMET request rather than answering it (see decision 2); G-AIRMET and textual AIRMET support is tracked in #29. During fair-weather periods no SIGMETs may be active — absence of results is a valid state, not an error.
+- **AIRSIGMET scope:** The endpoint serves domestic SIGMETs only and cannot return an AIRMET, so `aviation_get_advisories` rejects an AIRMET request rather than answering it (see decision 2); G-AIRMET and textual AIRMET support is tracked in #29. During fair-weather periods no SIGMETs may be active — absence of results is a valid state, not an error, and the notice on an empty result names what emptied it (decision 23).
+- **The record's hazard vocabulary for a non-convective domestic SIGMET is unobserved:** `hazard=turb`, `=ice`, and `=ifr` have answered HTTP 204 on every check, so no such row has been available to read, and AWC's schema declares the field a bare string with no enum. Nothing depends on it — the hazard filter is applied by AWC (decision 23) — so this is a documentation gap rather than a limit on what the tool can answer.
 - **An empty cloud array carries no sky condition on its own:** AWC encodes no layer for a group with no height, so a `CLR` report, a `VV///` obscuration, and a report that stated no sky condition all arrive as `clouds: []`. `sky_condition` separates them on both response surfaces, and an empty array beside a null reads as unreported rather than clear (decision 21). What stays unavailable is the sky above a station that reported none — no field recovers it, and neither response surface claims otherwise.
 
 ---
@@ -537,6 +562,7 @@ Decision 17 kept the weather tools' `missing` flat and their notice cause-free: 
 - `distance=N` — radius in nautical miles around the `id` center point for PIREP searches; ignored when the search is a bbox
 - `level=N` — for `pirep`, a flight-level centre searched with a fixed ±3,000 ft band ("Level +-3000' to search"), not a range: `level=190` returns FL160–220. Applies in both the radial and bbox modes, and admits reports whose flight level did not parse
 - `inten=lgt|mod|sev` — for `pirep`, minimum hazard intensity. Selects whole reports carrying at least one turbulence or icing layer at that intensity or above, so a matching report still carries its lighter layers
+- `hazard=conv|turb|ice|ifr` — for `airsigmet`, the hazard class. Values are matched case-insensitively; an unrecognized one returns HTTP 400 rather than being dropped, and a recognized one with nothing active returns 204. The tool's own spellings do not substitute: `CONVECTIVE` and `TURBULENCE` return 400, while `ICING` and `IFR` case-fold onto the undocumented `icing` and the documented `ifr` and return 204 — so the mapping in decision 23 is what keeps every outgoing value one this list accepts. `/airsigmet` defines no bbox parameter
 
 **Every endpoint returns at most 400 entries.** The limit is stated under Restrictions in the API documentation, alongside a request-pacing guideline of no more than 1 request/min per thread. The OpenAPI schema declares no `page`, `offset`, `limit`, or cursor parameter on any endpoint and does not mention the cap, so a client parsing the schema cannot learn the limit exists — a capped page is detectable only by counting the rows returned. `stationinfo` accepts only `ids`, `bbox`, and `format`, which leaves a smaller bounding box as its single narrowing lever.
 

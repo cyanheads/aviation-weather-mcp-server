@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { aviationGetAdvisories } from '@/mcp-server/tools/definitions/aviation-get-advisories.tool.js';
 import type { NormalizedAdvisory } from '@/services/aviation-weather/types.js';
@@ -13,9 +13,14 @@ import type { NormalizedAdvisory } from '@/services/aviation-weather/types.js';
 // Service mock
 // ---------------------------------------------------------------------------
 
-vi.mock('@/services/aviation-weather/aviation-weather-service.js', () => ({
-  getAviationWeatherService: vi.fn(),
-}));
+// Only the service accessor is stubbed. `isSigmetHazard` is the real hazard
+// vocabulary the handler rejects against, and stubbing it would leave the
+// AIRMET-rejection tests asserting against a fake list.
+vi.mock('@/services/aviation-weather/aviation-weather-service.js', async (importActual) => {
+  const actual =
+    await importActual<typeof import('@/services/aviation-weather/aviation-weather-service.js')>();
+  return { ...actual, getAviationWeatherService: vi.fn() };
+});
 
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 
@@ -109,6 +114,9 @@ describe('aviationGetAdvisories', () => {
   });
 
   it('passes hazard filter to the service', async () => {
+    // The tool's own spelling reaches the service, which owns the mapping to
+    // the token `/airsigmet` accepts — the handler never builds the URL, so
+    // this is the value the service needs to build the mapped one.
     mockFetchAdvisories.mockResolvedValue([sigmet]);
     const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
     const input = aviationGetAdvisories.input.parse({ hazard: 'CONVECTIVE' });
@@ -298,6 +306,179 @@ describe('aviationGetAdvisories AIRMET rejection', () => {
     expect(aviationGetAdvisories.description).not.toMatch(/AIRMETs\b(?!.*not)/);
     expect(String(advisoryType.description)).not.toMatch(/"all" returns both/);
     expect(String(hazard.description)).toMatch(/not served|no upstream counterpart|rejected/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Zero-draw disclosure (issue #33) — an empty result rendered identically
+// whether nothing was active, the hazard matched nothing, or the bbox excluded
+// everything, and nothing machine-readable separated them
+// ---------------------------------------------------------------------------
+
+describe('aviationGetAdvisories zero-draw disclosure', () => {
+  const quietBbox = { minLat: 46.5, minLon: -125.5, maxLat: 47.5, maxLon: -124.5 };
+
+  /**
+   * Resolve the service mock with `advisories`, reporting `drawnRows` through
+   * the pre-filter channel. Defaults to the returned length — the shape of a
+   * call whose bbox filter removed nothing.
+   */
+  function mockDraw(advisories: NormalizedAdvisory[], drawnRows = advisories.length) {
+    mockFetchAdvisories.mockImplementation(async (params) => {
+      params.onPreFilterRows?.(drawnRows);
+      return advisories;
+    });
+  }
+
+  /** Run the handler and return the enrichment it accumulated. */
+  async function enrichmentFor(input: Record<string, unknown>) {
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
+    await aviationGetAdvisories.handler(aviationGetAdvisories.input.parse(input), ctx);
+    return getEnrichment(ctx);
+  }
+
+  it('states an unfiltered empty draw as the fair-weather result', async () => {
+    mockDraw([], 0);
+    const notice = String((await enrichmentFor({})).notice);
+
+    expect(notice).toMatch(/no domestic sigmets are active/i);
+    expect(notice).toMatch(/fair.weather/i);
+  });
+
+  it('names the hazard filter when the draw it scoped came back empty', async () => {
+    // The live shape this was written against — every active advisory
+    // convective, `hazard=turb` answering HTTP 204 throughout — is recorded
+    // with its draw counts in decision 23. The measurement lives there rather
+    // than here so the two cannot drift apart.
+    mockDraw([], 0);
+    const notice = String((await enrichmentFor({ hazard: 'TURBULENCE' })).notice);
+
+    expect(notice).toContain('TURBULENCE');
+    expect(notice).toMatch(/drop the hazard filter/i);
+  });
+
+  it('does not claim other advisories are active behind a hazard filter', async () => {
+    // AWC answers the same HTTP 204 for a hazard with nothing active and for a
+    // feed with nothing active at all, so the counts in hand cannot separate
+    // them once the hazard is applied upstream. The notice must not assert one.
+    mockDraw([], 0);
+    const notice = String((await enrichmentFor({ hazard: 'ICING' })).notice);
+
+    expect(notice).not.toMatch(/advisories are active/i);
+    expect(notice).not.toMatch(/active elsewhere/i);
+  });
+
+  it('names the bbox when a non-empty draw returned nothing', async () => {
+    // Confirmed live: the 16 active advisories overlap none of this box.
+    mockDraw([], 16);
+    const notice = String((await enrichmentFor({ bbox: quietBbox })).notice);
+
+    expect(notice).toContain('16');
+    expect(notice).toMatch(/bbox/i);
+    expect(notice).toMatch(/widen|drop it/i);
+  });
+
+  it('attributes a hazard+bbox call to the hazard when the draw was already empty', async () => {
+    // The bbox never ran — AWC applied the hazard first, so blaming the box
+    // would point the caller at a filter that saw nothing.
+    mockDraw([], 0);
+    const notice = String((await enrichmentFor({ hazard: 'IFR', bbox: quietBbox })).notice);
+
+    expect(notice).toContain('IFR');
+    expect(notice).toMatch(/never applied|already empty/i);
+  });
+
+  it('says the bbox is not the cause when the unfiltered feed itself is empty', async () => {
+    mockDraw([], 0);
+    const notice = String((await enrichmentFor({ bbox: quietBbox })).notice);
+
+    expect(notice).toMatch(/bbox is not the cause/i);
+  });
+
+  it('asserts nothing when no draw was reported at all', async () => {
+    // `fetchAdvisories` returns before the pre-filter channel fires when AWC
+    // serves a body that is not an array, so no count arrives. Defaulting that
+    // to zero would claim fair weather off a draw the tool never read — the one
+    // notice in the set that could state something it did not observe.
+    mockFetchAdvisories.mockResolvedValue([]);
+    const enrichment = await enrichmentFor({});
+
+    expect(enrichment.notice).toBeUndefined();
+  });
+
+  it('reads the drawn count, not the returned one, when naming the bbox', async () => {
+    // The same rule cap detection follows (decision 18): the count that
+    // describes the draw is the one taken before the client-side filter.
+    mockDraw([], 9);
+    const notice = String((await enrichmentFor({ bbox: quietBbox })).notice);
+
+    expect(notice).toContain('9');
+    expect(notice).not.toMatch(/\b0 active/);
+  });
+
+  it('carries no notice on a non-empty result', async () => {
+    mockDraw([sigmet, sparseSigmet]);
+    const enrichment = await enrichmentFor({});
+
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('carries no notice on a bbox that kept something', async () => {
+    mockDraw([sparseSigmet], 2);
+    const enrichment = await enrichmentFor({ bbox: quietBbox });
+
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('leaves the empty result a valid state rather than an error', async () => {
+    mockDraw([], 0);
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
+    const result = await aviationGetAdvisories.handler(
+      aviationGetAdvisories.input.parse({ hazard: 'ICING' }),
+      ctx,
+    );
+
+    expect(result.advisories).toEqual([]);
+  });
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    mockDraw([], 16);
+    const result = await runToolContract(aviationGetAdvisories, { bbox: quietBbox });
+
+    expect(result.structuredContent).toMatchObject({
+      advisories: [],
+      notice: expect.stringContaining('16'),
+    });
+
+    // A client reading only content[] must learn the same two facts: the box is
+    // what emptied the result, and widening it is what recovers the advisories.
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('16');
+    expect(text).toMatch(/bbox/i);
+  });
+
+  it('leaves the advisories payload and its rendering untouched', async () => {
+    mockDraw([sigmet]);
+    const result = await runToolContract(aviationGetAdvisories, {});
+
+    expect(result.structuredContent).toMatchObject({
+      advisories: [expect.objectContaining({ series_id: 'BOSW0' })],
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('1 active advisory');
+    expect(text).toContain('## SIGMET: BOSW0 — CONVECTIVE');
+  });
+
+  it('discloses nothing on the rejected-product paths, which never draw', async () => {
+    // `airmet_not_served` fires before any request goes out, so there is no
+    // draw to attribute — the error carries the recovery instead.
+    mockDraw([], 0);
+    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
+
+    await expect(
+      aviationGetAdvisories.handler(aviationGetAdvisories.input.parse({ hazard: 'LLWS' }), ctx),
+    ).rejects.toMatchObject({ data: { reason: 'airmet_not_served' } });
+    expect(getEnrichment(ctx)).not.toHaveProperty('notice');
   });
 });
 
