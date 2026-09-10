@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
+import { formatSkyLine } from '@/mcp-server/tools/format-sky-condition.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 
 const CloudLayerSchema = z
@@ -19,19 +20,49 @@ const CloudLayerSchema = z
   })
   .describe('A reported cloud layer.');
 
+/** The decoded form of a `VVhhh` or `VV///` group — the sky is obscured. */
+const OBSCURATION_COVER = 'OVX';
+
 /** Render a numeric observation, or an explicit unknown when upstream omitted it. */
 function measurement(value: number | null, unit: string): string {
   return value != null ? `${value}${unit}` : 'unknown';
 }
 
+/** Prevailing visibility with its unit, or an explicit unreported state. */
+function visibility(sm: string): string {
+  return sm === 'unknown' ? 'not reported' : `${sm} sm`;
+}
+
 /**
- * Render the ceiling with its kind. A null ceiling means no broken, overcast,
- * or obscuration layer was reported — "none", never "clear", which would assert
- * a sky state the observation does not support (few and scattered layers can
- * sit above a station with no ceiling).
+ * Render the ceiling with its kind.
+ *
+ * A null height carries two meanings and they are not the same claim. Where no
+ * broken, overcast, or obscuration layer was reported the reading is "none" —
+ * never "clear", which would assert a sky state the observation does not
+ * support, since few and scattered layers can sit above a station with no
+ * ceiling. Where the station reported an obscuration but no vertical visibility
+ * into it — a `VV///` group, which AWC publishes as `cover: OVX` with no layer
+ * and no `vertVis` — the report *has* a ceiling under FAA AIM 7-1-29 and its
+ * height is what is missing, so "none" states the opposite of the observation,
+ * on records flagged IFR and LIFR where it costs most.
+ *
+ * `sky_condition` is the discriminator for the same reason it is on the cloud
+ * line: it is populated only when the observation published no layer heights,
+ * so an `OVX` value there beside a null height is exactly the undetermined
+ * case, and the numeric `VVhhh` records keep publishing their height untouched. Reading the raw text
+ * instead would misfire on a `VV` group inside a `TEMPO` clause — live `USTR …
+ * NSC … TEMPO 0300 FG VV002` forecasts one and reports none.
  */
-function ceiling(ft: number | null, type: 'measured' | 'indefinite' | null): string {
-  if (ft == null) return 'none';
+function ceiling(
+  ft: number | null,
+  type: 'measured' | 'indefinite' | null,
+  skyCondition: string | null,
+): string {
+  if (ft == null) {
+    return skyCondition === OBSCURATION_COVER
+      ? 'not determinable — sky obscured, no vertical visibility reported'
+      : 'none';
+  }
   const kind =
     type === 'indefinite' ? 'indefinite — vertical visibility into an obscuration' : 'measured';
   return `${ft} ft (${kind})`;
@@ -60,7 +91,7 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       .max(12)
       .default(1)
       .describe(
-        'Hours of observation history to return (1–12). Default 1 returns only the most recent observation per station.',
+        'Lookback window in hours (1–12), not a row limit: every observation inside the window is returned, so a station reporting more often than hourly yields more than one row per hour. At the default of 1, half-hourly stations return two observations and SPECI-issuing stations can return more. Budget rows by the station reporting interval, never one per station.',
       ),
   }),
   output: z.object({
@@ -104,12 +135,14 @@ export const aviationGetMetar = tool('aviation_get_metar', {
               .describe('Wind conditions at the station.'),
             visibility_sm: z
               .string()
-              .describe('Prevailing visibility in statute miles (e.g., "10+", "3", "1/2").'),
+              .describe(
+                'Prevailing visibility in statute miles (e.g., "10+", "3", "1/2"), or the string "unknown" when the observation carried no visibility group. "unknown" is not a measurement and carries no unit.',
+              ),
             ceiling_ft: z
               .number()
               .nullable()
               .describe(
-                'Ceiling in feet AGL — the lowest broken, overcast, or obscuration layer. Per FAA AIM 7-1-29 the ceiling is the lowest broken or overcast layer, or the vertical visibility into an obscuration; few and scattered layers are never ceilings. Null when the observation reported no such layer.',
+                'Ceiling in feet AGL — the lowest broken, overcast, or obscuration layer. Per FAA AIM 7-1-29 the ceiling is the lowest broken or overcast layer, or the vertical visibility into an obscuration; few and scattered layers are never ceilings. Null in two cases that are not the same: the observation reported no such layer, or it reported an obscuration whose vertical visibility the station could not determine (a VV/// group), where the ceiling exists and only its height is missing. A sky_condition of OVX marks the second.',
               ),
             ceiling_type: z
               .enum(['measured', 'indefinite'])
@@ -119,7 +152,15 @@ export const aviationGetMetar = tool('aviation_get_metar', {
               ),
             clouds: z
               .array(CloudLayerSchema)
-              .describe('All reported cloud layers from lowest to highest.'),
+              .describe(
+                'All reported cloud layers from lowest to highest. Empty whenever the observation published no layer heights, which covers a clear sky, an obscuration with no determinable height, and an observation that reported no sky condition at all; sky_condition distinguishes them. An empty array is not a clear sky on its own.',
+              ),
+            sky_condition: z
+              .string()
+              .nullable()
+              .describe(
+                'The sky condition the observation stated when it published no layer heights: CLR, SKC, or CAVOK for a clear or insignificant-cloud report, OVX for an obscuration whose layer carried no height (a VV/// group, and the opposite of clear). Null when clouds carries layers — those are the statement — and also when the observation carried no sky-condition group at all. An empty clouds array beside a null here is an unreported sky, never a clear one.',
+              ),
             present_weather: z
               .object({
                 raw: z
@@ -260,7 +301,7 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       const speedStr = obs.wind.speed_kt != null ? `${obs.wind.speed_kt} kt` : 'unknown speed';
       lines.push(`**Wind:** ${dirStr} at ${speedStr}${gustStr}`);
       lines.push(
-        `**Visibility:** ${obs.visibility_sm} sm | **Ceiling:** ${ceiling(obs.ceiling_ft, obs.ceiling_type)}`,
+        `**Visibility:** ${visibility(obs.visibility_sm)} | **Ceiling:** ${ceiling(obs.ceiling_ft, obs.ceiling_type, obs.sky_condition)}`,
       );
       if (obs.present_weather) {
         lines.push(
@@ -271,13 +312,16 @@ export const aviationGetMetar = tool('aviation_get_metar', {
         `**Temperature:** ${measurement(obs.temp_c, '°C')} | **Dewpoint:** ${measurement(obs.dewpoint_c, '°C')} | **Altimeter:** ${measurement(obs.altimeter_inhg, ' inHg')}`,
       );
 
-      if (obs.clouds.length > 0) {
-        lines.push(
-          `**Clouds:** ${obs.clouds.map((c) => `${c.cover} @ ${c.base_ft} ft`).join(', ')}`,
-        );
-      } else {
-        lines.push(`**Clouds:** Clear`);
-      }
+      // An empty cloud array used to render "Clear", which asserted a sky state
+      // for the 97 of 1,849 live observations that reported none — and inverted
+      // the `VV///` obscurations that land in the same empty array.
+      lines.push(
+        `**Clouds:** ${formatSkyLine(
+          obs.clouds.map((c) => `${c.cover} @ ${c.base_ft} ft`),
+          obs.sky_condition,
+          'not reported — the observation carried no sky-condition group',
+        )}`,
+      );
 
       lines.push(`**Raw METAR:** \`${obs.raw_metar}\``);
       lines.push('');

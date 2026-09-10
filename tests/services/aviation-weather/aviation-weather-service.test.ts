@@ -61,7 +61,8 @@ beforeEach(() => {
 const rawMetarKDEN: RawMetar = {
   altim: 1013,
   clouds: [],
-  cover: null,
+  // A `CLR` group carries no layer; AWC states the condition here instead.
+  cover: 'CLR',
   dewp: -2,
   elev: 1656,
   fltCat: 'VFR',
@@ -1592,5 +1593,210 @@ describe('AviationWeatherService pre-filter row count', () => {
     await svc.fetchStations({ stationIds: ['KSEA'], onPreFilterRows }, createMockContext());
 
     expect(onPreFilterRows).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sky condition (issue #27) — AWC encodes no layer for a group that carries no
+// height, so a clear report and a report that stated nothing arrive alike
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService METAR sky condition', () => {
+  /** Normalize one raw METAR through the real service path. */
+  async function normalize(overrides: Partial<RawMetar>) {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([{ ...rawMetarKDEN, ...overrides }]),
+    );
+    const [obs] = await svc.fetchMetar(['KDEN'], 1, createMockContext());
+    return obs!;
+  }
+
+  it.each(['CLR', 'SKC', 'CAVOK'])(
+    'reads a %s report off the record rather than the raw observation',
+    async (cover) => {
+      const obs = await normalize({ clouds: [], cover });
+
+      expect(obs.clouds).toEqual([]);
+      expect(obs.sky_condition).toBe(cover);
+    },
+  );
+
+  it('reports an observation carrying no sky-condition group as unreported', async () => {
+    // `METAR KJDN 131048Z AUTO 03008KT 14/12 A3002 RMK AO1` — AWC omits the
+    // `cover` key entirely rather than sending null, so the read must be on
+    // absence, not on a null literal. 97 of 1,849 distinct live records.
+    const { cover: _dropped, ...withoutCover } = rawMetarKDEN;
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([
+        {
+          ...withoutCover,
+          clouds: [],
+          rawOb: 'METAR KJDN 131048Z AUTO 03008KT 14/12 A3002 RMK AO1 SLP155 P0006 T0139',
+        },
+      ]),
+    );
+    const [obs] = await svc.fetchMetar(['KJDN'], 1, createMockContext());
+
+    expect(obs!.clouds).toEqual([]);
+    expect(obs!.sky_condition).toBeNull();
+  });
+
+  it('reads a degraded sky group as unreported rather than as a condition', async () => {
+    // `METAR LFAC 092330Z AUTO 16003KT 9999 ////// 13/12 Q1019` — the sensor
+    // could not report, and AWC omits `cover` exactly as it does for a station
+    // that sent no group at all. 16 of the 97 unreported records.
+    const obs = await normalize({
+      clouds: [],
+      cover: null,
+      rawOb: 'METAR LFAC 092330Z AUTO 16003KT 9999 ////// 13/12 Q1019',
+    });
+
+    expect(obs.sky_condition).toBeNull();
+  });
+
+  it('reads an indeterminate obscuration as obscured, not as an absent sky', async () => {
+    // `METAR WBGG 092300Z 00000KT 2000 HZ VV/// 24/24 Q1009`, reported IFR:
+    // `VV///` publishes no layer and no vertVis, so the empty cloud array here
+    // means the opposite of a clear sky.
+    const obs = await normalize({
+      clouds: [],
+      cover: 'OVX',
+      vertVis: null,
+      fltCat: 'IFR',
+      rawOb: 'METAR WBGG 092300Z 00000KT 2000 HZ VV/// 24/24 Q1009 NOSIG',
+    });
+
+    expect(obs.sky_condition).toBe('OVX');
+    expect(obs.ceiling_ft).toBeNull();
+  });
+
+  it.each(['FEW', 'SCT', 'BKN', 'OVC'])(
+    'states no separate sky condition when a %s layer carries the report',
+    async (cover) => {
+      const obs = await normalize({ clouds: [{ cover, base: 3000 }], cover });
+
+      expect(obs.clouds).toEqual([{ cover, base_ft: 3000 }]);
+      expect(obs.sky_condition).toBeNull();
+    },
+  );
+
+  it('treats a blank cover as unreported rather than as a condition', async () => {
+    const obs = await normalize({ clouds: [], cover: '   ' });
+
+    expect(obs.sky_condition).toBeNull();
+  });
+});
+
+describe('AviationWeatherService TAF sky condition', () => {
+  /** Normalize one raw TAF forecast period through the real service path. */
+  async function normalize(overrides: Partial<RawTafForecastPeriod>) {
+    const period = { ...rawTafKSEA.fcsts[0]!, ...overrides };
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([{ ...rawTafKSEA, fcsts: [period] }]),
+    );
+    const [taf] = await svc.fetchTaf(['KSEA'], createMockContext());
+    return taf!.forecast_periods[0]!;
+  }
+
+  it.each(['SKC', 'NSC'])(
+    'states a baseless %s layer as the period sky condition',
+    async (cover) => {
+      // 546 of the 723 live periods that normalize to no layers are one of
+      // these — a forecast clear sky, published as a cover with no height.
+      const period = await normalize({ clouds: [{ base: null, cover, type: null }] });
+
+      expect(period.clouds).toEqual([]);
+      expect(period.sky_condition).toBe(cover);
+    },
+  );
+
+  it.each([null, []])(
+    'reports %p upstream clouds as forecasting nothing about cloud',
+    async (clouds) => {
+      // A TEMPO or PROB group amending only visibility or weather. The
+      // prevailing forecast's cloud stands; nothing here says it will be clear.
+      const period = await normalize({ clouds, fcstChange: 'TEMPO' });
+
+      expect(period.clouds).toEqual([]);
+      expect(period.sky_condition).toBeNull();
+    },
+  );
+
+  it('states no separate sky condition when the period carries real layers', async () => {
+    const period = await normalize({
+      clouds: [
+        { base: 800, cover: 'OVC', type: null },
+        { base: 1500, cover: 'BKN', type: 'CB' },
+      ],
+    });
+
+    expect(period.sky_condition).toBeNull();
+  });
+
+  it('states no separate sky condition on an obscuration that kept its height', async () => {
+    // The OVX layer takes its base from vertVis and renders as a layer, so the
+    // period has a height to publish and needs no group beside it.
+    const period = await normalize({
+      clouds: [{ base: null, cover: 'OVX', type: null }],
+      vertVis: 200,
+    });
+
+    expect(period.clouds).toEqual([{ cover: 'OVX', base_ft: 200, type: null }]);
+    expect(period.sky_condition).toBeNull();
+  });
+
+  it('keeps a clear-sky forecast distinguishable from a vertVis carried onto it', async () => {
+    // Live CYXU: `... 3/8SM FG VV001 BECMG 1312/1314 P6SM NSW SKC`. The BECMG
+    // group forecasts a clearing sky while upstream repeats the base period's
+    // vertVis onto it — the SKC must read as clear, not as a 100 ft ceiling.
+    const period = await normalize({
+      clouds: [{ base: null, cover: 'SKC', type: null }],
+      vertVis: 100,
+      fcstChange: 'BECMG',
+    });
+
+    expect(period.clouds).toEqual([]);
+    expect(period.vertical_visibility_ft).toBeNull();
+    expect(period.sky_condition).toBe('SKC');
+  });
+
+  it('carries a standalone probability group as its own change indicator', async () => {
+    // A probability group with no temporary group after it — live KLRD, KCMH,
+    // KABI, CYSC, CYQB. AWC reports it as PROB in its own right; only a
+    // probability qualifying a temporary group folds into TEMPO. Across 2,416
+    // live periods from three regional boxes the indicators tally null 648, FM
+    // 986, TEMPO 378, BECMG 287, PROB 117 — roughly one period in twenty.
+    const period = await normalize({ clouds: null, fcstChange: 'PROB', probability: 30 });
+
+    expect(period).toMatchObject({
+      change_type: 'PROB',
+      probability: 30,
+      clouds: [],
+      sky_condition: null,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Station reconciliation key (issue #31) — the registry's own `id` is the only
+// identifier every entry carries, and the only one a lookup resolves against
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService station identifiers', () => {
+  it('carries the registry ID through normalization', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationKSEA]));
+    const [station] = await svc.fetchStations({ stationIds: ['KSEA'] }, createMockContext());
+
+    expect(station!.id).toBe('KSEA');
+  });
+
+  it('carries the registry ID for an entry with no ICAO, IATA, or FAA identifier', async () => {
+    // 375 of 1,600 rows across four live bbox draws look like this, and a
+    // lookup by that ID resolves — so `icao_id` cannot be the reconciliation key.
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationWASD2]));
+    const [station] = await svc.fetchStations({ stationIds: ['WASD2'] }, createMockContext());
+
+    expect(station!.id).toBe('WASD2');
+    expect(station!.icao_id).toBeNull();
   });
 });

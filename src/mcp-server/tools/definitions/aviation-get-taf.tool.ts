@@ -5,7 +5,23 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { formatSkyLine } from '@/mcp-server/tools/format-sky-condition.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
+
+/**
+ * Change indicators that amend a prevailing forecast rather than replacing it.
+ * A group of one of these kinds carrying no cloud element leaves the prevailing
+ * cloud standing; an `FM` group or the base period has nothing to inherit, so
+ * the same absent element means the forecast simply did not state one.
+ */
+const AMENDING_CHANGE_TYPES = new Set(['TEMPO', 'PROB', 'BECMG']);
+
+/** How a period with neither layers nor a sky-condition group reads. */
+function unamendedCloudReading(changeType: string | null): string {
+  return changeType != null && AMENDING_CHANGE_TYPES.has(changeType.toUpperCase())
+    ? 'not amended — this period carries no cloud element, so the prevailing forecast stands'
+    : 'not specified';
+}
 
 const TafCloudLayerSchema = z
   .object({
@@ -36,7 +52,7 @@ const ForecastPeriodSchema = z
       .string()
       .nullable()
       .describe(
-        'Change indicator: FM (from), TEMPO (temporary), BECMG (becoming), or null for the base period.',
+        'Change indicator: FM (from), TEMPO (temporary), BECMG (becoming), PROB (a standalone probability group), or null for the base period. A PROB30 or PROB40 qualifying a temporary group arrives as TEMPO; standing alone, with no temporary group after it, it arrives as PROB. Either way the percentage is in probability.',
       ),
     probability: z
       .number()
@@ -108,7 +124,17 @@ const ForecastPeriodSchema = z
       .describe(
         'Forecast weather for this period, or null when the period carried no weather group.',
       ),
-    clouds: z.array(TafCloudLayerSchema).describe('Forecast cloud layers for this period.'),
+    clouds: z
+      .array(TafCloudLayerSchema)
+      .describe(
+        'Forecast cloud layers for this period. Empty whenever the period published no layer heights, which covers a forecast clear sky and a period carrying no cloud element at all; sky_condition distinguishes them. An empty array is not a forecast of a clear sky on its own.',
+      ),
+    sky_condition: z
+      .string()
+      .nullable()
+      .describe(
+        'The sky condition this period forecast when it published no layer heights: SKC or NSC for a clear or insignificant-cloud forecast (a CAVOK group arrives as NSC), OVX for a forecast obscuration carrying no vertical visibility. Null when clouds carries layers — those are the statement — and also when the period carried no cloud element at all. An empty clouds array beside a null here forecasts nothing about cloud; on a TEMPO, PROB, or BECMG group that means the prevailing forecast stands unchanged, never that the sky will be clear.',
+      ),
   })
   .describe('A single TAF forecast period.');
 
@@ -271,14 +297,17 @@ export const aviationGetTaf = tool('aviation_get_taf', {
             `**Vertical visibility:** ${period.vertical_visibility_ft} ft AGL (indefinite ceiling)`,
           );
         }
-        if (period.clouds.length > 0) {
-          const cloudStr = period.clouds
-            .map((c) => `${c.cover} @ ${c.base_ft} ft${c.type ? ` (${c.type})` : ''}`)
-            .join(', ');
-          lines.push(`**Clouds:** ${cloudStr}`);
-        } else {
-          lines.push('**Clouds:** Clear');
-        }
+        // An empty cloud array used to render "Clear". Most of them are an
+        // explicit SKC or NSC forecast whose layer carries no height — 546 of
+        // 723 across 3,349 live periods — and the rest are amendment groups
+        // that never mentioned cloud, where "Clear" invented a forecast.
+        lines.push(
+          `**Clouds:** ${formatSkyLine(
+            period.clouds.map((c) => `${c.cover} @ ${c.base_ft} ft${c.type ? ` (${c.type})` : ''}`),
+            period.sky_condition,
+            unamendedCloudReading(period.change_type),
+          )}`,
+        );
         lines.push('');
       }
 

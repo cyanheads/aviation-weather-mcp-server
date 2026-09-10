@@ -6,7 +6,7 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `aviation_get_metar` | Current weather observations for one or more airports. Returns decoded fields (wind direction/speed/gusts, visibility, ceiling and its kind, present weather, temp/dewpoint, altimeter, cloud layers) plus the computed flight category (VFR/MVFR/IFR/LIFR) and the raw METAR string. Accepts 1–10 ICAO station IDs. | `station_ids: string[]`, `hours?: number (1–12, default 1)` | `readOnlyHint: true, idempotentHint: true` |
+| `aviation_get_metar` | Current weather observations for one or more airports. Returns decoded fields (wind direction/speed/gusts, visibility, ceiling and its kind, present weather, temp/dewpoint, altimeter, cloud layers) plus the computed flight category (VFR/MVFR/IFR/LIFR) and the raw METAR string. Accepts 1–10 ICAO station IDs. | `station_ids: string[]`, `hours?: number (1–12 lookback window, default 1)` | `readOnlyHint: true, idempotentHint: true` |
 | `aviation_get_taf` | Terminal Aerodrome Forecast for one or more airports. Returns each forecast period with valid times, wind, visibility, decoded weather, and cloud layers, plus the raw TAF string. Accepts 1–4 ICAO station IDs. | `station_ids: string[]` | `readOnlyHint: true, idempotentHint: true` |
 | `aviation_get_pireps` | Recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence/icing/cloud reports with altitude, aircraft type, intensity, and the raw pirep string. | `station_id?: string`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `distance_nm?: number (station_id only, 100 when omitted)`, `hours?: number (1–12, default 3)`, `altitude_min_ft?: number`, `altitude_max_ft?: number`, `min_intensity?: 'lgt' \| 'mod' \| 'sev'` | `readOnlyHint: true, idempotentHint: true` |
 | `aviation_get_advisories` | Active domestic SIGMETs for a region. Returns each advisory with hazard type (CONVECTIVE, TURBULENCE, ICING, IFR), severity, altitude range, valid period, polygon coordinates, and raw text. Accepts optional hazard filter or bounding box. AIRMETs are not served — a request for one is rejected. | `hazard?: enum`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `advisory_type?: 'sigmet' \| 'airmet' \| 'all'` | `readOnlyHint: true, idempotentHint: true` |
@@ -100,7 +100,7 @@ Each step is independently testable.
 **Input schema:**
 ```
 station_ids: z.array(z.string().regex(/^[A-Z]{4}$/).describe('ICAO station ID')).min(1).max(10)
-hours: z.number().int().min(1).max(12).default(1).describe('Hours of history to return (1–12). Default 1 returns only the most recent observation per station.')
+hours: z.number().int().min(1).max(12).default(1)   // a lookback window, not a row limit — every observation inside it is returned
 ```
 
 **Output schema (per station):**
@@ -113,16 +113,19 @@ flight_category: 'VFR' | 'MVFR' | 'IFR' | 'LIFR'  // fltCat — the headline
 metar_type: 'METAR' | 'SPECI'   // metarType — SPECI = special observation triggered by significant weather change
 observed_at: string          // ISO 8601 from obsTime (unix → date)
 wind: { direction_deg: number | null, speed_kt: number | null, gust_kt: number | null }
-visibility_sm: string        // '10+', '3', '1/2' etc.
-ceiling_ft: number | null    // lowest BKN, OVC, or OVX layer base, feet AGL
+visibility_sm: string        // '10+', '3', '1/2' etc.; 'unknown' when no visibility group was reported
+ceiling_ft: number | null    // lowest BKN, OVC, or OVX layer base, feet AGL; null both for no such layer and for an obscuration of undetermined height, which sky_condition: 'OVX' marks
 ceiling_type: 'measured' | 'indefinite' | null   // null exactly when ceiling_ft is null
-clouds: { cover: string, base_ft: number }[]   // base_ft is feet AGL
+clouds: { cover: string, base_ft: number }[]   // base_ft is feet AGL; empty whenever the observation published no layer heights
+sky_condition: string | null // cover — the group stated when there are no layer heights (CLR/SKC/CAVOK, or OVX for a VV/// obscuration); null when clouds carries layers, and when nothing was reported
 present_weather: { raw: string, decoded: string } | null   // wxString, both forms
 temp_c: number | null
 dewpoint_c: number | null
 altimeter_inhg: number | null
 raw_metar: string            // rawOb
 ```
+
+An empty `clouds` array and `sky_condition` are read together: the array empties for a clear sky, for an obscuration with no determinable height, and for an observation that stated nothing, and only `sky_condition` separates them — see decision 21.
 
 `speed_kt`, `temp_c`, `dewpoint_c`, and `altimeter_inhg` are null when upstream omitted the group. 0 is a real reading for every one of them (calm wind, freezing point), so it cannot double as "not reported". `elevation_ft` stays a plain number: AWC never returned a null METAR `elev` in any sampled region, its schema declares `default: 0`, and 0 is correct for a sea-level field.
 
@@ -157,14 +160,15 @@ valid_to: string             // ISO 8601 from validTimeTo
 forecast_periods: [{
   from: string,              // ISO 8601 from timeFrom
   to: string,                // ISO 8601 from timeTo
-  change_type: string | null // fcstChange: 'FM', 'TEMPO', 'BECMG', null
+  change_type: string | null // fcstChange: 'FM', 'TEMPO', 'BECMG', 'PROB' (a standalone probability group), null
   probability: number | null // probability
   wind: { direction_deg: number | null, speed_kt: number | null, gust_kt: number | null }
   wind_shear: { height_ft: number, direction_deg: number, speed_kt: number } | null  // wshearHgt/Dir/Spd, passed through unconverted
   visibility_sm: string | null
   vertical_visibility_ft: number | null   // vertVis, already in feet; non-null only on an obscured period
   weather: { raw: string, decoded: string } | null   // wxString, both forms
-  clouds: { cover: string, base_ft: number, type: string | null }[]   // base_ft is feet AGL
+  clouds: { cover: string, base_ft: number, type: string | null }[]   // base_ft is feet AGL; empty whenever the period published no layer heights
+  sky_condition: string | null   // the group the period forecast when its cover carries no height (SKC/NSC, or OVX for an obscuration with no vertical visibility); null when clouds carries layers, and when the period carried no cloud element
 }]
 raw_taf: string              // rawTAF
 ```
@@ -172,6 +176,8 @@ raw_taf: string              // rawTAF
 `wind.speed_kt` is null when the period carries no wind element — a TEMPO or PROB group amending only visibility, weather, or cloud, which is 13% of live CONUS forecast periods. `wdir` is null on exactly those, and the string `VRB` on a variable wind that does carry a speed; both normalize to `direction_deg: null`, so `speed_kt` is what separates "no wind forecast" from "variable". 0 kt stays a forecast calm.
 
 **Design note:** `wxString` from the API is one or more space-delimited weather groups (e.g., `-SHRA`, `-SHRA BR`). Both forms are carried, matching `aviation_get_metar`'s `present_weather` — see decision 14 for how a group is decoded and what happens when one does not resolve.
+
+**Design note:** an empty `clouds` array is read with `sky_condition`, which separates a forecast clear sky from a period that amended nothing about cloud — see decision 21.
 
 **Design note:** `vertical_visibility_ft` and the `OVX` layer that carries the same height are gated on the period's own obscuration — see decision 15. `wind_shear` is one nullable object rather than three nullable scalars, and its `speed_kt` is a wind velocity rather than a shear magnitude — see decision 16.
 
@@ -334,16 +340,22 @@ data_types: string[]         // siteType: ['METAR', 'TAF', etc.]
 
 `conflicting_location` is checked ahead of `invalid_state`, so combining a bogus `state` with another location mode reports the mode conflict.
 
-**Enrichment contract** (see decision 18):
+**Enrichment contract** — two disclosures on disjoint modes (decisions 18 and 22):
 ```
 truncated:    boolean         // always — true when the draw hit the 400-row upstream cap
 shown:        number          // always — stations returned, after any client-side state filter
 cap:          number          // only when truncated — the upstream row maximum applied
 upstreamRows: number          // only when the state filter narrowed a truncated draw
-notice:       string          // only when truncated — names a smaller bbox as the narrowing lever
+requested:    string[]        // station_ids mode — the identifiers as the caller spelled them
+returned:     string[]        // station_ids mode — the requested identifiers that resolved
+partial:      boolean         // station_ids mode — true when a requested identifier resolved to nothing
+missing:      string[]        // station_ids mode — only when non-empty
+notice:       string          // whichever disclosure fired — the narrowing lever, or the cause and fix
 ```
 
-Detection reads the drawn row count, never the returned one. The state mode filters its draw inside `fetchStations` and reports that pre-filter size back through the `onPreFilterRows` callback; the `station_ids` and `bbox` modes return their draw unfiltered and report nothing, because there the rows returned are the rows drawn. `upstreamRows` is emitted only where a filter moved the count, since elsewhere it would restate `shown`. An empty result stays `station_not_found` and carries no disclosure.
+Only `bbox` and `state` can reach the row cap (`station_ids` is bounded at 20 by the input schema) and only `station_ids` has a request to reconcile, so the two disclosures never co-occur and share `notice` without conflating anything. `returned` and `missing` deduplicate the way upstream does — a repeated or differently-cased identifier appears once, under its first spelling — and reconciliation matches the registry's own `id`, which is why `NormalizedStation` carries it. See decision 22.
+
+Cap detection reads the drawn row count, never the returned one. The state mode filters its draw inside `fetchStations` and reports that pre-filter size back through the `onPreFilterRows` callback; the `station_ids` and `bbox` modes return their draw unfiltered and report nothing, because there the rows returned are the rows drawn. `upstreamRows` is emitted only where a filter moved the count, since elsewhere it would restate `shown`. An empty result stays `station_not_found` and carries no disclosure.
 
 ---
 
@@ -477,6 +489,28 @@ Two-part ranges carry no trailing lowercase run and are preserved unsplit, match
 
 Turbulence is untouched. Its intensities were clean codes across the same corpus, and its bounds keep a zero: `tbBas1: 0` occurs on reports whose raw range reads `030-SFC` or `SFC-060` — a genuine surface-based chop layer — so mirroring the cloud-layer zero-as-unknown rule onto it would fabricate an unknown out of a correct reading. The one class of zero icing bound observed (`icgBas2: 0`) sits entirely on synthesized layers and disappears with the rule above, so no separate zero rule is needed for icing either.
 
+**21. An empty cloud array is not a sky condition, and the condition is read off the record rather than the raw text.**
+AWC encodes no cloud layer for any sky-condition group that carries no height, so a clear report, an obscuration whose vertical visibility the station could not determine, and a report that stated no sky condition at all arrive as the same empty array. 585 of 1,849 distinct METARs across 22 regional draws have one; 488 of those stated a condition and 97 stated nothing. Rendering all of them `Clear` asserted a sky state for the 97 and inverted the obscurations — the `VV///` records, reported IFR and LIFR, read as a clear sky.
+
+*The discriminator is already a structured field.* The METAR record's own `cover` holds `CLR`/`SKC`/`CAVOK` on a clear report and `OVX` on a `VV///` obscuration, and the key is **absent from the JSON** — not null — when nothing was read. Two upstream states feed that absence and want the same answer: a station that sent no sky group (54 of the 97) and a sensor that sent a degraded `//////` (16). Nothing needs to be parsed out of `raw_metar`, which is what keeps this from re-deriving the decoding AWC already did. `cover` is not carried when layers exist: it restates them, and it does so inconsistently — 2 of 654 layered records disagree with the most-significant layer, both on a `CB` group.
+
+*A `CLR` value reads wider than the AIM's definition.* AWC folds `NCD` and `NSC` into `CLR` — 88 of 591 — so the rendered reading stays at "clear or no significant cloud reported" rather than naming the AIM's 12,000 ft automated-station threshold, which 15% of the records would not support.
+
+*The TAF side needed the same field for a different reason, and the two agree only where the products do.* A forecast period has no summary field, and the empty array there has two causes rather than three. The dominant one is an explicit clear-sky forecast: AWC publishes `SKC` or `NSC` as a cover with a null base, which `normalizeTafClouds` drops for having no height — 546 of the 723 live periods that normalize to no layers, spread across base, `FM`, `BECMG`, and `PROB` groups alike. The rest, 176 of them and all but one a `TEMPO` or `PROB` group, carried no cloud element at all, where the prevailing forecast's cloud stands unchanged and `Clear` invented a forecast nobody issued. So `sky_condition` on a period is the cover of the heightless layer, which upstream never pairs with a layer carrying a height (0 of 3,349 periods).
+
+That split is what the two tools' wording follows. They state a reported clear sky identically — an `SKC` group renders `SKC (sky clear)` on both — because a clear-sky group carrying no layer height means the same thing in an observation and in a forecast. They diverge exactly where the causes diverge: a METAR with nothing reported says the observation carried no sky-condition group, while a `TEMPO`, `PROB`, or `BECMG` group with no cloud element says the prevailing forecast stands. Forcing one string onto both would have restored the original defect in a quieter form.
+
+*The ceiling reading follows from the same field.* `ceiling_ft` is null both where no broken, overcast, or obscuration layer was reported and where a `VV///` obscuration gave no height, and `**Ceiling:** none` asserted the first for both — on records flagged IFR and LIFR, which is where the claim costs most. The two are separated by `sky_condition`, which is `OVX` exactly in the second case, so the undetermined obscuration now reads as not determinable and the numeric `VVhhh` records keep publishing their height with the indefinite qualifier they already had (5 of the 8 `OVX` records in the 1,849-record corpus, down to a surface-level `VV000` at 0 ft). `ceiling_type` is untouched and stays null exactly when `ceiling_ft` is — the pairing decision 12 established. Keying on `sky_condition` rather than on `raw_metar` also keeps the reading off a `VV` group inside a forecast clause: live `USTR … NSC … TEMPO 0300 FG VV002` reports no obscuration at all and correctly renders no ceiling.
+
+**22. `aviation_find_stations` names the cause of a missing identifier, because here there is only one.**
+Decision 17 kept the weather tools' `missing` flat and their notice cause-free: a station can drop out of a METAR or TAF batch three ways and the response cannot tell them apart. Neither ambiguating cause exists on `stationinfo`. The endpoint accepts only `ids`, `bbox`, and `format` — no lookback window a station can fall outside of — and it returns a registered station's row whatever products that station carries; `KAWO` comes back on its `siteType: ["METAR"]` entry regardless of whether it has reported anything. A 20-ID batch of 17 valid identifiers returns all 17, so batch position and size cost nothing either. One cause remains and it is assertable: the identifier did not resolve to a row in the AWC station registry.
+
+*The claim stops at the registry.* `EGTF` (Fairoaks) and `LFOX` (Étampes) are real ICAO-identified aerodromes that answer HTTP 204, so absence from AWC's station list says nothing about whether the airport exists, and the notice says so. It also splits the two fixes, which is the part decision 17 could not afford: an identifier that is not four letters cannot reach the registry at all — `SEA` is Seattle-Tacoma's IATA code and resolves nothing even though KSEA's entry carries it — while an ICAO-shaped identifier the registry does not carry wants a `bbox` or `state` search instead. Both are decidable from what the handler already holds; the equivalent split on the weather tools would have cost a second upstream request and still failed.
+
+*Reconciliation matches the registry's own `id`, and every other key is wrong.* Upstream reorders results alphabetically, so array position mismatches; it case-folds, so exact strings report `ksea` missing; it de-duplicates, so counts report a phantom gap; and 375 of 1,600 rows across four bbox draws carry null ICAO, IATA, and FAA identifiers, so `icao_id` reports an identifier-less station that did resolve. `id` is present on every row and equals `icaoId` wherever that is non-null (0 divergences in 1,600). The IATA and FAA aliases are deliberately not matched — doing so would resolve a requested `SEA` against KSEA's own alias and hide the exact miss the disclosure exists to name. `NormalizedStation` carries `id` for this and the output schema does not publish it, which keeps the `stations` payload unchanged; publishing it would also give the identifier-less rows something to be addressed by, and is left to its own change.
+
+*The whole-batch miss stays an error.* When nothing resolves, AWC answers HTTP 204, the service maps it to an empty array, and `station_not_found` fires with its recovery hint before any reconciliation runs — as do `missing_search_criteria`, `conflicting_location`, `invalid_bbox`, and `invalid_state`, in their existing order.
+
 ---
 
 ## Known Limitations
@@ -487,7 +521,7 @@ Turbulence is untouched. Its intensities were clean codes across the same corpus
 - **400-row result cap:** Every endpoint returns at most 400 entries and offers no pagination surface. `aviation_find_stations` (bbox and state modes) and `aviation_get_pireps` can reach it; both disclose a capped result and name the levers that narrow the query before the cap applies. `aviation_get_pireps` also pushes `min_intensity` and, where the requested band fits the upstream ±3,000 ft width, the altitude bounds — so those queries reach the cap less often to begin with (decision 19). The other three tools' input limits keep them well below it. See decision 18.
 - **Not an official briefing:** This data does not constitute a regulatory-compliant preflight weather briefing. Pilots flying IFR or in controlled airspace must use an authorized source.
 - **AIRSIGMET scope:** The endpoint serves domestic SIGMETs only and cannot return an AIRMET, so `aviation_get_advisories` rejects an AIRMET request rather than answering it (see decision 2); G-AIRMET and textual AIRMET support is tracked in #29. During fair-weather periods no SIGMETs may be active — absence of results is a valid state, not an error.
-- **Empty cloud arrays are ambiguous:** AWC does not encode a clear sky as a layer — a METAR reporting `CLR` and one carrying no sky-condition group at all both arrive as `clouds: []`. Both currently render as `Clear`, which overstates the second case and is the one place the "never state what the structured result does not support" rule above is not yet honored. Separating them requires inspecting the raw observation; tracked in #27.
+- **An empty cloud array carries no sky condition on its own:** AWC encodes no layer for a group with no height, so a `CLR` report, a `VV///` obscuration, and a report that stated no sky condition all arrive as `clouds: []`. `sky_condition` separates them on both response surfaces, and an empty array beside a null reads as unreported rather than clear (decision 21). What stays unavailable is the sky above a station that reported none — no field recovers it, and neither response surface claims otherwise.
 
 ---
 

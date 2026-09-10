@@ -34,6 +34,7 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 const ksea: NormalizedStation = {
+  id: 'KSEA',
   icao_id: 'KSEA',
   iata_id: 'SEA',
   faa_id: 'SEA',
@@ -47,6 +48,7 @@ const ksea: NormalizedStation = {
 };
 
 const kbfi: NormalizedStation = {
+  id: 'KBFI',
   icao_id: 'KBFI',
   iata_id: null,
   faa_id: 'BFI',
@@ -65,6 +67,7 @@ const kbfi: NormalizedStation = {
  * own; KDCA/KIAD/KBWI all carry VA or MD.
  */
 const wasd2: NormalizedStation = {
+  id: 'WASD2',
   icao_id: null,
   iata_id: null,
   faa_id: null,
@@ -87,6 +90,7 @@ const kseaPrecise: NormalizedStation = { ...ksea, lat: 47.44467, lon: -122.31442
  */
 const k2s8: NormalizedStation = {
   ...ksea,
+  id: 'K2S8',
   icao_id: 'K2S8',
   iata_id: null,
   faa_id: null,
@@ -98,6 +102,7 @@ const k2s8: NormalizedStation = {
 
 /** Akutan, AK — AWC carries no elevation for it, so the height is unknown. */
 const kkqa: NormalizedStation = {
+  id: 'KKQA',
   icao_id: 'KKQA',
   iata_id: null,
   faa_id: 'KQA',
@@ -497,6 +502,7 @@ describe('aviationFindStations truncation disclosure', () => {
   function page(count: number, state = 'TX'): NormalizedStation[] {
     return Array.from({ length: count }, (_, i) => ({
       ...ksea,
+      id: `K${String(i).padStart(3, '0')}`,
       icao_id: `K${String(i).padStart(3, '0')}`,
       name: `Station ${i}`,
       state,
@@ -621,5 +627,236 @@ describe('aviationFindStations truncation disclosure', () => {
     const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
     expect(text).toContain('## Seattle-Tacoma International Airport');
     expect(text).toContain('**Data types:** METAR, TAF, SYNOP');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Partial-batch disclosure (issue #31) — `stationinfo` omits an identifier that
+// resolved to nothing with no marker at all, so a short list read as a full one
+// ---------------------------------------------------------------------------
+
+describe('aviationFindStations partial-batch disclosure', () => {
+  /** A second airport, so a batch can come back short. */
+  const kjfk: NormalizedStation = {
+    ...ksea,
+    id: 'KJFK',
+    icao_id: 'KJFK',
+    iata_id: 'JFK',
+    faa_id: 'JFK',
+    name: 'New York/JF Kennedy Intl',
+    state: 'NY',
+  };
+
+  /**
+   * A registry entry with no ICAO, IATA, or FAA identifier — 375 of 1,600 rows
+   * across four live bbox draws. It resolves by the registry's own `id`, so
+   * reconciling on `icao_id` would report a station that came back as missing.
+   */
+  const nuet2: NormalizedStation = {
+    ...wasd2,
+    id: 'NUET2',
+    name: 'Nueces Bay',
+    lat: 27.833,
+    lon: -97.486,
+    state: 'TX',
+  };
+
+  /** Run the handler over a station_ids lookup and return its enrichment. */
+  async function enrichmentFor(station_ids: string[], stations: NormalizedStation[]) {
+    mockFetchStations.mockResolvedValue(stations);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    await aviationFindStations.handler(aviationFindStations.input.parse({ station_ids }), ctx);
+    return getEnrichment(ctx);
+  }
+
+  it('names the identifier that resolved to nothing', async () => {
+    expect(await enrichmentFor(['KSEA', 'KZZZ'], [ksea])).toMatchObject({
+      requested: ['KSEA', 'KZZZ'],
+      returned: ['KSEA'],
+      partial: true,
+      missing: ['KZZZ'],
+    });
+  });
+
+  it('states completeness affirmatively on a full batch', async () => {
+    const enrichment = await enrichmentFor(['KSEA', 'KJFK'], [ksea, kjfk]);
+
+    expect(enrichment).toMatchObject({
+      requested: ['KSEA', 'KJFK'],
+      returned: ['KSEA', 'KJFK'],
+      partial: false,
+    });
+    expect(enrichment).not.toHaveProperty('missing');
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('treats a case difference as resolved, not as an omission', async () => {
+    // Upstream case-folds `ksea` into the KSEA row, so exact-string matching
+    // would report a station that did resolve.
+    expect(await enrichmentFor(['KSEA', 'ksea'], [ksea])).toMatchObject({
+      requested: ['KSEA', 'ksea'],
+      returned: ['KSEA'],
+      partial: false,
+    });
+  });
+
+  it('treats a duplicate as resolved, not as an omission', async () => {
+    // Upstream collapses `KSEA,KSEA` to one row, so comparing counts reports a
+    // missing station that was never missing.
+    expect(await enrichmentFor(['KSEA', 'KSEA'], [ksea])).toMatchObject({
+      returned: ['KSEA'],
+      partial: false,
+    });
+  });
+
+  it('names a repeated unresolved identifier once, the way a resolved one is', async () => {
+    // `missing` deduplicates on the same key `returned` does, so a request
+    // naming one unknown identifier twice does not report it twice or repeat it
+    // in the notice.
+    const enrichment = await enrichmentFor(['KSEA', 'KZZZ', 'kzzz'], [ksea]);
+
+    expect(enrichment).toMatchObject({
+      requested: ['KSEA', 'KZZZ', 'kzzz'],
+      returned: ['KSEA'],
+      missing: ['KZZZ'],
+      partial: true,
+    });
+    expect(String(enrichment.notice).match(/KZZZ/gi)).toHaveLength(1);
+  });
+
+  it('reports an identifier-less station as returned when asked for by registry ID', async () => {
+    expect(await enrichmentFor(['NUET2'], [nuet2])).toMatchObject({
+      returned: ['NUET2'],
+      partial: false,
+    });
+  });
+
+  it('reconciles against the identifiers upstream returned, not the request order', async () => {
+    // A four-ID request comes back alphabetically ordered, so matching by array
+    // position reports the wrong identifiers as missing.
+    expect(await enrichmentFor(['KSEA', 'KJFK', 'KZZZ'], [kjfk, ksea])).toMatchObject({
+      returned: ['KSEA', 'KJFK'],
+      missing: ['KZZZ'],
+      partial: true,
+    });
+  });
+
+  it('states the registry as the cause, scoped to the registry', async () => {
+    // `EGTF` and `LFOX` are real ICAO-identified aerodromes that AWC does not
+    // carry, so the notice must not claim the airport does not exist.
+    const notice = String((await enrichmentFor(['KSEA', 'EGTF'], [ksea])).notice);
+
+    expect(notice).toContain('EGTF');
+    expect(notice).toMatch(/AWC station registry/);
+    expect(notice).not.toMatch(/no such airport|does not exist|is not an airport/i);
+  });
+
+  it('separates an identifier that is not in ICAO format', async () => {
+    // `SEA` is Seattle-Tacoma's IATA code. The fix is a different one from an
+    // ICAO-shaped ID the registry does not carry, so the guidance splits.
+    const enrichment = await enrichmentFor(['KSEA', 'SEA', 'KZZZ'], [ksea]);
+    const notice = String(enrichment.notice);
+
+    expect(enrichment).toMatchObject({ missing: ['SEA', 'KZZZ'] });
+    expect(notice).toMatch(/Not in ICAO format: SEA/);
+    expect(notice).toMatch(/Not present in the AWC station registry: KZZZ/);
+  });
+
+  it('still throws rather than disclosing an empty result as a partial one', async () => {
+    mockFetchStations.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: ['KZZZ', 'KZZY'] });
+
+    await expect(aviationFindStations.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'station_not_found' },
+    });
+    expect(getEnrichment(ctx)).not.toHaveProperty('partial');
+  });
+
+  it('leaves the bbox and state modes without a partial disclosure', async () => {
+    mockFetchStations.mockResolvedValue([ksea, kbfi]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    await aviationFindStations.handler(
+      aviationFindStations.input.parse({
+        bbox: { minLat: 47, minLon: -123, maxLat: 48, maxLon: -122 },
+      }),
+      ctx,
+    );
+    const enrichment = getEnrichment(ctx);
+
+    expect(enrichment).toMatchObject({ truncated: false, shown: 2 });
+    expect(enrichment).not.toHaveProperty('partial');
+    expect(enrichment).not.toHaveProperty('requested');
+    expect(enrichment).not.toHaveProperty('missing');
+  });
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    mockFetchStations.mockResolvedValue([ksea]);
+    const result = await runToolContract(aviationFindStations, {
+      station_ids: ['KSEA', 'SEA', 'KZZZ'],
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      requested: ['KSEA', 'SEA', 'KZZZ'],
+      returned: ['KSEA'],
+      partial: true,
+      missing: ['SEA', 'KZZZ'],
+    });
+
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('SEA');
+    expect(text).toContain('KZZZ');
+    expect(text).toMatch(/AWC station registry/);
+  });
+
+  it('leaves the stations payload and its rendering untouched', async () => {
+    mockFetchStations.mockResolvedValue([ksea]);
+    const result = await runToolContract(aviationFindStations, {
+      station_ids: ['KSEA', 'KZZZ'],
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      stations: [expect.objectContaining({ icao_id: 'KSEA' })],
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('## Seattle-Tacoma International Airport');
+    expect(text).toContain('**Data types:** METAR, TAF, SYNOP');
+  });
+
+  it('does not publish the registry ID it reconciles against', async () => {
+    // Carried on the normalized record for reconciliation only — adding it to
+    // the output schema would change the stations payload.
+    mockFetchStations.mockResolvedValue([ksea]);
+    const result = await runToolContract(aviationFindStations, { station_ids: ['KSEA'] });
+    const [station] = (result.structuredContent as { stations: Record<string, unknown>[] })
+      .stations;
+
+    expect(station).not.toHaveProperty('id');
+  });
+
+  it('reports the cap and the reconciliation together without conflating them', async () => {
+    // A station_ids lookup is bounded at 20 by the schema and can never reach
+    // the 400-row cap, so its truncated:false stands beside a partial batch
+    // rather than competing with it for the shared notice.
+    const enrichment = await enrichmentFor(['KSEA', 'KZZZ'], [ksea]);
+
+    expect(enrichment).toMatchObject({ truncated: false, shown: 1, partial: true });
+    expect(enrichment).not.toHaveProperty('cap');
+    expect(String(enrichment.notice)).not.toMatch(/row cap|per-request maximum/);
+  });
+
+  it.each([
+    [{}, 'missing_search_criteria'],
+    [{ station_ids: ['KSEA'], state: 'WA' }, 'conflicting_location'],
+    [{ bbox: { minLat: 49, minLon: -66, maxLat: 25, maxLon: -125 } }, 'invalid_bbox'],
+    [{ state: 'ZZ' }, 'invalid_state'],
+  ])('runs the %o guard ahead of any reconciliation work', async (input, reason) => {
+    mockFetchStations.mockResolvedValue([ksea]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+
+    await expect(
+      aviationFindStations.handler(aviationFindStations.input.parse(input), ctx),
+    ).rejects.toMatchObject({ data: { reason } });
+    expect(getEnrichment(ctx)).not.toHaveProperty('partial');
   });
 });

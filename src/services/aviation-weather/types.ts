@@ -12,7 +12,15 @@
 export interface RawMetar {
   altim: number | null;
   clouds: RawCloudLayer[] | null;
-  cover: string | null; // sky cover summary
+  /**
+   * The sky-condition summary AWC read off the observation. When `clouds` is
+   * empty this is the whole sky statement — `CLR`/`SKC`/`CAVOK` for a clear or
+   * insignificant-cloud report, `OVX` for a `VV///` obscuration whose height the
+   * station could not determine — and the key is **absent from the JSON**, not
+   * null, when the observation carried no readable sky-condition group at all.
+   * When `clouds` carries layers this restates them and adds nothing.
+   */
+  cover?: string | null;
   dewp: number | null;
   elev: number | null;
   fltCat: string | null; // flight category: 'VFR' | 'MVFR' | 'IFR' | 'LIFR'
@@ -52,7 +60,7 @@ export interface RawCloudLayer {
 export interface RawTafForecastPeriod {
   altim?: number | null;
   clouds: RawTafCloudLayer[] | null;
-  fcstChange: string | null; // 'FM', 'TEMPO', 'BECMG', or null
+  fcstChange: string | null; // 'FM', 'TEMPO', 'BECMG', 'PROB', or null
   icgTurb?: string | null;
   notDecoded?: string | null;
   probability: number | null;
@@ -232,6 +240,15 @@ export interface NormalizedMetar {
   /** Null when the observation carried no weather group. */
   present_weather: NormalizedPresentWeather | null;
   raw_metar: string;
+  /**
+   * The sky condition the observation stated when it published no layer
+   * heights — `CLR`, `SKC`, `CAVOK`, or `OVX` for an obscuration whose layer
+   * carried no height. Null when `clouds` carries layers (they are
+   * the statement) and also when the observation carried no sky-condition group
+   * at all, which `clouds` being empty separates: an empty `clouds` beside a
+   * null here is an unreported sky, never a clear one.
+   */
+  sky_condition: string | null;
   station_id: string;
   temp_c: number | null;
   visibility_sm: string;
@@ -269,6 +286,16 @@ export interface NormalizedTafPeriod {
   clouds: NormalizedTafCloudLayer[];
   from: string; // ISO 8601
   probability: number | null;
+  /**
+   * The sky condition this period forecast when it published no layer heights —
+   * `SKC` or `NSC` for a clear or insignificant-cloud forecast, which AWC
+   * publishes as a cover with a null base and no height to render. Null when
+   * `clouds` carries layers (they are the statement) and also when the period
+   * carried no cloud element at all, which `clouds` being empty separates: an
+   * empty `clouds` beside a null here forecasts nothing about cloud. On a TEMPO
+   * or PROB group that means the prevailing forecast's cloud stands unchanged.
+   */
+  sky_condition: string | null;
   to: string; // ISO 8601
   /**
    * Vertical visibility into a forecast obscuration, in feet AGL — the TAF
@@ -364,6 +391,18 @@ export interface NormalizedStation {
   faa_id: string | null;
   iata_id: string | null;
   icao_id: string | null;
+  /**
+   * The registry's own identifier, and the only one every entry carries — 375 of
+   * 1,600 rows across four live bbox draws have null ICAO, IATA, and FAA IDs.
+   * A `stationinfo` lookup resolves against this field case-insensitively, so it
+   * is what a requested ID reconciles against; the IATA and FAA aliases resolve
+   * nothing (`SEA` returns no row even though KSEA's entry carries it).
+   *
+   * Carried for that reconciliation and deliberately absent from the tool's
+   * output schema, which strips it — publishing it would change the `stations`
+   * payload. See decision 22 in docs/design.md.
+   */
+  id: string;
   lat: number;
   lon: number;
   name: string;

@@ -45,6 +45,7 @@ const ksea: NormalizedMetar = {
   ceiling_ft: null,
   ceiling_type: null,
   clouds: [{ cover: 'FEW', base_ft: 4500 }],
+  sky_condition: null,
   present_weather: null,
   temp_c: 8,
   dewpoint_c: 3,
@@ -71,6 +72,7 @@ const obscuredMetar: NormalizedMetar = {
   ceiling_ft: 200,
   ceiling_type: 'indefinite',
   clouds: [{ cover: 'OVX', base_ft: 200 }],
+  sky_condition: null,
   present_weather: { raw: 'FG', decoded: 'fog' },
   temp_c: 21,
   dewpoint_c: 21,
@@ -125,6 +127,7 @@ const sparseMetar: NormalizedMetar = {
   ceiling_ft: null,
   ceiling_type: null,
   clouds: [],
+  sky_condition: null,
   present_weather: null,
   temp_c: null,
   dewpoint_c: null,
@@ -150,11 +153,65 @@ const calmMetar: NormalizedMetar = {
   ceiling_ft: null,
   ceiling_type: null,
   clouds: [],
+  sky_condition: 'CLR',
   present_weather: null,
   temp_c: 0,
   dewpoint_c: 0,
   altimeter_inhg: 30.0,
   raw_metar: 'METAR KMSY 151800Z 00000KT 10SM CLR 00/00 A3000',
+};
+
+/**
+ * An explicit clear report. `SPECI KVCT 131049Z AUTO 15005KT 2 1/2SM BR CLR
+ * 25/24 A2995` — AWC encodes no layer for a `CLR` group and states the
+ * condition in the record's own `cover` field instead.
+ */
+const clearMetar: NormalizedMetar = {
+  ...ksea,
+  station_id: 'KVCT',
+  name: 'Victoria Rgnl',
+  clouds: [],
+  ceiling_ft: null,
+  ceiling_type: null,
+  sky_condition: 'CLR',
+  raw_metar: 'SPECI KVCT 131049Z AUTO 15005KT 2 1/2SM BR CLR 25/24 A2995 RMK AO2',
+};
+
+/**
+ * An observation carrying no sky-condition group at all — an AO1 station whose
+ * sensor reports none. `METAR KJDN 131048Z AUTO 03008KT 14/12 A3002 RMK AO1`
+ * arrives with an empty cloud array and no `cover` field, the same empty array
+ * a `CLR` report produces.
+ */
+const unreportedSkyMetar: NormalizedMetar = {
+  ...ksea,
+  station_id: 'KJDN',
+  name: 'Jordan',
+  clouds: [],
+  ceiling_ft: null,
+  ceiling_type: null,
+  sky_condition: null,
+  raw_metar: 'METAR KJDN 131048Z AUTO 03008KT 14/12 A3002 RMK AO1 SLP155 P0006 T0139',
+};
+
+/**
+ * An obscuration whose vertical visibility the station could not determine —
+ * `METAR WBGG 092300Z 00000KT 2000 HZ VV/// 24/24 Q1009`, reported IFR. AWC
+ * publishes no layer for a `VV///` group and carries `OVX` in `cover`, so this
+ * lands in the same empty cloud array as a clear sky while meaning its opposite.
+ */
+const indeterminateObscurationMetar: NormalizedMetar = {
+  ...ksea,
+  station_id: 'WBGG',
+  name: 'Kuching',
+  flight_category: 'IFR',
+  visibility_sm: '1.25',
+  clouds: [],
+  ceiling_ft: null,
+  ceiling_type: null,
+  sky_condition: 'OVX',
+  present_weather: { raw: 'HZ', decoded: 'haze' },
+  raw_metar: 'METAR WBGG 092300Z 00000KT 2000 HZ VV/// 24/24 Q1009 NOSIG',
 };
 
 // ---------------------------------------------------------------------------
@@ -449,11 +506,10 @@ describe('aviationGetMetar.format', () => {
     expect(text).toContain('25');
   });
 
-  it('renders "Clear" when no clouds', () => {
-    const obs: NormalizedMetar = { ...ksea, clouds: [], ceiling_ft: null };
-    const blocks = aviationGetMetar.format!({ observations: [obs] });
+  it('renders the sky condition an observation with no layers reported', () => {
+    const blocks = aviationGetMetar.format!({ observations: [clearMetar] });
     const text = (blocks[0] as { type: string; text: string }).text;
-    expect(text).toContain('Clear');
+    expect(text).toContain('**Clouds:** CLR');
   });
 
   it('renders cloud layers when present', () => {
@@ -723,5 +779,224 @@ describe('aviationGetMetar partial-batch disclosure', () => {
     });
     const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
     expect(text).toContain('## KSEA — Seattle-Tacoma International Airport');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reported clear sky vs. unreported sky (issue #27) — AWC encodes no layer for
+// a clear-sky group, so a clear report and a report carrying no sky-condition
+// group arrive as the same empty array. Only one of them is a clear sky.
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar sky condition', () => {
+  /** Render one observation and return its text block. */
+  function render(obs: NormalizedMetar): string {
+    const blocks = aviationGetMetar.format!({ observations: [obs] });
+    return (blocks[0] as { type: string; text: string }).text;
+  }
+
+  it('renders a reported clear sky as the code the observation carried', () => {
+    expect(render(clearMetar)).toContain(
+      '**Clouds:** CLR (clear or no significant cloud reported)',
+    );
+  });
+
+  it('renders an unreported sky as unreported, never as clear', () => {
+    const text = render(unreportedSkyMetar);
+
+    expect(text).toContain('**Clouds:** not reported');
+    expect(text).not.toMatch(/\*\*Clouds:\*\* Clear/);
+    expect(text).not.toMatch(/\bclear\b/i);
+  });
+
+  it('renders an obscuration with no determinable height as obscured, never as clear', () => {
+    // `VV///` — the sky is obscured and the station could not measure how far up
+    // it can see. Rendering this as a clear sky inverts an IFR observation.
+    const text = render(indeterminateObscurationMetar);
+
+    expect(text).toContain('**Clouds:** OVX (sky obscured — no layer height reported)');
+    expect(text).not.toMatch(/\bclear\b/i);
+  });
+
+  it.each([
+    ['CAVOK', 'ceiling and visibility OK'],
+    ['SKC', 'sky clear'],
+  ])('renders a %s report as its own condition', (code, reading) => {
+    expect(render({ ...clearMetar, sky_condition: code })).toContain(
+      `**Clouds:** ${code} (${reading})`,
+    );
+  });
+
+  it('leaves an observation with real layers rendering exactly as before', () => {
+    expect(render(overcastMetar)).toContain('**Clouds:** SCT @ 500 ft, OVC @ 900 ft');
+  });
+
+  it('carries the distinction on structuredContent, not only in the rendered text', async () => {
+    mockFetchMetar.mockResolvedValue([clearMetar, unreportedSkyMetar]);
+    const result = await runToolContract(aviationGetMetar, {
+      station_ids: ['KVCT', 'KJDN'],
+      hours: 1,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      observations: [
+        expect.objectContaining({ station_id: 'KVCT', sky_condition: 'CLR', clouds: [] }),
+        expect.objectContaining({ station_id: 'KJDN', sky_condition: null, clouds: [] }),
+      ],
+    });
+  });
+
+  it('reaches a content[]-only client with both states distinguishable', async () => {
+    mockFetchMetar.mockResolvedValue([clearMetar, unreportedSkyMetar]);
+    const result = await runToolContract(aviationGetMetar, {
+      station_ids: ['KVCT', 'KJDN'],
+      hours: 1,
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+
+    expect(text).toContain('**Clouds:** CLR');
+    expect(text).toContain('**Clouds:** not reported');
+  });
+
+  it('leaves an obscuration that does carry a height reading as a layer', () => {
+    // Regression on decision 12 — a `VV002` group still decodes to an OVX layer
+    // with an indefinite ceiling, and states no separate sky condition.
+    const text = render(obscuredMetar);
+
+    expect(text).toContain('**Clouds:** OVX @ 200 ft');
+    expect(text).toContain('**Ceiling:** 200 ft');
+    expect(text).toContain('indefinite');
+  });
+
+  it('names the empty-array ambiguity in the clouds description', () => {
+    const clouds =
+      aviationGetMetar.output.shape.observations.element.shape.clouds.description ?? '';
+
+    expect(clouds).toMatch(/sky_condition/);
+  });
+
+  it('states in the sky_condition description that a null with no layers is unreported', () => {
+    const sky =
+      aviationGetMetar.output.shape.observations.element.shape.sky_condition.description ?? '';
+
+    expect(sky).toMatch(/never a clear one|not.*clear/i);
+    expect(sky).toMatch(/OVX/);
+  });
+
+  it('describes the OVX marker by the layer height it lacks, not by an undetermined measurement', () => {
+    // The field is set from an empty cloud array alone, and `computeCeiling`'s
+    // documented vertVis backstop reaches that state on an observation whose
+    // vertical visibility *was* determined: AWC publishes the OVX layer with a
+    // null base and holds the height on the record. What OVX marks there is a
+    // layer that carried no height, which is true in both cases.
+    const sky =
+      aviationGetMetar.output.shape.observations.element.shape.sky_condition.description ?? '';
+
+    expect(sky).toMatch(/carried no height/i);
+    expect(sky).not.toMatch(/could not determine/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An undetermined ceiling is not the absence of one — the same never-assert
+// rule as the sky condition above, one field over
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar ceiling on an obscuration of undetermined height', () => {
+  /** Render one observation and return its text block. */
+  function render(obs: NormalizedMetar): string {
+    const blocks = aviationGetMetar.format!({ observations: [obs] });
+    return (blocks[0] as { type: string; text: string }).text;
+  }
+
+  it('renders a VV/// obscuration as not determinable rather than as no ceiling', () => {
+    // `METAR VOGA 092300Z 00000KT 0100 ... FG VV/// 27/26 Q1011`, reported
+    // LIFR. FAA AIM 7-1-29 counts vertical visibility into an obscuration as a
+    // ceiling, so this report has one and its height is what is missing.
+    const text = render(indeterminateObscurationMetar);
+
+    expect(text).toContain('**Ceiling:** not determinable');
+    expect(text).not.toContain('**Ceiling:** none');
+  });
+
+  it('still renders no ceiling as none when no such layer was reported', () => {
+    // A few or scattered layer over a station with no ceiling — `none` is the
+    // correct reading there, and the two must not collapse into one word.
+    const text = render(ksea);
+
+    expect(text).toContain('**Ceiling:** none');
+    expect(text).not.toContain('not determinable');
+  });
+
+  it('leaves a numeric vertical visibility rendering its height', () => {
+    // Regression: `VV002` publishes a layer and a height, and that path was
+    // already correct. 5 of the 8 OVX records in a 1,849-record live corpus.
+    const text = render(obscuredMetar);
+
+    expect(text).toContain(
+      '**Ceiling:** 200 ft (indefinite — vertical visibility into an obscuration)',
+    );
+    expect(text).not.toContain('not determinable');
+  });
+
+  it('keeps a surface-level indefinite ceiling at 0 ft rather than reading it as absent', () => {
+    // `SPECI USCC ... FG VV000`, reported LIFR — the most hazardous value the
+    // field holds and the one a truthiness guard drops.
+    const text = render({
+      ...obscuredMetar,
+      ceiling_ft: 0,
+      clouds: [{ cover: 'OVX', base_ft: 0 }],
+    });
+
+    expect(text).toContain('**Ceiling:** 0 ft (indefinite');
+    expect(text).not.toContain('not determinable');
+  });
+
+  it('states both meanings of a null ceiling in the ceiling_ft description', () => {
+    const description =
+      aviationGetMetar.output.shape.observations.element.shape.ceiling_ft.description ?? '';
+
+    expect(description).toMatch(/determin/i);
+    expect(description).toMatch(/OVX|obscuration/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rendered unreported states carry no unit, and input descriptions state what
+// the endpoint does rather than what a caller might assume
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar description and unit accuracy', () => {
+  it('renders an unreported visibility without a unit', () => {
+    const blocks = aviationGetMetar.format!({ observations: [sparseMetar] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('**Visibility:** not reported');
+    expect(text).not.toContain('unknown sm');
+  });
+
+  it('still renders a reported visibility with its unit', () => {
+    const blocks = aviationGetMetar.format!({ observations: [ksea] });
+    const text = (blocks[0] as { type: string; text: string }).text;
+
+    expect(text).toContain('**Visibility:** 10+ sm');
+  });
+
+  it('does not claim the default hours returns one observation per station', () => {
+    // `hours` is a lookback window, not a row limit. At hours=1 every one of 10
+    // live half-hourly stations returned two observations, against one each
+    // from 9 hourly-reporting US majors.
+    const description = aviationGetMetar.input.shape.hours.description ?? '';
+
+    expect(description).not.toMatch(/only the most recent/i);
+    expect(description).toMatch(/lookback|window|every observation/i);
+  });
+
+  it('states the empty-cloud fact without instructing the reader', () => {
+    const description =
+      aviationGetMetar.output.shape.observations.element.shape.clouds.description ?? '';
+
+    expect(description).toMatch(/sky_condition/);
+    expect(description).not.toMatch(/\bread\b/i);
   });
 });

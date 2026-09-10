@@ -263,6 +263,26 @@ function metersToFeet(meters: number): number {
   return Math.round(meters * 3.28084);
 }
 
+/**
+ * The sky condition a report or forecast stated when it published no layer
+ * heights, or null when the layers themselves are the statement.
+ *
+ * AWC encodes no cloud layer for a group that carries no height — `CLR`, `SKC`,
+ * `CAVOK`, `NSC`, and the `VV///` obscuration whose vertical visibility the
+ * station could not determine — so all of them arrive as an empty cloud array,
+ * indistinguishable from an observation that carried no sky-condition group at
+ * all. 585 of 1,849 distinct live METARs across 22 regional draws have an empty
+ * array; 97 of those reported nothing, and the rest stated a condition. Reading
+ * the condition off the record is what separates them, and the empty array is
+ * then the unreported state on its own.
+ */
+function skyConditionWithoutLayers(
+  layers: readonly unknown[],
+  stated: string | null | undefined,
+): string | null {
+  return layers.length === 0 ? strOrNull(stated) : null;
+}
+
 function normalizeMetar(raw: RawMetar): NormalizedMetar {
   const clouds = normalizeClouds(raw.clouds);
   const visib =
@@ -287,6 +307,9 @@ function normalizeMetar(raw: RawMetar): NormalizedMetar {
     // without knowing whether it was measured or seen up into an obscuration.
     ...computeCeiling(clouds, verticalVisibilityFeet(raw.vertVis)),
     clouds,
+    // `cover` is the record's own sky-condition summary and the only field that
+    // separates a reported clear sky from a station that reported none.
+    sky_condition: skyConditionWithoutLayers(clouds, raw.cover),
     present_weather: normalizePresentWeather(raw.wxString),
     temp_c: raw.temp ?? null,
     dewpoint_c: raw.dewp ?? null,
@@ -374,6 +397,12 @@ function normalizeTafPeriod(p: RawTafForecastPeriod): NormalizedTafPeriod {
     vertical_visibility_ft: verticalVisibilityFt,
     weather: normalizePresentWeather(p.wxString),
     clouds,
+    // The TAF endpoint has no summary field to read, so the statement is the
+    // cover of the layer that carried no height — the one `normalizeTafClouds`
+    // just dropped. Upstream never pairs such a layer with one carrying a
+    // height (0 of 3,349 live periods across six regional draws), so a period
+    // left with no layers has at most one cover to state.
+    sky_condition: skyConditionWithoutLayers(clouds, p.clouds?.[0]?.cover),
   };
 }
 
@@ -578,6 +607,7 @@ function normalizeAdvisory(raw: RawAirSigmet): NormalizedAdvisory {
 
 function normalizeStation(raw: RawStationInfo): NormalizedStation {
   return {
+    id: raw.id,
     icao_id: raw.icaoId || null,
     iata_id: raw.iataId || null,
     faa_id: raw.faaId || null,

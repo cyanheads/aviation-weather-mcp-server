@@ -42,6 +42,7 @@ const basePeriod: NormalizedTafPeriod = {
   vertical_visibility_ft: null,
   weather: { raw: '-RA', decoded: 'light rain' },
   clouds: [{ cover: 'BKN', base_ft: 2500, type: null }],
+  sky_condition: null,
 };
 
 const tempoPeriod: NormalizedTafPeriod = {
@@ -58,6 +59,7 @@ const tempoPeriod: NormalizedTafPeriod = {
     { cover: 'OVC', base_ft: 800, type: null },
     { cover: 'BKN', base_ft: 1500, type: 'CB' },
   ],
+  sky_condition: null,
 };
 
 /** TAF with epoch-seconds timestamps (as issued by the service after normalization). */
@@ -90,6 +92,7 @@ const sparseTaf: NormalizedTaf = {
       vertical_visibility_ft: null,
       weather: null,
       clouds: [],
+      sky_condition: 'NSC',
     },
   ],
   raw_taf: 'KLAX 151200Z 1512/1612 27008KT CAVOK',
@@ -111,6 +114,7 @@ const windlessPeriod: NormalizedTafPeriod = {
   vertical_visibility_ft: null,
   weather: { raw: 'BR', decoded: 'mist' },
   clouds: [],
+  sky_condition: null,
 };
 
 /**
@@ -411,10 +415,10 @@ describe('aviationGetTaf.format unreported states', () => {
     expect(text).toContain('**Weather:** not specified');
   });
 
-  it('renders an empty cloud array the way aviation_get_metar does', () => {
-    const text = render({ ...basePeriod, clouds: [] });
+  it('renders a forecast clear sky the way aviation_get_metar does', () => {
+    const text = render({ ...basePeriod, clouds: [], sky_condition: 'SKC' });
 
-    expect(text).toContain('**Clouds:** Clear');
+    expect(text).toContain('**Clouds:** SKC (sky clear)');
   });
 
   it('renders a probability of 0 rather than treating it as absent', () => {
@@ -843,5 +847,154 @@ describe('aviationGetTaf partial-batch disclosure', () => {
     ).forecasts[0]!.forecast_periods;
     expect(periods[0]!.vertical_visibility_ft).toBe(200);
     expect(periods[1]!.wind_shear).toEqual({ height_ft: 2000, direction_deg: 200, speed_kt: 40 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Forecast clear sky vs. an unamended period (issue #27) — a period's cloud
+// array empties for two reasons, and neither of them used to be visible
+// ---------------------------------------------------------------------------
+
+describe('aviationGetTaf sky condition', () => {
+  /** A base period forecasting a clear sky — raw `... P6SM SKC`. */
+  const clearPeriod: NormalizedTafPeriod = {
+    ...basePeriod,
+    weather: null,
+    clouds: [],
+    sky_condition: 'SKC',
+  };
+
+  /** A base period forecasting no significant cloud — raw `... 9999 NSC`, or a CAVOK group. */
+  const nscPeriod: NormalizedTafPeriod = { ...clearPeriod, sky_condition: 'NSC' };
+
+  /**
+   * A TEMPO group amending only visibility and weather. It carries no cloud
+   * element at all, so the prevailing forecast's cloud stands — this is not a
+   * forecast of a clear sky, and never was.
+   */
+  const unamendedCloudPeriod: NormalizedTafPeriod = {
+    ...basePeriod,
+    change_type: 'TEMPO',
+    visibility_sm: '3',
+    weather: { raw: 'BR', decoded: 'mist' },
+    clouds: [],
+    sky_condition: null,
+  };
+
+  it('renders a forecast clear sky as the group the forecast carried', () => {
+    expect(render(clearPeriod)).toContain('**Clouds:** SKC (sky clear)');
+  });
+
+  it('renders a no-significant-cloud forecast as its own group', () => {
+    expect(render(nscPeriod)).toContain('**Clouds:** NSC (no significant cloud)');
+  });
+
+  it('renders an amendment carrying no cloud element as unamended, never as clear', () => {
+    const text = render(unamendedCloudPeriod);
+
+    expect(text).toContain('**Clouds:** not amended');
+    expect(text).not.toMatch(/\bclear\b/i);
+  });
+
+  it('renders a base period with no cloud element as unspecified, not unamended', () => {
+    // Nothing prevails ahead of a base period, so there is no forecast to leave
+    // unchanged. Live `TAF WBGG 092300Z 1000/1100 VRB03KT 2000 HZ VV///`.
+    const text = render({ ...unamendedCloudPeriod, change_type: null });
+
+    expect(text).toContain('**Clouds:** not specified');
+    expect(text).not.toContain('not amended');
+  });
+
+  it('states a reported clear sky in the same words aviation_get_metar does', () => {
+    // The two tools agree where the two upstream products mean the same thing:
+    // an explicit clear-sky group carrying no layer height. The METAR side pins
+    // the identical string in its own suite.
+    expect(render(clearPeriod)).toContain('**Clouds:** SKC (sky clear)');
+  });
+
+  it('carries the distinction on structuredContent', async () => {
+    const period = await handle(clearPeriod);
+
+    expect(period).toMatchObject({ clouds: [], sky_condition: 'SKC' });
+  });
+
+  it('reports a period carrying no cloud element as a null sky condition', async () => {
+    const period = await handle(unamendedCloudPeriod);
+
+    expect(period).toMatchObject({ clouds: [], sky_condition: null });
+  });
+
+  it('leaves a period with real layers rendering exactly as before', () => {
+    expect(render(basePeriod)).toContain('**Clouds:** BKN @ 2500 ft');
+  });
+
+  it('leaves a forecast obscuration reading as a layer', () => {
+    // Regression on decision 15 — a `VV002` group is still an OVX layer whose
+    // base is the vertical visibility, and states no separate sky condition.
+    const text = render(obscuredPeriod);
+
+    expect(text).toContain('**Clouds:** OVX @ 200 ft');
+    expect(text).toContain('**Vertical visibility:** 200 ft AGL');
+  });
+
+  it('reaches a content[]-only client with both states distinguishable', async () => {
+    mockFetchTaf.mockResolvedValue([
+      { ...kseaTaf, forecast_periods: [clearPeriod, unamendedCloudPeriod] },
+    ]);
+    const result = await runToolContract(aviationGetTaf, { station_ids: ['KSEA'] });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+
+    expect(text).toContain('**Clouds:** SKC (sky clear)');
+    expect(text).toContain('**Clouds:** not amended');
+  });
+
+  it('names the empty-array ambiguity in the clouds description', () => {
+    const periodShape =
+      aviationGetTaf.output.shape.forecasts.element.shape.forecast_periods.element.shape;
+
+    expect(periodShape.clouds.description ?? '').toMatch(/sky_condition/);
+  });
+
+  it('renders a standalone probability group carrying no cloud element as unamended', () => {
+    // A probability group with no temporary group after it arrives as PROB in
+    // its own right — 117 of 2,416 live periods, roughly one in twenty — and
+    // amends a prevailing forecast exactly as a TEMPO does. Reading it as an
+    // unamendable period would restore `Clear` on every one of them.
+    const text = render({ ...unamendedCloudPeriod, change_type: 'PROB', probability: 30 });
+
+    expect(text).toContain('**Clouds:** not amended');
+    expect(text).not.toMatch(/\bclear\b/i);
+  });
+});
+
+describe('aviationGetTaf description accuracy', () => {
+  it('states the empty-cloud fact without instructing the reader', () => {
+    const periodShape =
+      aviationGetTaf.output.shape.forecasts.element.shape.forecast_periods.element.shape;
+    const description = periodShape.clouds.description ?? '';
+
+    expect(description).toMatch(/sky_condition/);
+    expect(description).not.toMatch(/\bread\b/i);
+  });
+
+  it('names the standalone probability group as a change indicator of its own', () => {
+    // Both shapes are live and the description must carry both: a probability
+    // qualifying a temporary group arrives as TEMPO, one standing alone as
+    // PROB. Enumerating only FM/TEMPO/BECMG leaves 117 of 2,416 live periods
+    // carrying a value the field claims it never takes.
+    const periodShape =
+      aviationGetTaf.output.shape.forecasts.element.shape.forecast_periods.element.shape;
+    const description = periodShape.change_type.description ?? '';
+
+    expect(description).toMatch(/PROB/);
+    expect(description).toMatch(/standalone|standing alone/i);
+    expect(description).not.toMatch(/not an indicator of its own/i);
+  });
+
+  it('names the probability group among the indicators that leave cloud unamended', () => {
+    const periodShape =
+      aviationGetTaf.output.shape.forecasts.element.shape.forecast_periods.element.shape;
+
+    expect(periodShape.sky_condition.description ?? '').toMatch(/TEMPO, PROB, or BECMG/);
   });
 });
