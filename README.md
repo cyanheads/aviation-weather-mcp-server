@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -43,12 +43,14 @@ Five tools covering aviation weather — station lookup, current observations, t
 
 Resolve and discover weather stations by multiple search modes.
 
-- Look up one or more stations by 4-letter ICAO ID (up to 20 IDs per call) — lookup is ICAO-only, but each returned record includes its IATA/FAA aliases when available
+- Look up one or more stations by identifier (up to 20 per call) — a lookup matches the registry's own ID, which for an airport is its 4-letter ICAO ID and for a buoy or mesonet site is whatever that site carries. A 3-letter IATA code never resolves, though each returned record includes its IATA/FAA aliases when available
 - Discover all stations within a geographic bounding box
 - List stations for one of the 50 US states or DC via two-letter USPS code (uses bbox + client-side state filter)
 - Returns `data_types` (METAR, TAF, etc.) so agents can confirm what's available before querying
 - Every result states whether the upstream 400-row cap cut it, so a truncated draw is never mistaken for every station in the area — a capped state query also reports the row count from before the state filter, and a smaller `bbox` is the named lever
-- An ID lookup names every identifier that resolved to nothing instead of silently returning a shorter list, and says which fix applies: not in ICAO format, or in ICAO format but absent from the AWC station registry. Reconciliation matches the identifiers upstream returned, so a repeated or differently-cased ID is not reported as a gap
+- `limit` (1–400) bounds how many stations a `bbox` or `state` search returns without changing the area searched, ordered by ICAO identifier ascending with identifier-less stations (buoys, mesonet sites) last — so the same query and limit return the same stations, and a sampled state leads with airports rather than with sites carrying no ID. A limited result says so separately from the cap — a limit withheld stations that were examined, a cap dropped stations that were never drawn — and both can be reported at once without either implying the other. It belongs to the area modes; supplying it alongside `station_ids` is rejected, since that mode already names the set
+- An ID lookup names every identifier that resolved to nothing instead of silently returning a shorter list, and separates the one shape it can diagnose — a 3-letter IATA code, which never resolves — from an identifier the registry simply does not list. Reconciliation matches the identifiers upstream returned, so a repeated or differently-cased ID is not reported as a gap
+- Whitespace around an ID is trimmed rather than failing the batch — a padded entry resolves like the bare one, and only an empty or whitespace-only entry is rejected. No ICAO shape is imposed, so buoys and mesonet sites carrying no ICAO, IATA, or FAA identifier still resolve
 
 ---
 
@@ -90,6 +92,7 @@ Search for recent Pilot Reports by station+radius or bounding box.
 - `min_intensity` (`lgt` / `mod` / `sev`) restricts the search to reports carrying a turbulence or icing layer at that intensity or above — it selects reports, not layers, so a matching report still carries its lighter layers
 - Turbulence and icing arrays include up to two layers per report. Icing layers the API synthesized for a report that never mentioned ice are dropped, so an icing layer always reflects something the pilot reported
 - Every result states whether the upstream 400-row cap cut it, naming the levers that narrow a query before the cap applies — and only the ones the query has not already used
+- `limit` (1–400) bounds how many reports come back without changing what is searched; it applies after the ordering by observation time, so it keeps the most recent. A limited result says so separately from the cap — a limit withheld reports that were examined, a cap dropped reports that were never drawn — and both can be reported at once without either implying the other. Selection is by recency alone, so pair it with `min_intensity` to bound a result by severity instead
 - Note: absence of PIREPs does not mean smooth conditions — they are sparse by nature
 
 ---

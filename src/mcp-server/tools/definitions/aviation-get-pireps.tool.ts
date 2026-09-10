@@ -96,6 +96,34 @@ const PirepCloudLayerSchema = z
 const DEFAULT_DISTANCE_NM = 100;
 
 /**
+ * What a request-imposed `limit` withheld, stated so it cannot be read as the
+ * upstream row cap. The two say opposite things about what was examined: a
+ * capped page is one AWC never drew past, while a limited result counted every
+ * report it is selecting from. `matched` is scoped to the page it was counted
+ * from — on a capped page it describes that page, never the search area.
+ *
+ * The severity lever is offered only where the caller has not already pulled
+ * it. `narrowingLevers` follows the same rule for the same reason: proposing a
+ * parameter already in the query sends the caller in a circle, and on a capped
+ * result the two halves of one notice would contradict each other — the cap
+ * half correctly omitting `min_intensity` while the limit half re-proposed it.
+ */
+function limitNotice(
+  shown: number,
+  matched: number,
+  capped: boolean,
+  minIntensity: string | undefined,
+): string {
+  const scope = capped
+    ? `${matched} report(s) that matched inside the capped page`
+    : `${matched} matching report(s)`;
+  const severityLever = minIntensity
+    ? ''
+    : ' A limit selects by recency alone, so set min_intensity to have AWC narrow to the severe reports before it applies.';
+  return `The request limited this result to the ${shown} most recent of ${scope}. That is not the upstream cap — every report counted here was examined, and raising or dropping limit returns the ones it withheld.${severityLever}`;
+}
+
+/**
  * The parameters that narrow a PIREP query before the upstream row cap applies,
  * naming only the ones this query has not already pulled. `min_intensity` and
  * an altitude band inside the upstream width are both sent to AWC, so once
@@ -147,7 +175,7 @@ function altitudeExtent(base_ft: number | null, top_ft: number | null): string {
 export const aviationGetPireps = tool('aviation_get_pireps', {
   title: 'Get Pilot Reports (PIREPs)',
   description:
-    'Get recent Pilot Reports (PIREPs) near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, and the raw PIREP string. Requires either station_id (ICAO center point for radial search, e.g., KSEA) or bbox (area search) — not both. distance_nm belongs to the station_id search only, and altitude_min_ft must not exceed altitude_max_ft. min_intensity restricts the result to reports carrying a turbulence or icing layer at that intensity or above. Coverage is US-centric; PIREPs are sparse and absence of reports does not imply smooth conditions.',
+    'Get recent Pilot Reports (PIREPs) near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, and the raw PIREP string. Requires either station_id (ICAO center point for radial search, e.g., KSEA) or bbox (area search) — not both. distance_nm belongs to the station_id search only, and altitude_min_ft must not exceed altitude_max_ft. min_intensity restricts the result to reports carrying a turbulence or icing layer at that intensity or above. limit bounds how many reports come back without changing what is searched, keeping the most recent. Coverage is US-centric; PIREPs are sparse and absence of reports does not imply smooth conditions.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     station_id: z
@@ -193,6 +221,15 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       .optional()
       .describe(
         'Return only reports carrying at least one turbulence or icing layer at this intensity or above. The filter selects reports, not layers — a matching report still carries its lighter layers, so a result may include NEG, TRC, or LGT entries alongside the layer that matched. Optional.',
+      ),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(AWC_MAX_ROWS)
+      .optional()
+      .describe(
+        `Maximum reports to return, applied last — after every filter and after ordering by observation time descending, so a limited result is the most recent reports rather than an arbitrary slice. It bounds the response without changing what is searched, which every other parameter does. Distinct from the ${AWC_MAX_ROWS}-row upstream cap: a limited result examined every report it counted and withheld some, while a capped one never drew the rest. Selection is by recency alone, so pair it with min_intensity to bound a result by severity. Omit to return every match. Optional.`,
       ),
   }),
   output: z.object({
@@ -301,7 +338,21 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       .describe(
         'True when the upstream page hit the AWC row cap, so reports inside the search area and time window are missing from this result. False affirms the whole window was searched, which a count alone cannot establish.',
       ),
-    shown: z.number().describe('Reports in this result, counted after any altitude filter.'),
+    shown: z
+      .number()
+      .describe('Reports in this result, counted after any altitude filter and after any limit.'),
+    limited: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when the requested limit withheld reports that matched — the caller asked to see fewer of them. False affirms the limit did not bite, so every matching report is here. Present only when the call supplied a limit. It never states anything about the upstream cap: a limited result examined every report it counted, while a truncated one never drew the rest.',
+      ),
+    matched: z
+      .number()
+      .optional()
+      .describe(
+        'Reports that matched this query before the limit selected from them. Present only on a limited result. Where the result is also truncated this counts the capped page and not the search area — the reports the cap dropped were never examined, so no count can include them.',
+      ),
     cap: z
       .number()
       .optional()
@@ -318,7 +369,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       .string()
       .optional()
       .describe(
-        'Guidance naming the levers that narrow the query before the cap applies. Present only on a truncated result.',
+        'Guidance for whichever disclosures fired: the levers that narrow the query before the cap applies, and what a requested limit withheld. Both can fire on one result, and the text keeps them apart.',
       ),
   },
 
@@ -327,6 +378,8 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     shown: { label: 'Reports returned' },
     cap: { label: 'Upstream row maximum' },
     upstreamRows: { label: 'Reports returned before the altitude filter' },
+    limited: { label: 'Limited by the request' },
+    matched: { label: 'Reports matched before the limit' },
   },
 
   async handler(input, ctx) {
@@ -487,24 +540,47 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       throw ctx.fail('no_pireps_found', message, { recovery: { hint: recovery } });
     }
 
+    // Reports that matched the query — everything the limit selects from, and
+    // the count the cap disclosure describes the altitude filter as leaving.
+    // The limit runs last, after the sort, so a bounded result is the most
+    // recent matches rather than an arbitrary slice.
+    const matched = pireps.length;
+    const shownReports = input.limit != null ? pireps.slice(0, input.limit) : pireps;
+    const limited = input.limit != null && matched > input.limit;
+
     if (capped) {
       const narrowed =
-        pireps.length < rawCount
-          ? ` — the ${pireps.length} shown are what survived the altitude filter applied to that capped page`
+        matched < rawCount
+          ? ` — the altitude filter then narrowed that capped page to ${matched} report(s)`
           : '';
       ctx.enrich.truncated({
-        shown: pireps.length,
+        shown: shownReports.length,
         cap: AWC_MAX_ROWS,
-        guidance: `AWC served ${rawCount} reports for this query, its per-request maximum, so reports inside the search area and the ${input.hours}-hour window are missing from this result${narrowed}. Narrow the search — ${narrowingLevers(level, input.min_intensity)} — and re-run. ${altitudeLeverNote(level)}`,
+        // The cap and the limit are separate disclosures sharing one notice, so
+        // the cap states its own case first and the limit appends its own.
+        guidance: [
+          `AWC served ${rawCount} reports for this query, its per-request maximum, so reports inside the search area and the ${input.hours}-hour window are missing from this result${narrowed}. Narrow the search — ${narrowingLevers(level, input.min_intensity)} — and re-run. ${altitudeLeverNote(level)}`,
+          limited ? limitNotice(shownReports.length, matched, true, input.min_intensity) : null,
+        ]
+          .filter(Boolean)
+          .join(' '),
       });
       // Restating the served count is only informative where the filter moved it.
-      if (pireps.length < rawCount) ctx.enrich({ upstreamRows: rawCount });
+      if (matched < rawCount) ctx.enrich({ upstreamRows: rawCount });
     } else {
-      ctx.enrich({ truncated: false, shown: pireps.length });
+      ctx.enrich({ truncated: false, shown: shownReports.length });
+      if (limited)
+        ctx.enrich.notice(limitNotice(shownReports.length, matched, false, input.min_intensity));
     }
 
-    ctx.log.info('PIREPs retrieved', { count: pireps.length, rawCount });
-    return { pireps };
+    // A caller who set no limit already knows none applied, so the affirmative
+    // `limited: false` is only owed to one who did — where it separates a limit
+    // that bit from one that had nothing to withhold.
+    if (input.limit != null) ctx.enrich({ limited });
+    if (limited) ctx.enrich({ matched });
+
+    ctx.log.info('PIREPs retrieved', { count: shownReports.length, matched, rawCount });
+    return { pireps: shownReports };
   },
 
   format: (result) => {

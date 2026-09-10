@@ -1288,3 +1288,334 @@ describe('aviationGetPireps truncation disclosure', () => {
     expect(text).toContain('MOD, CAT, OCNL (24,000–28,000 ft)');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Request-imposed limit (issue #34) — every other parameter changes what is
+// searched; this one bounds what comes back, and it is a different statement
+// from the upstream row cap
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps request limit', () => {
+  const conus = { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 };
+
+  /**
+   * A page of distinct reports, newest first by construction so a limit's
+   * selection is checkable against a known order.
+   */
+  function page(count: number, altitude_ft: number | null = 8000): NormalizedPirep[] {
+    return Array.from({ length: count }, (_, i) => ({
+      ...minimalPirep,
+      altitude_ft,
+      observed_at: new Date(Date.UTC(2026, 0, 15, 6, 0, 0) - i * 60_000).toISOString(),
+      raw_pirep: `REPORT${i}`,
+    }));
+  }
+
+  /** Run the handler and return both the payload and the enrichment. */
+  async function runFor(input: Record<string, unknown>, reports: NormalizedPirep[]) {
+    mockFetchPireps.mockResolvedValue(reports);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const result = await aviationGetPireps.handler(aviationGetPireps.input.parse(input), ctx);
+    return { result, enrichment: getEnrichment(ctx) };
+  }
+
+  it('bounds the result below the match count', async () => {
+    const { result, enrichment } = await runFor({ bbox: conus, limit: 5 }, page(50));
+
+    expect(result.pireps).toHaveLength(5);
+    expect(enrichment).toMatchObject({ limited: true, matched: 50, shown: 5 });
+  });
+
+  it('keeps the most recent reports rather than an arbitrary slice', async () => {
+    // Hand the service the page in the worst order for a naive slice: oldest
+    // first. The limit runs after the sort, so the newest must survive.
+    const reports = page(10);
+    const { result } = await runFor({ bbox: conus, limit: 3 }, [...reports].reverse());
+
+    expect(result.pireps.map((p) => p.raw_pirep)).toEqual(['REPORT0', 'REPORT1', 'REPORT2']);
+  });
+
+  it('keeps the ordering descending inside a limited result', async () => {
+    const { result } = await runFor({ bbox: conus, limit: 4 }, [...page(20)].reverse());
+    const times = result.pireps.map((p) => Date.parse(p.observed_at));
+
+    expect(times).toEqual([...times].sort((a, b) => b - a));
+  });
+
+  it('states the limit did not bite when it equals the match count', async () => {
+    const { result, enrichment } = await runFor({ bbox: conus, limit: 6 }, page(6));
+
+    expect(result.pireps).toHaveLength(6);
+    expect(enrichment).toMatchObject({ limited: false, shown: 6 });
+    expect(enrichment).not.toHaveProperty('matched');
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('states the limit did not bite when it exceeds the match count', async () => {
+    const { result, enrichment } = await runFor({ bbox: conus, limit: 99 }, page(2));
+
+    expect(result.pireps).toHaveLength(2);
+    expect(enrichment).toMatchObject({ limited: false, shown: 2 });
+    expect(enrichment).not.toHaveProperty('matched');
+  });
+
+  it('applies after the altitude filter, not before it', async () => {
+    // 3 reports at cruise inside a page of 20; a limit of 2 must select from
+    // the 3 that matched, never from the 20 that were drawn.
+    const reports = [...page(17, 8000), ...page(3, 33000)];
+    const { result, enrichment } = await runFor(
+      { bbox: conus, altitude_min_ft: 30000, limit: 2 },
+      reports,
+    );
+
+    expect(result.pireps).toHaveLength(2);
+    expect(result.pireps.every((p) => p.altitude_ft === 33000)).toBe(true);
+    expect(enrichment).toMatchObject({ limited: true, matched: 3, shown: 2 });
+  });
+
+  it('names the limit in the notice without calling it the upstream cap', async () => {
+    const { enrichment } = await runFor({ bbox: conus, limit: 5 }, page(50));
+    const notice = String(enrichment.notice);
+
+    expect(notice).toContain('limit');
+    expect(notice).toContain('50');
+    expect(notice).toMatch(/not the upstream cap/i);
+    // The severity signal a limit discards is answered with the lever that
+    // recovers it, rather than with a synthesized summary of what was omitted.
+    expect(notice).toContain('min_intensity');
+  });
+
+  it('drops the severity lever once the caller has already set min_intensity', async () => {
+    // The reported case: {station_id, min_intensity: 'sev', limit: 3} ended by
+    // telling the caller to set a parameter already in the query.
+    const { enrichment } = await runFor(
+      { station_id: 'KSEA', min_intensity: 'sev', limit: 3 },
+      page(20),
+    );
+    const notice = String(enrichment.notice);
+
+    expect(notice).toMatch(/not the upstream cap/i);
+    expect(notice).not.toContain('min_intensity');
+    expect(notice).not.toMatch(/selects by recency alone/);
+  });
+
+  it('still offers the severity lever when min_intensity is unset', async () => {
+    const { enrichment } = await runFor({ station_id: 'KSEA', limit: 3 }, page(20));
+
+    expect(String(enrichment.notice)).toContain('min_intensity');
+  });
+
+  it('does not re-offer min_intensity in one half of a capped notice after suppressing it in the other', async () => {
+    // narrowingLevers() already drops a pulled lever; the limit half must not
+    // contradict it two sentences later inside the same string.
+    const { enrichment } = await runFor(
+      { bbox: conus, hours: 12, min_intensity: 'mod', limit: 10 },
+      page(AWC_MAX_ROWS),
+    );
+    const notice = String(enrichment.notice);
+
+    expect(notice).toContain('per-request maximum');
+    expect(notice).toMatch(/not the upstream cap/i);
+    expect(notice).not.toContain('min_intensity');
+  });
+
+  it('discloses a capped page and a request limit as two separate facts', async () => {
+    const { result, enrichment } = await runFor(
+      { bbox: conus, hours: 12, limit: 10 },
+      page(AWC_MAX_ROWS),
+    );
+
+    expect(result.pireps).toHaveLength(10);
+    expect(enrichment).toMatchObject({
+      truncated: true,
+      cap: AWC_MAX_ROWS,
+      shown: 10,
+      limited: true,
+      matched: AWC_MAX_ROWS,
+    });
+  });
+
+  it('keeps the two statements distinguishable in the shared notice', async () => {
+    const { enrichment } = await runFor({ bbox: conus, hours: 12, limit: 10 }, page(AWC_MAX_ROWS));
+    const notice = String(enrichment.notice);
+
+    // The cap: reports were never drawn, and narrowing the query is the lever.
+    expect(notice).toContain('per-request maximum');
+    expect(notice).toContain('bbox');
+    // The limit: reports were drawn and examined, and raising it returns them.
+    expect(notice).toMatch(/not the upstream cap/i);
+    expect(notice).toMatch(/every report counted here was examined/i);
+    // And the count the limit selected from is scoped to the capped page.
+    expect(notice).toMatch(/400 report\(s\) that matched inside the capped page/);
+  });
+
+  it('scopes matched to the capped page after the altitude filter narrowed it', async () => {
+    // Three numbers, none implying another: 400 drawn, 12 past the altitude
+    // filter, 4 returned. `matched` is the middle one and describes the page.
+    const reports = [...page(AWC_MAX_ROWS - 12, 8000), ...page(12, 33000)];
+    const { enrichment } = await runFor({ bbox: conus, altitude_min_ft: 30000, limit: 4 }, reports);
+
+    expect(enrichment).toMatchObject({
+      truncated: true,
+      upstreamRows: AWC_MAX_ROWS,
+      matched: 12,
+      shown: 4,
+      limited: true,
+    });
+  });
+
+  it('keeps upstreamRows keyed on the altitude filter, not on the limit', async () => {
+    // A capped page no client-side filter touched: the limit cut the result,
+    // but restating the drawn count would only repeat what the cap said.
+    const { enrichment } = await runFor({ bbox: conus, hours: 12, limit: 10 }, page(AWC_MAX_ROWS));
+
+    expect(enrichment).toMatchObject({ truncated: true, limited: true });
+    expect(enrichment).not.toHaveProperty('upstreamRows');
+  });
+
+  it.each([
+    ['a radial search', { station_id: 'KSEA' }],
+    ['an area search', { bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 } }],
+  ])('leaves %s untouched when limit is omitted', async (_label, input) => {
+    const { result, enrichment } = await runFor(input, [pirep, minimalPirep]);
+
+    expect(result.pireps).toHaveLength(2);
+    expect(enrichment).toMatchObject({ truncated: false, shown: 2 });
+    expect(enrichment).not.toHaveProperty('limited');
+    expect(enrichment).not.toHaveProperty('matched');
+  });
+
+  it('leaves an empty result an error rather than a limit disclosure', async () => {
+    mockFetchPireps.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KSEA', limit: 5 });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_pireps_found' },
+    });
+    expect(getEnrichment(ctx)).not.toHaveProperty('limited');
+  });
+
+  it('leaves an altitude-emptied result an error rather than a limit disclosure', async () => {
+    mockFetchPireps.mockResolvedValue(page(3, 8000));
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      station_id: 'KSEA',
+      altitude_min_ft: 30000,
+      limit: 5,
+    });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_pireps_found' },
+    });
+    expect(getEnrichment(ctx)).not.toHaveProperty('limited');
+  });
+
+  it.each([
+    ['missing_location', {}],
+    [
+      'conflicting_location',
+      { station_id: 'KSEA', bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 } },
+    ],
+    [
+      'conflicting_distance',
+      { bbox: { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 }, distance_nm: 150 },
+    ],
+  ])('keeps %s ahead of any limit work', async (reason, input) => {
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const parsed = aviationGetPireps.input.parse({ ...input, limit: 5 });
+
+    await expect(aviationGetPireps.handler(parsed, ctx)).rejects.toMatchObject({
+      data: { reason },
+    });
+    expect(mockFetchPireps).not.toHaveBeenCalled();
+  });
+
+  it('does not narrow what is searched', async () => {
+    // The whole point of the parameter: the outgoing request is identical, so
+    // a limited call and an unlimited one see the same corpus.
+    await runFor({ bbox: conus, hours: 12, limit: 5 }, page(50));
+    const withLimit = mockFetchPireps.mock.calls[0]![0];
+    mockFetchPireps.mockClear();
+    await runFor({ bbox: conus, hours: 12 }, page(50));
+
+    expect(withLimit).toEqual(mockFetchPireps.mock.calls[0]![0]);
+    expect(withLimit).not.toHaveProperty('limit');
+  });
+
+  it.each([
+    ['zero', 0],
+    ['a negative count', -1],
+    ['a fraction', 2.5],
+    ['a value above the upstream row cap', AWC_MAX_ROWS + 1],
+  ])('rejects %s at the schema', (_label, limit) => {
+    expect(aviationGetPireps.input.safeParse({ station_id: 'KSEA', limit }).success).toBe(false);
+  });
+
+  it.each([1, AWC_MAX_ROWS])('accepts a limit of %i', (limit) => {
+    expect(aviationGetPireps.input.safeParse({ station_id: 'KSEA', limit }).success).toBe(true);
+  });
+
+  it('names limit in the tool description', () => {
+    expect(aviationGetPireps.description).toContain('limit');
+  });
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    mockFetchPireps.mockResolvedValue(page(AWC_MAX_ROWS));
+    const result = await runToolContract(aviationGetPireps, {
+      bbox: conus,
+      hours: 12,
+      limit: 10,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      truncated: true,
+      cap: AWC_MAX_ROWS,
+      shown: 10,
+      limited: true,
+      matched: AWC_MAX_ROWS,
+    });
+    expect((result.structuredContent as { pireps: unknown[] }).pireps).toHaveLength(10);
+
+    // A content[]-only client must learn both facts and be able to tell them
+    // apart, not just that the result is short.
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('**Limited by the request:** true');
+    expect(text).toContain('**Reports matched before the limit:** 400');
+    expect(text).toContain('**Truncated at the upstream row cap:** true');
+    expect(text).toMatch(/not the upstream cap/i);
+  });
+
+  it('renders the nested hazard layers of every report it did return', async () => {
+    // The limit selects whole reports, so a surviving report keeps its full
+    // turbulence, icing, and cloud detail on both surfaces.
+    mockFetchPireps.mockResolvedValue([pirep, minimalPirep]);
+    const result = await runToolContract(aviationGetPireps, { station_id: 'KSEA', limit: 1 });
+
+    expect(result.structuredContent).toMatchObject({
+      pireps: [
+        expect.objectContaining({
+          turbulence: [
+            expect.objectContaining({ intensity: 'MOD', type: 'CAT', frequency: 'OCNL' }),
+            expect.objectContaining({ intensity: 'LGT', type: 'CHOP' }),
+          ],
+          icing: [
+            expect.objectContaining({ intensity: 'LGT', type: 'RIME' }),
+            expect.objectContaining({ intensity: 'MOD', type: 'MIXED' }),
+          ],
+          clouds: [expect.objectContaining({ cover: 'BKN', base_ft: 8000, top_ft: 15000 })],
+        }),
+      ],
+      limited: true,
+      matched: 2,
+    });
+
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('MOD, CAT, OCNL (24,000–28,000 ft)');
+    expect(text).toContain('LGT, CHOP (20,000–22,000 ft)');
+    expect(text).toContain('LGT, RIME (10,000–14,000 ft)');
+    expect(text).toContain('MOD, MIXED (14,000–18,000 ft)');
+    expect(text).toContain('BKN 8,000–15,000 ft');
+    expect(text).toContain('1 PIREP(s) found');
+  });
+});

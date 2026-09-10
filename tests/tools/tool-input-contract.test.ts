@@ -31,8 +31,8 @@ const tools = [
   {
     name: 'aviation_find_stations',
     def: aviationFindStations,
-    keys: ['bbox', 'state', 'station_ids'],
-    full: { station_ids: ['KSEA'], bbox, state: 'WA' },
+    keys: ['bbox', 'limit', 'state', 'station_ids'],
+    full: { station_ids: ['KSEA'], bbox, state: 'WA', limit: 25 },
   },
   {
     name: 'aviation_get_metar',
@@ -55,6 +55,7 @@ const tools = [
       'bbox',
       'distance_nm',
       'hours',
+      'limit',
       'min_intensity',
       'station_id',
     ],
@@ -66,6 +67,7 @@ const tools = [
       altitude_min_ft: 18000,
       altitude_max_ft: 35000,
       min_intensity: 'mod',
+      limit: 25,
     },
   },
   {

@@ -3,7 +3,7 @@
  * @module tests/tools/aviation-find-stations.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { aviationFindStations } from '@/mcp-server/tools/definitions/aviation-find-stations.tool.js';
@@ -751,15 +751,30 @@ describe('aviationFindStations partial-batch disclosure', () => {
     expect(notice).not.toMatch(/no such airport|does not exist|is not an airport/i);
   });
 
-  it('separates an identifier that is not in ICAO format', async () => {
-    // `SEA` is Seattle-Tacoma's IATA code. The fix is a different one from an
-    // ICAO-shaped ID the registry does not carry, so the guidance splits.
+  it('separates an identifier shaped like an IATA code', async () => {
+    // `SEA` is Seattle-Tacoma's IATA code. It never resolves, even though the
+    // station's own entry carries it, so the fix is a different one from an
+    // identifier the registry simply does not list.
     const enrichment = await enrichmentFor(['KSEA', 'SEA', 'KZZZ'], [ksea]);
     const notice = String(enrichment.notice);
 
     expect(enrichment).toMatchObject({ missing: ['SEA', 'KZZZ'] });
-    expect(notice).toMatch(/Not in ICAO format: SEA/);
+    expect(notice).toMatch(/3-letter IATA code: SEA/);
     expect(notice).toMatch(/Not present in the AWC station registry: KZZZ/);
+  });
+
+  it('does not blame the shape of an unlisted non-airport identifier', async () => {
+    // A lookup matches the registry's own id, whatever shape the site carries:
+    // `NUET2` and `46114` both resolve live. So an unresolved id of some other
+    // length is absent, not malformed, and saying otherwise sends the caller to
+    // fix a format that was never the problem.
+    const enrichment = await enrichmentFor(['KSEA', '46999', 'NUET9'], [ksea]);
+    const notice = String(enrichment.notice);
+
+    expect(enrichment).toMatchObject({ missing: ['46999', 'NUET9'] });
+    expect(notice).toMatch(/Not present in the AWC station registry: 46999, NUET9/);
+    expect(notice).not.toMatch(/IATA/);
+    expect(notice).not.toMatch(/format/i);
   });
 
   it('still throws rather than disclosing an empty result as a partial one', async () => {
@@ -858,5 +873,632 @@ describe('aviationFindStations partial-batch disclosure', () => {
       aviationFindStations.handler(aviationFindStations.input.parse(input), ctx),
     ).rejects.toMatchObject({ data: { reason } });
     expect(getEnrichment(ctx)).not.toHaveProperty('partial');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Identifier whitespace and upstream rejection (issue #35) — `stationinfo`
+// answers HTTP 400 for a padded entry and returns nothing at all, so one stray
+// space cost a batch every station it could have resolved
+// ---------------------------------------------------------------------------
+
+describe('aviationFindStations identifier whitespace', () => {
+  const kjfk: NormalizedStation = {
+    ...ksea,
+    id: 'KJFK',
+    icao_id: 'KJFK',
+    iata_id: 'JFK',
+    faa_id: 'JFK',
+    name: 'New York/JF Kennedy Intl',
+    state: 'NY',
+  };
+
+  /**
+   * The error `fetchWithTimeout` raises for AWC's HTTP 400, in the shape and
+   * with the payload the framework's status ladder produces: the redacted
+   * endpoint in the message, and the upstream body in `data`. Reproduced here
+   * because that payload is half of what the fix removes from the caller's view.
+   */
+  const AWC_ERROR_BODY =
+    '{"status":"error","error":"Must specify station IDs or bounding box, zoom, and density"}';
+  const AWC_ENDPOINT = 'https://aviationweather.gov/api/data/stationinfo';
+
+  function upstreamBadRequest(): McpError {
+    return new McpError(
+      JsonRpcErrorCode.InvalidParams,
+      `Fetch failed for ${AWC_ENDPOINT}?…. Status: 400`,
+      {
+        status: 400,
+        statusText: 'Bad Request',
+        body: AWC_ERROR_BODY,
+        statusCode: 400,
+        responseBody: AWC_ERROR_BODY,
+        errorSource: 'FetchHttpError',
+      },
+    );
+  }
+
+  /**
+   * Model the registry the way it actually behaves: an `ids` list carrying a
+   * padded entry is rejected outright rather than resolving the entries around
+   * it. Without this the mock would resolve untrimmed identifiers and the
+   * defect would be invisible at the handler boundary.
+   */
+  function mockRegistry(stations: NormalizedStation[]) {
+    mockFetchStations.mockImplementation(async (params) => {
+      if (params.stationIds?.some((id) => id !== id.trim())) throw upstreamBadRequest();
+      const wanted = new Set(params.stationIds?.map((id) => id.toUpperCase()));
+      return params.stationIds ? stations.filter((s) => wanted.has(s.id.toUpperCase())) : stations;
+    });
+  }
+
+  it('resolves a padded identifier instead of failing the whole batch', async () => {
+    // The reported case: `KSEA ` made upstream reject the request, so KJFK was
+    // lost too. Both must come back.
+    mockRegistry([ksea, kjfk]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: ['KSEA ', 'KJFK'] });
+    const result = await aviationFindStations.handler(input, ctx);
+
+    expect(result.stations.map((s) => s.icao_id)).toEqual(['KSEA', 'KJFK']);
+  });
+
+  it.each([
+    ['a trailing space', 'KSEA '],
+    ['a leading space', ' KSEA'],
+    ['whitespace on both sides', '  KSEA  '],
+    ['a tab', '\tKSEA'],
+    ['a newline', 'KSEA\n'],
+  ])('resolves %s the same as the bare identifier', async (_label, padded) => {
+    mockRegistry([ksea]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: [padded] });
+    const result = await aviationFindStations.handler(input, ctx);
+
+    expect(result.stations).toHaveLength(1);
+    expect(mockFetchStations).toHaveBeenCalledWith(
+      expect.objectContaining({ stationIds: ['KSEA'] }),
+      ctx,
+    );
+  });
+
+  it.each([
+    ['an empty entry', ''],
+    ['a whitespace-only entry', '   '],
+    ['a tab-only entry', '\t'],
+  ])('rejects %s at the schema, naming the field', (_label, entry) => {
+    const result = aviationFindStations.input.safeParse({ station_ids: ['KSEA', entry] });
+
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues[0]?.path).toEqual(['station_ids', 1]);
+    expect(result.error.issues[0]?.message).toContain('station_ids');
+  });
+
+  it.each([
+    ['a 5-character registry ID', 'NUET2'],
+    ['a digit-bearing ID', 'K2S8'],
+    ['a 3-character code', 'SEA'],
+    ['a lowercase ID', 'ksea'],
+  ])('still accepts %s — the fix borrows no ICAO pattern', (_label, entry) => {
+    // The registry legitimately carries buoys and mesonet sites with no ICAO,
+    // IATA, or FAA identifier, so a four-letter pattern here would break a
+    // working search rather than catch a caller error.
+    expect(aviationFindStations.input.safeParse({ station_ids: [entry] }).success).toBe(true);
+  });
+
+  it('resolves an identifier-less registry entry through a padded spelling', async () => {
+    const nuet2: NormalizedStation = {
+      ...wasd2,
+      id: 'NUET2',
+      name: 'Nueces Bay',
+      state: 'TX',
+    };
+    mockRegistry([nuet2]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: [' NUET2 '] });
+    const result = await aviationFindStations.handler(input, ctx);
+
+    expect(result.stations).toHaveLength(1);
+    expect(getEnrichment(ctx)).toMatchObject({ returned: ['NUET2'], partial: false });
+  });
+
+  it('separates a padded entry from a genuinely unknown one', async () => {
+    mockRegistry([ksea]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: ['KSEA ', 'KZZZ'] });
+    const result = await aviationFindStations.handler(input, ctx);
+
+    expect(result.stations).toHaveLength(1);
+    expect(getEnrichment(ctx)).toMatchObject({
+      requested: ['KSEA', 'KZZZ'],
+      returned: ['KSEA'],
+      missing: ['KZZZ'],
+      partial: true,
+    });
+  });
+
+  it('names the trimmed spelling in the notice, not the padded one', async () => {
+    // The notice is read by a human and a model; padding would render as an
+    // identifier carrying an invisible character.
+    mockRegistry([ksea]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: ['KSEA', ' KZZZ '] });
+    await aviationFindStations.handler(input, ctx);
+    const notice = String(getEnrichment(ctx).notice);
+
+    expect(notice).toContain('registry: KZZZ.');
+    expect(notice).not.toContain(' KZZZ ');
+  });
+
+  it('collapses a padded repeat onto its bare spelling', async () => {
+    // Trimming happens before the deduplication, so `KSEA` and `KSEA ` are one
+    // identifier rather than two, and neither is reported as a gap.
+    mockRegistry([ksea]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: ['KSEA', 'KSEA '] });
+    await aviationFindStations.handler(input, ctx);
+
+    expect(getEnrichment(ctx)).toMatchObject({
+      requested: ['KSEA', 'KSEA'],
+      returned: ['KSEA'],
+      partial: false,
+    });
+  });
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    mockRegistry([ksea, kjfk]);
+    const result = await runToolContract(aviationFindStations, {
+      station_ids: ['KSEA ', 'KJFK'],
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      stations: [
+        expect.objectContaining({ icao_id: 'KSEA' }),
+        expect.objectContaining({ icao_id: 'KJFK' }),
+      ],
+      requested: ['KSEA', 'KJFK'],
+      returned: ['KSEA', 'KJFK'],
+      partial: false,
+    });
+
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('## Seattle-Tacoma International Airport');
+    expect(text).toContain('## New York/JF Kennedy Intl');
+    expect(text).toContain('**Requested:** KSEA, KJFK');
+  });
+});
+
+describe('aviationFindStations upstream rejection', () => {
+  const AWC_ERROR_BODY =
+    '{"status":"error","error":"Must specify station IDs or bounding box, zoom, and density"}';
+  const AWC_ENDPOINT = 'https://aviationweather.gov/api/data/stationinfo';
+
+  /** Run the handler against a service that throws `error`, and return the throw. */
+  async function errorFor(error: unknown, input: Record<string, unknown> = { state: 'WA' }) {
+    mockFetchStations.mockRejectedValue(error);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    try {
+      await aviationFindStations.handler(aviationFindStations.input.parse(input), ctx);
+    } catch (e) {
+      return e as McpError;
+    }
+    throw new Error('handler resolved where it was expected to throw');
+  }
+
+  it('raises the declared reason for an upstream rejection', async () => {
+    const err = await errorFor(
+      new McpError(
+        JsonRpcErrorCode.InvalidParams,
+        `Fetch failed for ${AWC_ENDPOINT}?…. Status: 400`,
+        {
+          status: 400,
+          body: AWC_ERROR_BODY,
+          responseBody: AWC_ERROR_BODY,
+          errorSource: 'FetchHttpError',
+        },
+      ),
+    );
+
+    expect(err.code).toBe(JsonRpcErrorCode.InvalidParams);
+    expect(err.data).toMatchObject({ reason: 'upstream_rejected' });
+  });
+
+  it('carries a recovery hint naming what the caller should change', async () => {
+    const err = await errorFor(
+      new McpError(
+        JsonRpcErrorCode.InvalidParams,
+        `Fetch failed for ${AWC_ENDPOINT}?…. Status: 400`,
+        {
+          status: 400,
+          body: AWC_ERROR_BODY,
+        },
+      ),
+    );
+    const hint = String((err.data as { recovery?: { hint?: string } })?.recovery?.hint);
+
+    expect(hint).toContain('station_ids');
+    expect(hint).toMatch(/bbox|state/);
+  });
+
+  it('surfaces neither the upstream endpoint nor its response body', async () => {
+    const err = await errorFor(
+      new McpError(
+        JsonRpcErrorCode.InvalidParams,
+        `Fetch failed for ${AWC_ENDPOINT}?…. Status: 400`,
+        {
+          status: 400,
+          statusText: 'Bad Request',
+          body: AWC_ERROR_BODY,
+          statusCode: 400,
+          responseBody: AWC_ERROR_BODY,
+          errorSource: 'FetchHttpError',
+        },
+      ),
+    );
+    const payload = JSON.stringify({ message: err.message, data: err.data });
+
+    expect(payload).not.toContain('aviationweather.gov');
+    expect(payload).not.toContain('stationinfo');
+    expect(payload).not.toContain('Must specify station IDs');
+    expect(payload).not.toContain('Fetch failed');
+  });
+
+  it('keeps the original error as the cause for the logs', async () => {
+    const upstream = new McpError(JsonRpcErrorCode.InvalidParams, 'Fetch failed. Status: 400');
+    const err = await errorFor(upstream);
+
+    expect(err.cause).toBe(upstream);
+  });
+
+  it.each([
+    ['a 5xx outage', JsonRpcErrorCode.ServiceUnavailable],
+    ['an abandoned request', JsonRpcErrorCode.RequestCancelled],
+    ['a timeout', JsonRpcErrorCode.Timeout],
+    ['a rate limit', JsonRpcErrorCode.RateLimited],
+  ])('lets %s bubble as classified rather than reading it as malformed input', async (_l, code) => {
+    const err = await errorFor(new McpError(code, 'upstream'));
+
+    expect(err.code).toBe(code);
+    expect(err.data ?? {}).not.toMatchObject({ reason: 'upstream_rejected' });
+  });
+
+  it('lets a non-McpError bubble untouched', async () => {
+    const boom = new Error('socket hang up');
+    await expect(errorFor(boom)).resolves.toBe(boom as unknown as McpError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Request-imposed limit (issue #36) — a state or bbox search has no size lever,
+// and a self-imposed limit is a different statement from the upstream row cap
+// ---------------------------------------------------------------------------
+
+describe('aviationFindStations request limit', () => {
+  /** A page of distinct stations whose registry IDs sort predictably. */
+  function page(count: number, state = 'CA'): NormalizedStation[] {
+    return Array.from({ length: count }, (_, i) => ({
+      ...ksea,
+      id: `K${String(i).padStart(3, '0')}`,
+      icao_id: `K${String(i).padStart(3, '0')}`,
+      name: `Station ${i}`,
+      state,
+    }));
+  }
+
+  function mockDraw(stations: NormalizedStation[], preFilterRows?: number) {
+    mockFetchStations.mockImplementation(async (params) => {
+      if (preFilterRows != null) params.onPreFilterRows?.(preFilterRows);
+      return stations;
+    });
+  }
+
+  /** Run the handler and return both the payload and the enrichment. */
+  async function runFor(input: Record<string, unknown>) {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const result = await aviationFindStations.handler(aviationFindStations.input.parse(input), ctx);
+    return { result, enrichment: getEnrichment(ctx) };
+  }
+
+  it('bounds a state search below the match count', async () => {
+    mockDraw(page(270), 349);
+    const { result, enrichment } = await runFor({ state: 'CA', limit: 25 });
+
+    expect(result.stations).toHaveLength(25);
+    expect(enrichment).toMatchObject({ limited: true, matched: 270, shown: 25 });
+  });
+
+  it('bounds a bbox search the same way', async () => {
+    mockDraw(page(40));
+    const { result, enrichment } = await runFor({
+      bbox: { minLat: 32, minLon: -124, maxLat: 42, maxLon: -114 },
+      limit: 10,
+    });
+
+    expect(result.stations).toHaveLength(10);
+    expect(enrichment).toMatchObject({ limited: true, matched: 40, shown: 10 });
+  });
+
+  it('states the limit did not bite when it equals the match count', async () => {
+    mockDraw(page(10));
+    const { result, enrichment } = await runFor({ state: 'CA', limit: 10 });
+
+    expect(result.stations).toHaveLength(10);
+    expect(enrichment).toMatchObject({ limited: false, shown: 10 });
+    expect(enrichment).not.toHaveProperty('matched');
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('states the limit did not bite when it exceeds the match count', async () => {
+    mockDraw(page(3));
+    const { result, enrichment } = await runFor({ state: 'CA', limit: 50 });
+
+    expect(result.stations).toHaveLength(3);
+    expect(enrichment).toMatchObject({ limited: false, shown: 3 });
+    expect(enrichment).not.toHaveProperty('matched');
+  });
+
+  it('returns the same stations for the same query and limit', async () => {
+    // Upstream order is not a contract, so the ordering has to come from the
+    // rows themselves — otherwise the same query returns a different subset.
+    const stations = page(20);
+    mockDraw([...stations].reverse());
+    const first = await runFor({ state: 'CA', limit: 5 });
+    mockDraw([...stations].sort(() => 0.5 - Math.random()));
+    const second = await runFor({ state: 'CA', limit: 5 });
+
+    expect(first.result.stations.map((s) => s.icao_id)).toEqual([
+      'K000',
+      'K001',
+      'K002',
+      'K003',
+      'K004',
+    ]);
+    expect(second.result.stations.map((s) => s.icao_id)).toEqual(
+      first.result.stations.map((s) => s.icao_id),
+    );
+  });
+
+  /** An NDBC buoy: no identifier of any kind, and a numeric registry ID. */
+  function buoy(id: string, name: string): NormalizedStation {
+    return { ...wasd2, id, name, state: 'CA' };
+  }
+
+  it('leads a sampled state with airports, not with identifier-less buoys', async () => {
+    // The query #36 was filed against. A live CA draw holds 270 rows, 49 of
+    // them buoys whose numeric registry IDs sort ahead of every K*** airport —
+    // so ordering on the registry ID alone returned ten buoys and no airport,
+    // nothing the caller can hand to aviation_get_metar.
+    const buoys = ['46114', '46214', '46215', '46218', '46219'].map((id) => buoy(id, `Buoy ${id}`));
+    const airports = ['K18C', 'K1O2', 'K1O5'].map((icao) => ({
+      ...ksea,
+      id: icao,
+      icao_id: icao,
+      name: `Airport ${icao}`,
+      state: 'CA',
+    }));
+    mockDraw([...buoys, ...airports]);
+    const { result } = await runFor({ state: 'CA', limit: 3 });
+
+    expect(result.stations.map((s) => s.icao_id)).toEqual(['K18C', 'K1O2', 'K1O5']);
+  });
+
+  it('keeps identifier-less rows reachable at the tail rather than dropping them', async () => {
+    const rows = [buoy('46114', 'W Monterey Bay'), ksea, buoy('TIBC1', 'Tiburon'), kbfi];
+    mockDraw(rows);
+    const { result } = await runFor({ state: 'CA', limit: 4 });
+
+    expect(result.stations.map((s) => s.icao_id)).toEqual(['KBFI', 'KSEA', null, null]);
+  });
+
+  it('breaks a tie between two identifier-less rows on the registry ID', async () => {
+    // icao_id is null across both and cannot separate them, so the order would
+    // not be total without the registry ID underneath it.
+    mockDraw([buoy('UPBC1', 'Union Pacific'), buoy('46114', 'W Monterey Bay')]);
+    const { result } = await runFor({ state: 'CA', limit: 2 });
+
+    expect(result.stations.map((s) => s.name)).toEqual(['W Monterey Bay', 'Union Pacific']);
+  });
+
+  it('orders identifier-less rows deterministically across shuffled draws', async () => {
+    const rows = ['UPBC1', 'TIXC1', '46114', 'TIBC1'].map((id) => buoy(id, `Site ${id}`));
+    mockDraw([...rows].reverse());
+    const first = await runFor({ state: 'CA', limit: 4 });
+    mockDraw([rows[2]!, rows[0]!, rows[3]!, rows[1]!]);
+    const second = await runFor({ state: 'CA', limit: 4 });
+
+    expect(first.result.stations.map((s) => s.name)).toEqual(
+      second.result.stations.map((s) => s.name),
+    );
+    expect(first.result.stations.map((s) => s.name)).toEqual([
+      'Site 46114',
+      'Site TIBC1',
+      'Site TIXC1',
+      'Site UPBC1',
+    ]);
+  });
+
+  it('names the ordering in the notice so the caller can predict the next page', async () => {
+    mockDraw([...page(30), buoy('46114', 'W Monterey Bay')]);
+    const { enrichment } = await runFor({ state: 'CA', limit: 5 });
+
+    expect(String(enrichment.notice)).toMatch(
+      /ordered by ICAO identifier ascending with identifier-less stations last/,
+    );
+  });
+
+  it('names the limit in the notice without calling it the upstream cap', async () => {
+    mockDraw(page(270), 349);
+    const { enrichment } = await runFor({ state: 'CA', limit: 25 });
+    const notice = String(enrichment.notice);
+
+    expect(notice).toContain('limit');
+    expect(notice).toContain('270');
+    expect(notice).toMatch(/not the upstream cap/i);
+    expect(notice).toMatch(/ordered by ICAO identifier ascending/);
+  });
+
+  it('discloses a capped draw and a request limit as two separate facts', async () => {
+    // Texas: 400 rows drawn, 279 in-state, the caller asked for 20. All three
+    // numbers are different and none of them implies another.
+    mockDraw(page(279, 'TX'), AWC_MAX_ROWS);
+    const { result, enrichment } = await runFor({ state: 'TX', limit: 20 });
+
+    expect(result.stations).toHaveLength(20);
+    expect(enrichment).toMatchObject({
+      truncated: true,
+      cap: AWC_MAX_ROWS,
+      upstreamRows: AWC_MAX_ROWS,
+      shown: 20,
+      limited: true,
+      matched: 279,
+    });
+  });
+
+  it('keeps the two statements distinguishable in the shared notice', async () => {
+    mockDraw(page(279, 'TX'), AWC_MAX_ROWS);
+    const notice = String((await runFor({ state: 'TX', limit: 20 })).enrichment.notice);
+
+    // The cap: rows were never drawn, and a smaller box is the lever.
+    expect(notice).toContain('per-request maximum');
+    expect(notice).toContain('bbox');
+    // The limit: rows were drawn and examined, and raising it returns them.
+    expect(notice).toMatch(/not the upstream cap/i);
+    expect(notice).toMatch(/every station counted here was examined/i);
+    // And the count the limit selected from is scoped to the capped draw.
+    expect(notice).toMatch(/279 station\(s\) that matched inside the capped draw/);
+  });
+
+  it('keeps upstreamRows keyed on the state filter, not on the limit', async () => {
+    // A capped draw entirely inside the state: the limit cut the result, but
+    // no client-side filter moved the drawn count, so restating it would only
+    // repeat what the cap already said.
+    mockDraw(page(AWC_MAX_ROWS, 'TX'), AWC_MAX_ROWS);
+    const { enrichment } = await runFor({ state: 'TX', limit: 20 });
+
+    expect(enrichment).toMatchObject({ truncated: true, limited: true, matched: AWC_MAX_ROWS });
+    expect(enrichment).not.toHaveProperty('upstreamRows');
+  });
+
+  it.each([
+    ['a state search', { state: 'WA' }],
+    ['a bbox search', { bbox: { minLat: 47, minLon: -123, maxLat: 48, maxLon: -122 } }],
+    ['an identifier lookup', { station_ids: ['KSEA', 'KBFI'] }],
+  ])('leaves %s untouched when limit is omitted', async (_label, input) => {
+    mockDraw([ksea, kbfi]);
+    const { result, enrichment } = await runFor(input);
+
+    expect(result.stations).toEqual([ksea, kbfi]);
+    expect(enrichment).toMatchObject({ truncated: false, shown: 2 });
+    expect(enrichment).not.toHaveProperty('limited');
+    expect(enrichment).not.toHaveProperty('matched');
+  });
+
+  it('preserves the upstream order when limit is omitted', async () => {
+    // The identifier ordering is what a limit selects under; without one the
+    // result is served exactly as it arrives.
+    mockDraw([kbfi, ksea]);
+    const { result } = await runFor({ state: 'WA' });
+
+    expect(result.stations.map((s) => s.icao_id)).toEqual(['KBFI', 'KSEA']);
+  });
+
+  it('rejects limit alongside station_ids', async () => {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: ['KSEA'], limit: 5 });
+
+    await expect(aviationFindStations.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'conflicting_limit' },
+    });
+    expect(mockFetchStations).not.toHaveBeenCalled();
+  });
+
+  it('points conflicting_limit at both ways out', async () => {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ station_ids: ['KSEA'], limit: 5 });
+
+    let thrown: unknown;
+    try {
+      await aviationFindStations.handler(input, ctx);
+    } catch (e) {
+      thrown = e;
+    }
+    const err = thrown as { data?: { recovery?: { hint?: string } } };
+
+    expect(err.data?.recovery?.hint).toContain('limit');
+    expect(err.data?.recovery?.hint).toMatch(/bbox or state/);
+  });
+
+  it.each([
+    [{ station_ids: ['KSEA'], state: 'WA', limit: 5 }, 'conflicting_location'],
+    [{ bbox: { minLat: 49, minLon: -66, maxLat: 25, maxLon: -125 }, limit: 5 }, 'invalid_bbox'],
+    [{ state: 'ZZ', limit: 5 }, 'invalid_state'],
+  ])('runs the %o guard ahead of conflicting_limit', async (input, reason) => {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+
+    await expect(
+      aviationFindStations.handler(aviationFindStations.input.parse(input), ctx),
+    ).rejects.toMatchObject({ data: { reason } });
+    expect(mockFetchStations).not.toHaveBeenCalled();
+  });
+
+  it('leaves an empty result an error rather than a limit disclosure', async () => {
+    mockDraw([]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const input = aviationFindStations.input.parse({ state: 'WA', limit: 5 });
+
+    await expect(aviationFindStations.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'station_not_found' },
+    });
+    expect(getEnrichment(ctx)).not.toHaveProperty('limited');
+  });
+
+  it.each([
+    ['zero', 0],
+    ['a negative count', -1],
+    ['a fraction', 2.5],
+    ['a value above the upstream row cap', AWC_MAX_ROWS + 1],
+  ])('rejects %s at the schema', (_label, limit) => {
+    expect(aviationFindStations.input.safeParse({ state: 'WA', limit }).success).toBe(false);
+  });
+
+  it.each([1, AWC_MAX_ROWS])('accepts a limit of %i', (limit) => {
+    expect(aviationFindStations.input.safeParse({ state: 'WA', limit }).success).toBe(true);
+  });
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    mockDraw(page(279, 'TX'), AWC_MAX_ROWS);
+    const result = await runToolContract(aviationFindStations, { state: 'TX', limit: 20 });
+
+    expect(result.structuredContent).toMatchObject({
+      truncated: true,
+      cap: AWC_MAX_ROWS,
+      shown: 20,
+      limited: true,
+      matched: 279,
+    });
+    expect((result.structuredContent as { stations: unknown[] }).stations).toHaveLength(20);
+
+    // A content[]-only client must learn both facts and be able to tell them
+    // apart, not just that the result is short.
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('**Limited by the request:** true');
+    expect(text).toContain('**Stations matched before the limit:** 279');
+    expect(text).toContain('**Truncated at the upstream row cap:** true');
+    expect(text).toMatch(/not the upstream cap/i);
+  });
+
+  it('renders every station it did return', async () => {
+    mockDraw([ksea, kbfi, wasd2]);
+    const result = await runToolContract(aviationFindStations, { state: 'WA', limit: 2 });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+
+    // K-prefixed IDs sort ahead of WASD2, so the two Seattle fields are what a
+    // limit of 2 keeps — rendered in full, layers and all.
+    expect(text).toContain('## Boeing Field / King County International');
+    expect(text).toContain('## Seattle-Tacoma International Airport');
+    expect(text).toContain('**Data types:** METAR, TAF, SYNOP');
+    expect(text).not.toContain('Washington DC');
   });
 });
