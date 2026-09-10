@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -48,6 +48,7 @@ Resolve and discover weather stations by multiple search modes.
 - List stations for one of the 50 US states or DC via two-letter USPS code (uses bbox + client-side state filter)
 - Returns `data_types` (METAR, TAF, etc.) so agents can confirm what's available before querying
 - Every result states whether the upstream 400-row cap cut it, so a truncated draw is never mistaken for every station in the area — a capped state query also reports the row count from before the state filter, and a smaller `bbox` is the named lever
+- An ID lookup names every identifier that resolved to nothing instead of silently returning a shorter list, and says which fix applies: not in ICAO format, or in ICAO format but absent from the AWC station registry. Reconciliation matches the identifiers upstream returned, so a repeated or differently-cased ID is not reported as a gap
 
 ---
 
@@ -55,10 +56,11 @@ Resolve and discover weather stations by multiple search modes.
 
 Fetch current or recent METAR observations (1–10 stations per call).
 
-- `hours` parameter (1–12) returns observation history per station; default 1 returns only the most recent
+- `hours` (1–12) is a lookback window rather than a row limit — every observation inside it is returned, so a half-hourly station yields two rows at the default of 1
 - Flight category (VFR/MVFR/IFR/LIFR) is returned directly from the AWC API — no client-side computation needed
 - Decodes cloud layers, wind with gusts, visibility, and present weather (the raw groups plus plain English, one reading per group) in addition to the raw METAR string
-- Ceiling covers broken, overcast, and obscuration layers, and reports whether the height was measured or is an indefinite ceiling — vertical visibility into an obscuration
+- Ceiling covers broken, overcast, and obscuration layers, and reports whether the height was measured or is an indefinite ceiling — vertical visibility into an obscuration. An obscuration the station could not see up into (a `VV///` group) reads as a ceiling of undetermined height rather than as no ceiling
+- `sky_condition` carries the group an observation states when it publishes no layer heights (`CLR`, `SKC`, `CAVOK`, or `OVX` for a `VV///` obscuration), so an empty `clouds` array with nothing beside it reads as a sky the station did not report rather than as a clear one
 - METAR type field distinguishes `METAR` (routine) from `SPECI` (special observation triggered by significant weather change)
 - Every batch reports which of the requested stations came back, so a partial result is never mistaken for full coverage — missing IDs are named with recovery guidance
 
@@ -71,6 +73,7 @@ Fetch Terminal Aerodrome Forecasts for 1–4 airports.
 - Returns structured forecast periods with change types (`FM`, `TEMPO`, `BECMG`) and probabilities
 - Forecast weather decoded group by group beside the raw groups (`-SHRA BR` → `light rain showers; mist`), the same shape `aviation_get_metar` returns
 - Forecast obscurations keep their layer and carry the vertical visibility into them (`VV002` → a 200 ft indefinite ceiling), rather than reading as a clear sky
+- `sky_condition` carries a forecast clear sky (`SKC`, `NSC`) whose group has no height to publish, so a period with no cloud element — a `TEMPO` or `PROB` group amending only visibility or weather — reads as leaving the prevailing forecast's cloud unchanged rather than as forecasting clear
 - Low-level wind shear (`WS020/20040KT`) is decoded to the shear-layer top and the forecast wind at that height
 - `valid_from` / `valid_to` in ISO 8601 for straightforward time comparisons
 - Every batch reports which of the requested stations came back, so a partial result is never mistaken for full coverage — missing IDs are named with recovery guidance

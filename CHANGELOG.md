@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.3](changelog/0.4.x/0.4.3.md) — 2026-09-09
+
+aviation_get_metar and aviation_get_taf disclose a reported/forecast sky condition instead of rendering an empty cloud array as clear, and aviation_find_stations discloses which requested identifiers resolved to nothing.
+
 ## [0.4.2](changelog/0.4.x/0.4.2.md) — 2026-09-09
 
 aviation_get_pireps: a malformed flight-level group no longer reports altitude 0, a synthesized icing layer is dropped instead of published, and altitude/intensity filters are pushed upstream of the 400-row cap via a new min_intensity input.
