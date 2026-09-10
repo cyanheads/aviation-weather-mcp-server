@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -114,7 +114,9 @@ List currently active domestic SIGMETs.
 
 | Type | Name | Description |
 |:-----|:-----|:------------|
-| Prompt | `aviation_preflight_brief` | Structure a preflight weather briefing for one or more airports. Guides the LLM to call `aviation_get_metar`, `aviation_get_taf`, and `aviation_get_advisories` in sequence and synthesize a go/no-go picture with flight categories and active hazards. |
+| Prompt | `aviation_preflight_brief` | Structure a preflight weather briefing for a flight. Guides the LLM to call `aviation_get_metar`, `aviation_get_taf`, `aviation_get_pireps`, and `aviation_get_advisories` in sequence — split across as many calls as each tool's station limit requires — and synthesize a weather-risk summary with flight categories, active hazards, and the assessments it could not make. |
+
+Takes `departure_icao` and `destination_icao`, plus optional `alternates`, `departure_time`, `cruise_altitude`, and `route_waypoints`. The last three each narrow one step: the departure time selects the TAF forecast period the briefing is read against, the cruise altitude bounds the PIREP search to a ±3,000 ft band, and the route waypoints (decimal-degree `lat,lon` pairs) become the advisory `bbox`. Omit any of them and the briefing still generates, naming the assessment it could not make. It reports weather risk rather than a go/no-go recommendation — that decision needs pilot, aircraft, and operational-minima context this server does not hold.
 
 All resource data is reachable via tools. This server has no resources — all aviation weather data is time-sensitive (METARs valid ~1 hour, advisories minutes to hours) and unsuitable for stable-URI resources.
 
@@ -142,7 +144,7 @@ Agent-friendly output:
 
 - Flight category (`VFR`/`MVFR`/`IFR`/`LIFR`) as a discriminated string field — agents can branch on it without parsing ceiling + visibility
 - Structured error contracts with typed `reason` fields and `recovery` hints (e.g., "Verify ICAO IDs with `aviation_find_stations`")
-- `aviation_preflight_brief` prompt encodes the correct METAR → TAF → PIREPs → advisories briefing sequence that agents frequently get wrong by omitting steps
+- `aviation_preflight_brief` prompt encodes the correct METAR → TAF → PIREPs → advisories briefing sequence that agents frequently get wrong by omitting steps, chunks each step to the station limit the tool actually enforces, and names the assessments it could not make instead of implying a complete picture
 
 ---
 
