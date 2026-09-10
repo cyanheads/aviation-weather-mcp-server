@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.5](changelog/0.4.x/0.4.5.md) — 2026-09-09
+
+aviation_get_pireps and aviation_find_stations gain a response-size limit, and aviation_find_stations trims and correctly describes its station identifiers.
+
 ## [0.4.4](changelog/0.4.x/0.4.4.md) — 2026-09-09
 
 aviation_get_advisories moves hazard filtering upstream to AWC's own vocabulary and discloses which stage produced an empty result.
