@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.4](changelog/0.4.x/0.4.4.md) — 2026-09-09
+
+aviation_get_advisories moves hazard filtering upstream to AWC's own vocabulary and discloses which stage produced an empty result.
+
 ## [0.4.3](changelog/0.4.x/0.4.3.md) — 2026-09-09
 
 aviation_get_metar and aviation_get_taf disclose a reported/forecast sky condition instead of rendering an empty cloud array as clear, and aviation_find_stations discloses which requested identifiers resolved to nothing.
