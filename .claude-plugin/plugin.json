@@ -1,20 +1,40 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "aviation-weather-mcp-server",
   "version": "0.4.6",
   "description": "Fetch METARs, TAFs, PIREPs, and domestic SIGMETs from the NWS Aviation Weather Center via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "cyanheads"
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
   "homepage": "https://github.com/cyanheads/aviation-weather-mcp-server#readme",
   "repository": "git+https://github.com/cyanheads/aviation-weather-mcp-server.git",
   "license": "Apache-2.0",
+  "keywords": [
+    "aviation",
+    "aviation-weather",
+    "metar",
+    "taf",
+    "pirep",
+    "sigmet",
+    "aviation-weather-center",
+    "awc",
+    "flight-weather",
+    "preflight",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "ai-agent"
+  ],
   "mcpServers": {
     "aviation-weather-mcp-server": {
       "command": "npx",
-      "args": [
-        "-y",
-        "@cyanheads/aviation-weather-mcp-server"
-      ],
+      "args": ["-y", "@cyanheads/aviation-weather-mcp-server"],
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio"
       }
