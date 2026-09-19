@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.7](changelog/0.4.x/0.4.7.md) — 2026-09-19
+
+Upgrades to mcp-ts-core 0.13.6: tool error text now closes with a reason and retryable flag, argument rejections carry a synthesized recovery hint, and a mis-cased or extra argument key is corrected before validation instead of failing the call.
+
 ## [0.4.6](changelog/0.4.x/0.4.6.md) — 2026-09-09
 
 aviation_preflight_brief accepts optional departure time, cruise altitude, and route waypoints to narrow its TAF, PIREP, and advisories steps; station calls now chunk to each tool's limit, and its ICAO identifier arguments are validated against the same 4-letter pattern the weather tools enforce.
