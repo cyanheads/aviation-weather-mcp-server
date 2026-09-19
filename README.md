@@ -27,9 +27,11 @@
 
 ---
 
-## Tools
+## Overview
 
-Five tools covering aviation weather — station lookup, current observations, terminal forecasts, pilot reports, and active advisories:
+Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, and domestic SIGMETs. Look up stations, fetch current and forecast conditions, and pull pilot reports and hazard advisories from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+
+### Tools
 
 | Tool | Description |
 |:-----|:------------|
@@ -39,112 +41,96 @@ Five tools covering aviation weather — station lookup, current observations, t
 | `aviation_get_pireps` | Get recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, and the raw PIREP string. |
 | `aviation_get_advisories` | Get active domestic SIGMETs for a region. Returns hazard type (CONVECTIVE, TURBULENCE, ICING, IFR), severity, altitude range, valid period, polygon coordinates, and raw text. |
 
-### `aviation_find_stations`
+### Prompts
 
-Resolve and discover weather stations by multiple search modes.
+| Prompt | Description |
+|:-----|:------------|
+| `aviation_preflight_brief` | Structure a preflight weather briefing for a flight, calling the tools above in sequence and synthesizing a weather-risk summary. |
 
-- Look up one or more stations by identifier (up to 20 per call) — a lookup matches the registry's own ID, which for an airport is its 4-letter ICAO ID and for a buoy or mesonet site is whatever that site carries. A 3-letter IATA code never resolves, though each returned record includes its IATA/FAA aliases when available
-- Discover all stations within a geographic bounding box
-- List stations for one of the 50 US states or DC via two-letter USPS code (uses bbox + client-side state filter)
+---
+
+## Capability reference
+
+### `aviation_find_stations` <sub>tool</sub>
+
+- Look up one or more stations by identifier (up to 20 per call) — a lookup matches the registry's own ID, which for an airport is its 4-letter ICAO ID; a 3-letter IATA code never resolves, though each record includes its IATA/FAA aliases when available
+- Discover stations within a geographic bounding box, or list stations for one of the 50 US states or DC via two-letter USPS code
 - Returns `data_types` (METAR, TAF, etc.) so agents can confirm what's available before querying
-- Every result states whether the upstream 400-row cap cut it, so a truncated draw is never mistaken for every station in the area — a capped state query also reports the row count from before the state filter, and a smaller `bbox` is the named lever
-- `limit` (1–400) bounds how many stations a `bbox` or `state` search returns without changing the area searched, ordered by ICAO identifier ascending with identifier-less stations (buoys, mesonet sites) last — so the same query and limit return the same stations, and a sampled state leads with airports rather than with sites carrying no ID. A limited result says so separately from the cap — a limit withheld stations that were examined, a cap dropped stations that were never drawn — and both can be reported at once without either implying the other. It belongs to the area modes; supplying it alongside `station_ids` is rejected, since that mode already names the set
-- An ID lookup names every identifier that resolved to nothing instead of silently returning a shorter list, and separates the one shape it can diagnose — a 3-letter IATA code, which never resolves — from an identifier the registry simply does not list. Reconciliation matches the identifiers upstream returned, so a repeated or differently-cased ID is not reported as a gap
-- Whitespace around an ID is trimmed rather than failing the batch — a padded entry resolves like the bare one, and only an empty or whitespace-only entry is rejected. No ICAO shape is imposed, so buoys and mesonet sites carrying no ICAO, IATA, or FAA identifier still resolve
+- Every result states whether the upstream 400-row cap cut it; `limit` (1–400) bounds how many stations a `bbox` or `state` search returns, ordered by ICAO identifier ascending with identifier-less stations last — rejected alongside `station_ids`, since that mode already names the set
+- An ID lookup names every identifier that resolved to nothing, separating a 3-letter IATA code (never resolves) from an identifier the registry simply does not list
+- Whitespace around an ID is trimmed rather than failing the batch; only an empty or whitespace-only entry is rejected
 
 ---
 
-### `aviation_get_metar`
+### `aviation_get_metar` <sub>tool</sub>
 
-Fetch current or recent METAR observations (1–10 stations per call).
-
-- `hours` (1–12) is a lookback window rather than a row limit — every observation inside it is returned, so a half-hourly station yields two rows at the default of 1
-- Flight category (VFR/MVFR/IFR/LIFR) is returned directly from the AWC API — no client-side computation needed
-- Decodes cloud layers, wind with gusts, visibility, and present weather (the raw groups plus plain English, one reading per group) in addition to the raw METAR string
-- Ceiling covers broken, overcast, and obscuration layers, and reports whether the height was measured or is an indefinite ceiling — vertical visibility into an obscuration. An obscuration the station could not see up into (a `VV///` group) reads as a ceiling of undetermined height rather than as no ceiling
-- `sky_condition` carries the group an observation states when it publishes no layer heights (`CLR`, `SKC`, `CAVOK`, or `OVX` for a `VV///` obscuration), so an empty `clouds` array with nothing beside it reads as a sky the station did not report rather than as a clear one
-- METAR type field distinguishes `METAR` (routine) from `SPECI` (special observation triggered by significant weather change)
-- Every batch reports which of the requested stations came back, so a partial result is never mistaken for full coverage — missing IDs are named with recovery guidance
+- Accepts 1–10 ICAO station IDs per call; `hours` (1–12) is a lookback window, not a row limit — every observation inside it is returned
+- Flight category (VFR/MVFR/IFR/LIFR) returned directly from the AWC API; decodes wind, visibility, present weather, and cloud layers alongside the raw METAR string
+- Ceiling reports both height and kind (measured, or indefinite for vertical visibility into an obscuration) — `sky_condition` distinguishes a reported clear sky from an unreported one when `clouds` is empty
+- `metar_type` distinguishes routine `METAR` from special `SPECI` observations
+- Every batch reports which requested stations came back, naming missing IDs with recovery guidance
 
 ---
 
-### `aviation_get_taf`
+### `aviation_get_taf` <sub>tool</sub>
 
-Fetch Terminal Aerodrome Forecasts for 1–4 airports.
-
-- Returns structured forecast periods with change types (`FM`, `TEMPO`, `BECMG`) and probabilities
-- Forecast weather decoded group by group beside the raw groups (`-SHRA BR` → `light rain showers; mist`), the same shape `aviation_get_metar` returns
-- Forecast obscurations keep their layer and carry the vertical visibility into them (`VV002` → a 200 ft indefinite ceiling), rather than reading as a clear sky
-- `sky_condition` carries a forecast clear sky (`SKC`, `NSC`) whose group has no height to publish, so a period with no cloud element — a `TEMPO` or `PROB` group amending only visibility or weather — reads as leaving the prevailing forecast's cloud unchanged rather than as forecasting clear
-- Low-level wind shear (`WS020/20040KT`) is decoded to the shear-layer top and the forecast wind at that height
-- `valid_from` / `valid_to` in ISO 8601 for straightforward time comparisons
-- Every batch reports which of the requested stations came back, so a partial result is never mistaken for full coverage — missing IDs are named with recovery guidance
+- Accepts 1–4 ICAO station IDs per call
+- Structured forecast periods with change types (`FM`, `TEMPO`, `BECMG`) and probabilities; weather decoded group by group beside the raw groups
+- Forecast obscurations keep their layer and carry the vertical visibility into them, rather than reading as clear sky; `sky_condition` distinguishes an unamended period from a stated clear sky
+- Low-level wind shear (`WS020/20040KT`) decoded to the shear-layer top and forecast wind at that height
+- `valid_from` / `valid_to` in ISO 8601 for time comparisons
+- Every batch reports which requested stations came back, naming missing IDs with recovery guidance
 
 ---
 
-### `aviation_get_pireps`
+### `aviation_get_pireps` <sub>tool</sub>
 
-Search for recent Pilot Reports by station+radius or bounding box.
-
-- `station_id` + `distance_nm` (10–500 nm, 100 when omitted) for radial search around an airport
-- `bbox` for geographic area search — useful for en-route corridor checks; `distance_nm` has no meaning here and is rejected alongside it
-- `altitude_min_ft` / `altitude_max_ft` filters to isolate reports at cruise altitude, either bound alone or both (min must not exceed max). Both bounds together, spanning 6,000 ft or less, fit the API's own search width and are sent to it, so the band narrows the search rather than only trimming the result; a single bound or a wider span trims the result alone
-- `min_intensity` (`lgt` / `mod` / `sev`) restricts the search to reports carrying a turbulence or icing layer at that intensity or above — it selects reports, not layers, so a matching report still carries its lighter layers
-- Turbulence and icing arrays include up to two layers per report. Icing layers the API synthesized for a report that never mentioned ice are dropped, so an icing layer always reflects something the pilot reported
-- Every result states whether the upstream 400-row cap cut it, naming the levers that narrow a query before the cap applies — and only the ones the query has not already used
-- `limit` (1–400) bounds how many reports come back without changing what is searched; it applies after the ordering by observation time, so it keeps the most recent. A limited result says so separately from the cap — a limit withheld reports that were examined, a cap dropped reports that were never drawn — and both can be reported at once without either implying the other. Selection is by recency alone, so pair it with `min_intensity` to bound a result by severity instead
-- Note: absence of PIREPs does not mean smooth conditions — they are sparse by nature
+- `station_id` + `distance_nm` (10–500 nm, 100 when omitted) for radial search, or `bbox` for area search — mutually exclusive
+- `altitude_min_ft` / `altitude_max_ft` filter to a cruise-altitude band (min must not exceed max); a report with unknown altitude is dropped once either bound is set
+- `min_intensity` (`lgt` / `mod` / `sev`) restricts to reports carrying a turbulence or icing layer at that intensity or above — a matching report still carries its lighter layers
+- Turbulence and icing arrays include up to two layers per report; icing layers the API synthesized for a report that never mentioned ice are dropped
+- Every result states whether the upstream 400-row cap cut it, and `limit` (1–400) bounds how many reports come back, ordered by recency
+- PIREPs are sparse by nature — absence of reports does not mean smooth conditions
 
 ---
 
-### `aviation_get_advisories`
+### `aviation_get_advisories` <sub>tool</sub>
 
-List currently active domestic SIGMETs.
-
-- `advisory_type` filter: `sigmet` or `all` (default) — both return the active SIGMET set
-- `hazard` filter: `CONVECTIVE`, `TURBULENCE`, `ICING`, `IFR` — sent to the AWC endpoint's own `hazard` parameter, so the matching is done by AWC against however it spells the class
-- `bbox` filter applied client-side (the AWC endpoint defines no bbox parameter; the tool filters by polygon overlap)
-- AIRMETs are not served. The upstream feed carries domestic SIGMETs only, so `advisory_type: airmet` and the `MTN OBSCN`, `SURFACE WIND`, and `LLWS` hazards are rejected with guidance rather than answered with SIGMETs or an empty array
-- During fair-weather periods, no SIGMETs may be active — an empty result is a valid state, not an error
-- An empty result names what emptied it: nothing active anywhere, no advisory carrying the requested hazard, or none intersecting the requested `bbox` — so a filter that needs broadening is not mistaken for quiet weather
+- `advisory_type`: `sigmet` or `all` (default) — both return the active SIGMET set
+- `hazard` filter (`CONVECTIVE`, `TURBULENCE`, `ICING`, `IFR`) applied upstream by AWC; `bbox` filtered client-side by polygon overlap
+- AIRMETs are not served — the upstream feed carries domestic SIGMETs only, and a request for one (or its `MTN OBSCN` / `SURFACE WIND` / `LLWS` hazards) is rejected with guidance rather than answered with SIGMETs
+- An empty result is a valid fair-weather state, and names what emptied it — nothing active, no advisory carrying the hazard, or none intersecting the `bbox` — so a filter that needs broadening isn't mistaken for quiet weather
 
 ---
 
-## Prompts
+### `aviation_preflight_brief` <sub>prompt</sub>
 
-| Type | Name | Description |
-|:-----|:-----|:------------|
-| Prompt | `aviation_preflight_brief` | Structure a preflight weather briefing for a flight. Guides the LLM to call `aviation_get_metar`, `aviation_get_taf`, `aviation_get_pireps`, and `aviation_get_advisories` in sequence — split across as many calls as each tool's station limit requires — and synthesize a weather-risk summary with flight categories, active hazards, and the assessments it could not make. |
-
-Takes `departure_icao` and `destination_icao`, plus optional `alternates`, `departure_time`, `cruise_altitude`, and `route_waypoints`. The last three each narrow one step: the departure time selects the TAF forecast period the briefing is read against, the cruise altitude bounds the PIREP search to a ±3,000 ft band, and the route waypoints (decimal-degree `lat,lon` pairs) become the advisory `bbox`. Omit any of them and the briefing still generates, naming the assessment it could not make. It reports weather risk rather than a go/no-go recommendation — that decision needs pilot, aircraft, and operational-minima context this server does not hold.
-
-All resource data is reachable via tools. This server has no resources — all aviation weather data is time-sensitive (METARs valid ~1 hour, advisories minutes to hours) and unsuitable for stable-URI resources.
+- Arguments: `departure_icao` and `destination_icao` required; `alternates` (comma-separated ICAOs), `departure_time` (ISO 8601 UTC), `cruise_altitude` (feet MSL), and `route_waypoints` (semicolon-separated `lat,lon` pairs) optional
+- Calls `aviation_get_metar`, `aviation_get_taf`, `aviation_get_pireps`, and `aviation_get_advisories` in sequence, chunked to each tool's station-per-call limit
+- `departure_time` selects the TAF forecast period the briefing is read against; `cruise_altitude` bounds the PIREP search to a ±3,000 ft band; `route_waypoints` become the advisories `bbox`, widened by 1° on each side
+- Omitting any of the three still generates the briefing, naming the assessment it could not make
+- Reports weather risk rather than a go/no-go recommendation — that decision needs pilot, aircraft, and operational-minima context this server does not hold
 
 ---
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
-
-- Declarative tool and prompt definitions — single file per primitive, framework handles registration and validation
-- Unified error handling — handlers throw, framework catches, classifies, and formats
-- Pluggable auth: `none`, `jwt`, `oauth`
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 Aviation-weather-specific:
 
 - Keyless — no API key or authentication required; all data is from the public AWC Data API
 - Single service (`aviation-weather-service`) with retry + exponential backoff for the keyless public endpoint
-- Raw coded strings (`rawOb`, `rawTAF`, `rawAirSigmet`) surfaced alongside decoded fields so agents have both layers
+- Raw coded strings (`raw_metar`, `raw_taf`, `raw_pirep`, `raw_text`) surfaced alongside decoded fields so agents have both layers
 - State→bbox table enables US-state station queries that the AWC API doesn't natively support
 - Server-level `instructions` field surfaces the "not an official briefing" safety disclaimer to all clients on `initialize`
 
 Agent-friendly output:
 
-- Flight category (`VFR`/`MVFR`/`IFR`/`LIFR`) as a discriminated string field — agents can branch on it without parsing ceiling + visibility
-- Structured error contracts with typed `reason` fields and `recovery` hints (e.g., "Verify ICAO IDs with `aviation_find_stations`")
-- `aviation_preflight_brief` prompt encodes the correct METAR → TAF → PIREPs → advisories briefing sequence that agents frequently get wrong by omitting steps, chunks each step to the station limit the tool actually enforces, and names the assessments it could not make instead of implying a complete picture
+- Discriminated output — flight category (`VFR`/`MVFR`/`IFR`/`LIFR`) as a typed string field, so agents branch on it without parsing ceiling and visibility
+- Structured error contracts — typed `reason` fields with `recovery` hints (e.g., "Verify ICAO IDs with `aviation_find_stations`")
+- Partial-result reconciliation — batch tools report `requested` / `returned` / `missing` / `partial` fields, so a short batch is never mistaken for full coverage
+- Workflow sequencing — the `aviation_preflight_brief` prompt encodes the correct METAR → TAF → PIREPs → advisories sequence, chunks each step to the tool's station limit, and names the assessments it could not make
 
 ---
 
@@ -165,7 +151,7 @@ A public hosted instance is available at `https://aviation-weather.caseyjhand.co
 }
 ```
 
-### Self-hosted / local
+### Self-Hosted / Local
 
 Add the following to your MCP client configuration file.
 
@@ -230,7 +216,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
 - No API key required — the AWC Data API is fully public and keyless.
 
 ### Installation
@@ -270,7 +256,7 @@ cp .env.example .env
 | `AWC_TIMEOUT_MS` | Per-request timeout in milliseconds (1000–60000). | `10000` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
-| `MCP_SESSION_MODE` | HTTP session handling: `auto` (resolves to `stateful`), `stateful`, or `stateless`. The shipped `.env.example` and Docker image pin `stateless` — no tool here needs a multi-round-trip input. | `stateless` |
+| `MCP_SESSION_MODE` | HTTP session handling: `auto` (resolves to `stateful`), `stateful`, or `stateless`. The server declares `stateless` in code — no tool here needs a multi-round-trip input — and the shipped `.env.example` and Docker image pin the same value. Setting this overrides the declaration. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry). | `false` |
@@ -339,7 +325,7 @@ See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rule
 
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck
