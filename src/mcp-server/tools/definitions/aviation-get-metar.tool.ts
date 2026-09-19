@@ -213,6 +213,9 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       reason: 'no_stations_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'None of the requested station IDs returned METAR data.',
+      // A station that transmits no METAR is an ordinary answer to the lookup,
+      // not an incident — keep it out of the level upstream faults occupy.
+      severity: 'notice',
       recovery:
         'Verify ICAO IDs with aviation_find_stations. Not all stations transmit METARs. Check that the station IDs are 4-letter ICAO format (e.g., KSEA not SEA).',
     },

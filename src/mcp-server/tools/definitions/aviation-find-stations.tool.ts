@@ -208,6 +208,9 @@ export const aviationFindStations = tool('aviation_find_stations', {
       reason: 'station_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'None of the requested IDs match any known station.',
+      // An identifier the registry does not list is an ordinary answer to a
+      // lookup, not an incident.
+      severity: 'notice',
       recovery:
         "A lookup matches the registry's own identifier, which for an airport is its 4-letter ICAO ID (KSEA, not SEA). Use bbox or state to discover identifiers by location.",
     },

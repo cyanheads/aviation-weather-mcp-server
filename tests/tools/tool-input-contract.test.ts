@@ -10,6 +10,12 @@
  * client, and they pin the root-strict / nested-strip split the strictness only
  * applies at the root.
  *
+ * These assert against the schema directly, which is the surface `inputSchema`
+ * advertises. The framework runs a pre-validation step above it that rewrites a
+ * case-style variant of a declared key before the schema sees it, so a key the
+ * schema rejects here is not necessarily a key a caller cannot send — see the
+ * camelCase case below.
+ *
  * @module tests/tools/tool-input-contract.test
  */
 
@@ -103,10 +109,14 @@ describe('tool input contract', () => {
         expect(result.error.issues[0]?.message).toContain('not_a_parameter');
       });
 
-      it('rejects a camelCase spelling of a declared snake_case parameter', () => {
-        // The realistic drift: a doc or a client writes `stationIds`. Before
-        // strict inputs this was dropped and the call ran with the parameter
-        // missing; it now fails loudly and names the offending key.
+      it('rejects a camelCase spelling of a declared snake_case parameter at the schema', () => {
+        // The realistic drift: a doc or a client writes `stationIds`. The schema
+        // rejects it by name rather than dropping it, which is what keeps
+        // `additionalProperties: false` honest. A caller does not see that
+        // rejection: the framework's case-style pre-validation folds `-`/`_` and
+        // case, matches the single declared key, and rewrites the argument
+        // before the schema runs — so the call succeeds. What is pinned here is
+        // the schema, not the caller-facing outcome.
         const camel = keys.find((k) => k.includes('_'));
         if (!camel) return;
         const camelCase = camel.replace(/_(.)/g, (_, c: string) => c.toUpperCase());

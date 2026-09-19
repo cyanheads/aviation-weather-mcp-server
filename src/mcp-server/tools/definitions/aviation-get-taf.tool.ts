@@ -185,6 +185,9 @@ export const aviationGetTaf = tool('aviation_get_taf', {
       reason: 'no_taf_available',
       code: JsonRpcErrorCode.NotFound,
       when: 'Station does not issue TAFs or no TAF is currently available.',
+      // Most airports issue no TAF at all, so a miss is an ordinary answer to
+      // the lookup rather than an incident.
+      severity: 'notice',
       recovery:
         'Not all airports have TAFs — only major airports with scheduled commercial service typically issue them. Check data_types from aviation_find_stations to confirm TAF capability. Smaller airports may only have METARs.',
     },

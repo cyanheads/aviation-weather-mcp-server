@@ -702,11 +702,20 @@ export class AviationWeatherService {
     this.timeoutMs = serverConfig.awcTimeoutMs;
   }
 
-  /** Fetch and parse JSON from the AWC API with retry and timeout. */
+  /**
+   * Fetch and parse JSON from the AWC API with retry and timeout.
+   *
+   * Each attempt bounds its own fetch on `attempt.signal` rather than on
+   * `ctx.signal` directly: the attempt signal is the union of the caller's
+   * cancellation and the retry deadline, so a budget that expires mid-flight
+   * aborts the request in progress instead of only between attempts.
+   */
   private fetchJson<T>(url: string, ctx: Context): Promise<T> {
     return withRetry(
-      async () => {
-        const response = await fetchWithTimeout(url, this.timeoutMs, ctx, { signal: ctx.signal });
+      async (attempt) => {
+        const response = await fetchWithTimeout(url, this.timeoutMs, ctx, {
+          signal: attempt.signal,
+        });
         // AWC returns HTTP 204 with empty body when no data matches the query.
         // Treat this as an empty result — callers guard with `if (!Array.isArray(raw)) return []`.
         if (response.status === 204) return [] as T;

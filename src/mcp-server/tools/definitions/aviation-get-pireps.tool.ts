@@ -292,6 +292,9 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       reason: 'no_pireps_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'No pilot reports found in the search area and time window.',
+      // PIREPs are sparse by nature, so an empty search is the common outcome
+      // rather than an incident.
+      severity: 'notice',
       recovery:
         'Expand the distance_nm or hours parameters, or try a different region. PIREPs are sparse; absence of reports does not mean smooth conditions.',
     },
