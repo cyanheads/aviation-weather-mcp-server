@@ -3,6 +3,7 @@
  * @module tests/tools/aviation-get-metar.tool.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { aviationGetMetar } from '@/mcp-server/tools/definitions/aviation-get-metar.tool.js';
@@ -231,7 +232,7 @@ describe('aviationGetMetar', () => {
       flight_category: 'VFR',
       visibility_sm: '10+',
     });
-    expect(mockFetchMetar).toHaveBeenCalledWith(['KSEA'], 1, ctx);
+    expect(mockFetchMetar).toHaveBeenCalledWith({ stationIds: ['KSEA'], hours: 1 }, ctx);
   });
 
   it('passes hours parameter to the service', async () => {
@@ -241,7 +242,7 @@ describe('aviationGetMetar', () => {
     const result = await aviationGetMetar.handler(input, ctx);
 
     expect(result.observations).toHaveLength(2);
-    expect(mockFetchMetar).toHaveBeenCalledWith(['KSEA'], 3, ctx);
+    expect(mockFetchMetar).toHaveBeenCalledWith({ stationIds: ['KSEA'], hours: 3 }, ctx);
   });
 
   it('throws no_stations_found when service returns empty array', async () => {
@@ -275,6 +276,48 @@ describe('aviationGetMetar', () => {
 
     expect(typeof result.observations[0]!.visibility_sm).toBe('string');
     expect(result.observations[0]!.visibility_sm).toBe('10+');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// station_ids mode, pinned whole — every row inside the window, in the order
+// upstream served them, disclosing the reconciliation and nothing else
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar station_ids mode', () => {
+  /** A second station, so the batch spans two. */
+  const kpdx: NormalizedMetar = { ...ksea, station_id: 'KPDX', name: 'Portland Intl' };
+  /** An earlier KSEA observation — a second row for a station already present. */
+  const kseaEarlier: NormalizedMetar = { ...ksea, observed_at: '2026-01-15T17:53:00.000Z' };
+
+  it('returns every observation in the window, one row per station/time pair', async () => {
+    mockFetchMetar.mockResolvedValue([ksea, kseaEarlier, kpdx]);
+    const result = await runToolContract(aviationGetMetar, {
+      station_ids: ['KSEA', 'KPDX'],
+      hours: 3,
+    });
+    const { observations } = result.structuredContent as { observations: NormalizedMetar[] };
+
+    expect(observations.map((o) => [o.station_id, o.observed_at])).toEqual([
+      ['KSEA', ksea.observed_at],
+      ['KSEA', kseaEarlier.observed_at],
+      ['KPDX', kpdx.observed_at],
+    ]);
+  });
+
+  it('discloses the request reconciliation and no area-survey field', async () => {
+    mockFetchMetar.mockResolvedValue([ksea, kseaEarlier, kpdx]);
+    const result = await runToolContract(aviationGetMetar, {
+      station_ids: ['KSEA', 'KPDX'],
+      hours: 3,
+    });
+
+    expect(Object.keys(result.structuredContent ?? {}).sort()).toEqual([
+      'observations',
+      'partial',
+      'requested',
+      'returned',
+    ]);
   });
 });
 
@@ -524,13 +567,15 @@ describe('aviationGetMetar.format', () => {
     expect(text).toContain('1800');
   });
 
-  // A content[]-only client never sees structuredContent, so the unknown state
-  // has to survive into the rendered text rather than reading as a measurement.
-  it('renders an unreported wind speed as unknown, not 0 kt', () => {
+  // A content[]-only client never sees structuredContent, so the unreported
+  // state has to survive into the rendered text rather than reading as a
+  // measurement — neither a calm nor a variable wind.
+  it('renders an observation with no wind group as not reported, not 0 kt or variable', () => {
     const blocks = aviationGetMetar.format!({ observations: [sparseMetar] });
     const text = (blocks[0] as { type: string; text: string }).text;
-    expect(text).toContain('**Wind:** variable at unknown');
+    expect(text).toContain('**Wind:** not reported\n');
     expect(text).not.toContain('at 0 kt');
+    expect(text).not.toContain('variable');
   });
 
   it('renders a calm wind as 0 kt', () => {
@@ -644,6 +689,107 @@ describe('aviationGetMetar.format', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Wind line (issue #38) — a null direction is a variable wind only when a speed
+// rides beside it; with no speed the observation carried no wind group at all
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar wind line', () => {
+  /** Render one observation carrying `wind` and return its text block. */
+  function render(wind: NormalizedMetar['wind']): string {
+    const blocks = aviationGetMetar.format!({ observations: [{ ...ksea, wind }] });
+    return (blocks[0] as { type: string; text: string }).text;
+  }
+
+  it('renders a directional wind with its direction and speed', () => {
+    expect(render({ direction_deg: 180, speed_kt: 10, gust_kt: null })).toContain(
+      '**Wind:** 180° at 10 kt\n',
+    );
+  });
+
+  it('renders a VRB wind that carries a speed as variable', () => {
+    // Raw `VRB05KT` — wdir arrives as the string 'VRB' beside a real speed.
+    expect(render({ direction_deg: null, speed_kt: 5, gust_kt: null })).toContain(
+      '**Wind:** variable at 5 kt\n',
+    );
+  });
+
+  it('renders a calm wind as 0° at 0 kt, distinct from an unreported one', () => {
+    // Raw `00000KT` — 0 and null must stay distinguishable on the rendered line.
+    expect(render({ direction_deg: 0, speed_kt: 0, gust_kt: null })).toContain(
+      '**Wind:** 0° at 0 kt\n',
+    );
+  });
+
+  it.each([
+    ['a directional wind', { direction_deg: 270, speed_kt: 15, gust_kt: 25 }, '270° at 15 kt'],
+    ['a variable wind', { direction_deg: null, speed_kt: 8, gust_kt: 18 }, 'variable at 8 kt'],
+  ])('appends the gust to %s', (_label, wind, reading) => {
+    expect(render(wind)).toContain(`**Wind:** ${reading} gusting ${wind.gust_kt} kt\n`);
+  });
+
+  it('keeps the structured wind all null for an observation with no wind group', async () => {
+    mockFetchMetar.mockResolvedValue([sparseMetar]);
+    const result = await runToolContract(aviationGetMetar, { station_ids: ['KACY'], hours: 1 });
+
+    expect(result.structuredContent).toMatchObject({
+      observations: [
+        expect.objectContaining({
+          wind: { direction_deg: null, speed_kt: null, gust_kt: null },
+        }),
+      ],
+    });
+  });
+
+  it('renders an observation with no wind group as not reported, never as variable', () => {
+    // Live KPVF: `METAR KPVF 221555Z AUTO 10SM CLR 19/05 A3001 RMK AO1` — the
+    // sensor sent no wind group, so there is no direction to call variable.
+    const text = render({ direction_deg: null, speed_kt: null, gust_kt: null });
+
+    expect(text).toContain('**Wind:** not reported\n');
+    expect(text).not.toMatch(/\*\*Wind:\*\* variable/);
+    expect(text).not.toContain('unknown speed');
+  });
+
+  it('keeps an unreported wind distinguishable on both surfaces in one batch', async () => {
+    // A calm, a variable, and a missing wind group side by side: three different
+    // readings on structuredContent, and three different lines in content[].
+    const kvrb: NormalizedMetar = {
+      ...ksea,
+      station_id: 'KVRB',
+      name: 'Vero Beach',
+      wind: { direction_deg: null, speed_kt: 4, gust_kt: null },
+    };
+    mockFetchMetar.mockResolvedValue([calmMetar, kvrb, sparseMetar]);
+    const result = await runToolContract(aviationGetMetar, {
+      station_ids: ['KMSY', 'KVRB', 'KACY'],
+      hours: 1,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      observations: [
+        expect.objectContaining({ wind: { direction_deg: 0, speed_kt: 0, gust_kt: null } }),
+        expect.objectContaining({ wind: { direction_deg: null, speed_kt: 4, gust_kt: null } }),
+        expect.objectContaining({ wind: { direction_deg: null, speed_kt: null, gust_kt: null } }),
+      ],
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('**Wind:** 0° at 0 kt');
+    expect(text).toContain('**Wind:** variable at 4 kt');
+    expect(text).toContain('**Wind:** not reported');
+  });
+
+  it('states both null cases in the direction description, and what separates them', () => {
+    const description =
+      aviationGetMetar.output.shape.observations.element.shape.wind.shape.direction_deg
+        .description ?? '';
+
+    expect(description).toMatch(/VRB|variable/i);
+    expect(description).toMatch(/no wind group/i);
+    expect(description).toContain('speed_kt');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Partial-batch disclosure (issue #18) — a station that returns nothing was
 // dropped without a trace, so a partial result read as full route coverage
 // ---------------------------------------------------------------------------
@@ -751,8 +897,8 @@ describe('aviationGetMetar partial-batch disclosure', () => {
     (id) => {
       // Comparing the requested IDs against upstream `icaoId` is only a sound
       // set operation because the input contract fixes them at four uppercase
-      // letters — a relaxed input would surface a casing mismatch as a missing
-      // station rather than as the input error it is.
+      // letters or digits — a relaxed input would surface a casing mismatch as
+      // a missing station rather than as the input error it is.
       expect(aviationGetMetar.input.safeParse({ station_ids: [id], hours: 1 }).success).toBe(false);
     },
   );
@@ -779,6 +925,58 @@ describe('aviationGetMetar partial-batch disclosure', () => {
     });
     const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
     expect(text).toContain('## KSEA — Seattle-Tacoma International Airport');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Digit-bearing station identifiers (issue #37) — a US airport with no
+// three-letter FAA identifier takes a K + FAA-ID form that carries digits, and
+// AWC serves METARs for it
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar digit-bearing station identifiers', () => {
+  /** Live K0S9: `METAR K0S9 221615Z AUTO 27004KT 10SM CLR 16/11 A3005 RMK AO2`. */
+  const k0s9: NormalizedMetar = {
+    ...clearMetar,
+    station_id: 'K0S9',
+    name: 'Port Townsend/Jefferson Cnty, WA, US',
+    raw_metar: 'METAR K0S9 221615Z AUTO 27004KT 10SM CLR 16/11 A3005 RMK AO2',
+  };
+  const ks52: NormalizedMetar = { ...k0s9, station_id: 'KS52', name: 'Methow Valley State' };
+
+  it('sends the identifiers upstream and reconciles them like any other', async () => {
+    mockFetchMetar.mockResolvedValue([ks52, k0s9]);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ station_ids: ['KS52', 'K0S9'] });
+    const result = await aviationGetMetar.handler(input, ctx);
+
+    expect(mockFetchMetar).toHaveBeenCalledWith({ stationIds: ['KS52', 'K0S9'], hours: 1 }, ctx);
+    expect(result.observations.map((o) => o.station_id)).toEqual(['KS52', 'K0S9']);
+    expect(getEnrichment(ctx)).toMatchObject({ returned: ['KS52', 'K0S9'], partial: false });
+  });
+
+  it('reaches both response surfaces through the real tool pipeline', async () => {
+    mockFetchMetar.mockResolvedValue([k0s9]);
+    const result = await runToolContract(aviationGetMetar, {
+      station_ids: ['K0S9', 'KS52'],
+      hours: 1,
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      observations: [expect.objectContaining({ station_id: 'K0S9' })],
+      missing: ['KS52'],
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('## K0S9 — Port Townsend/Jefferson Cnty, WA, US');
+    expect(text).toContain('**No data returned for:** KS52');
+  });
+
+  it('describes the identifier shape as letters or digits', () => {
+    const element = aviationGetMetar.input.shape.station_ids.unwrap().element;
+
+    expect(element.description ?? '').toMatch(/digit/i);
+    expect(aviationGetMetar.errors?.[0]?.recovery ?? '').not.toMatch(/4-letter/);
   });
 });
 
@@ -998,5 +1196,430 @@ describe('aviationGetMetar description and unit accuracy', () => {
 
     expect(description).toMatch(/sky_condition/);
     expect(description).not.toMatch(/\bread\b/i);
+  });
+
+  it('describes the bbox mode as one observation per station', () => {
+    const description = aviationGetMetar.output.shape.observations.description ?? '';
+
+    expect(description).toMatch(/bbox/);
+    expect(description).toMatch(/latest observation/i);
+  });
+
+  it('names the four-layer decode limit and raw_metar as the complete source (issue #39)', () => {
+    // AWC decodes at most four METAR layers: `KPHX … SCT034 BKN043 BKN060 BKN140
+    // BKN250` arrives with four entries and BKN250 gone, with no marker.
+    const description =
+      aviationGetMetar.output.shape.observations.element.shape.clouds.description ?? '';
+
+    expect(description).toMatch(/four/i);
+    expect(description).toContain('raw_metar');
+    expect(description).not.toMatch(/\ball reported\b/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bbox area survey (issue #43) — a box draws every observation each station
+// made inside the window, so the tool reduces it to the latest per station and
+// discloses the cap it read off the draw
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar bbox survey', () => {
+  const bbox = { minLat: 47, minLon: -123, maxLat: 48, maxLon: -122 };
+
+  /** One observation at a station and time, otherwise the KSEA fixture. */
+  function observation(station_id: string, observed_at: string): NormalizedMetar {
+    return { ...ksea, station_id, name: `${station_id} field`, observed_at };
+  }
+
+  /** Run the handler over a bbox draw and return its result. */
+  async function survey(drawn: NormalizedMetar[], input: Record<string, unknown> = {}) {
+    mockFetchMetar.mockResolvedValue(drawn);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const parsed = aviationGetMetar.input.parse({ bbox, ...input });
+    const result = await aviationGetMetar.handler(parsed, ctx);
+    return { result, enrichment: getEnrichment(ctx) };
+  }
+
+  /** A draw of `rows` observations spread evenly over `stations` stations. */
+  function draw(stations: number, rows: number): NormalizedMetar[] {
+    return Array.from({ length: rows }, (_, i) =>
+      observation(
+        `K${String(i % stations).padStart(3, '0')}`,
+        `2026-01-15T${String(6 + Math.floor(i / stations)).padStart(2, '0')}:53:00.000Z`,
+      ),
+    );
+  }
+
+  it('sends the box and the lookback window to the service, naming no station', async () => {
+    mockFetchMetar.mockResolvedValue([ksea]);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ bbox, hours: 3 });
+    await aviationGetMetar.handler(input, ctx);
+
+    expect(mockFetchMetar).toHaveBeenCalledWith({ bbox, hours: 3 }, ctx);
+  });
+
+  it('returns the latest observation per station, one row each', async () => {
+    // Upstream serves every observation inside the window for every station in
+    // the box — 52 rows across 9 stations in a live 1°×1° draw at hours=3.
+    const { result } = await survey(
+      [
+        observation('KPLU', '2026-01-15T16:35:00.000Z'),
+        observation('KPWT', '2026-01-15T16:35:00.000Z'),
+        observation('KPLU', '2026-01-15T16:15:00.000Z'),
+        observation('KPWT', '2026-01-15T16:07:00.000Z'),
+        observation('KPLU', '2026-01-15T16:00:00.000Z'),
+      ],
+      { hours: 3 },
+    );
+
+    expect(result.observations.map((o) => [o.station_id, o.observed_at])).toEqual([
+      ['KPLU', '2026-01-15T16:35:00.000Z'],
+      ['KPWT', '2026-01-15T16:35:00.000Z'],
+    ]);
+  });
+
+  it('keeps the latest reading however the draw was ordered', async () => {
+    // Upstream serves newest first today, and the reduction does not lean on it.
+    const { result } = await survey([
+      observation('KSEA', '2026-01-15T15:00:00.000Z'),
+      observation('KSEA', '2026-01-15T17:00:00.000Z'),
+      observation('KSEA', '2026-01-15T16:00:00.000Z'),
+    ]);
+
+    expect(result.observations).toHaveLength(1);
+    expect(result.observations[0]!.observed_at).toBe('2026-01-15T17:00:00.000Z');
+  });
+
+  it('orders the result by station ID ascending', async () => {
+    const { result } = await survey([
+      observation('KTIW', '2026-01-15T16:00:00.000Z'),
+      observation('K0S9', '2026-01-15T16:00:00.000Z'),
+      observation('KPLU', '2026-01-15T16:00:00.000Z'),
+      observation('KBFI', '2026-01-15T16:00:00.000Z'),
+    ]);
+
+    expect(result.observations.map((o) => o.station_id)).toEqual(['K0S9', 'KBFI', 'KPLU', 'KTIW']);
+  });
+
+  it('returns the same stations on an identical repeated call', async () => {
+    const drawn = draw(12, 60);
+    const first = await survey(drawn, { limit: 5 });
+    const second = await survey(drawn, { limit: 5 });
+
+    expect(second.result.observations.map((o) => o.station_id)).toEqual(
+      first.result.observations.map((o) => o.station_id),
+    );
+  });
+
+  it('discloses an uncapped survey affirmatively and reconciles no request', async () => {
+    const { enrichment } = await survey(draw(3, 9));
+
+    expect(enrichment).toEqual({ truncated: false, shown: 3 });
+  });
+
+  // -------------------------------------------------------------------------
+  // Mode guards
+  // -------------------------------------------------------------------------
+
+  it('rejects a call naming neither station_ids nor bbox', async () => {
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({});
+
+    await expect(aviationGetMetar.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'missing_location', recovery: { hint: expect.any(String) } },
+    });
+    expect(mockFetchMetar).not.toHaveBeenCalled();
+  });
+
+  it('rejects a call naming both station_ids and bbox', async () => {
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ station_ids: ['KSEA'], bbox });
+
+    await expect(aviationGetMetar.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'conflicting_location' },
+    });
+    expect(mockFetchMetar).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['an inverted latitude', { ...bbox, minLat: 49 }],
+    ['an inverted longitude', { ...bbox, minLon: -121 }],
+    ['both bounds inverted', { minLat: 48, minLon: -122, maxLat: 47, maxLon: -123 }],
+  ])('rejects %s before any upstream request', async (_label, inverted) => {
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ bbox: inverted });
+
+    await expect(aviationGetMetar.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_bbox' },
+    });
+    expect(mockFetchMetar).not.toHaveBeenCalled();
+  });
+
+  it('accepts a degenerate zero-area box, which is ordered', async () => {
+    mockFetchMetar.mockResolvedValue([ksea]);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({
+      bbox: { minLat: 47, minLon: -122, maxLat: 47, maxLon: -122 },
+    });
+
+    await expect(aviationGetMetar.handler(input, ctx)).resolves.toMatchObject({
+      observations: [expect.objectContaining({ station_id: 'KSEA' })],
+    });
+  });
+
+  it('rejects a limit alongside station_ids, which already names the set', async () => {
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ station_ids: ['KSEA'], limit: 5 });
+
+    await expect(aviationGetMetar.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'conflicting_limit' },
+    });
+    expect(mockFetchMetar).not.toHaveBeenCalled();
+  });
+
+  it('reports a location-mode mistake ahead of a limit mistake', async () => {
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ station_ids: ['KSEA'], bbox, limit: 5 });
+
+    await expect(aviationGetMetar.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'conflicting_location' },
+    });
+  });
+
+  it.each([0, 401])('rejects a limit of %i at the schema', (limit) => {
+    expect(aviationGetMetar.input.safeParse({ bbox, limit }).success).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // Empty box
+  // -------------------------------------------------------------------------
+
+  it('words an empty box for the mode that produced it', async () => {
+    mockFetchMetar.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ bbox, hours: 2 });
+
+    await expect(aviationGetMetar.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: expect.stringContaining('bounding box'),
+      data: {
+        reason: 'no_stations_found',
+        recovery: { hint: expect.stringContaining('Widen the bounding box') },
+      },
+    });
+  });
+
+  it('keeps the station_ids wording on an empty batch', async () => {
+    mockFetchMetar.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ station_ids: ['KZZZ'] });
+
+    await expect(aviationGetMetar.handler(input, ctx)).rejects.toMatchObject({
+      message: 'No METAR data found for: KZZZ',
+      data: {
+        stationIds: ['KZZZ'],
+        recovery: { hint: expect.stringContaining('aviation_find_stations') },
+      },
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // limit
+  // -------------------------------------------------------------------------
+
+  it('bounds the reduced result and says what it withheld', async () => {
+    const { result, enrichment } = await survey(draw(9, 45), { limit: 4 });
+
+    expect(result.observations).toHaveLength(4);
+    expect(enrichment).toMatchObject({ truncated: false, shown: 4, limited: true, matched: 9 });
+    expect(String(enrichment.notice)).toContain('4 of 9 matching station(s)');
+    expect(String(enrichment.notice)).toContain('not the upstream cap');
+  });
+
+  it('affirms a limit that had nothing to withhold', async () => {
+    const { result, enrichment } = await survey(draw(3, 9), { limit: 10 });
+
+    expect(result.observations).toHaveLength(3);
+    expect(enrichment).toMatchObject({ limited: false, shown: 3 });
+    expect(enrichment).not.toHaveProperty('matched');
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('treats a limit equal to the station count as not biting', async () => {
+    const { enrichment } = await survey(draw(3, 9), { limit: 3 });
+
+    expect(enrichment).toMatchObject({ limited: false, shown: 3 });
+  });
+
+  it('emits no limited field for a survey that set no limit', async () => {
+    const { enrichment } = await survey(draw(3, 9));
+
+    expect(enrichment).not.toHaveProperty('limited');
+    expect(enrichment).not.toHaveProperty('matched');
+  });
+
+  it('counts the limit in stations, not in drawn observations', async () => {
+    // 30 rows over 5 stations: a limit of 2 returns two stations, never two rows
+    // off the front of the draw.
+    const { result } = await survey(draw(5, 30), { limit: 2 });
+
+    expect(result.observations).toHaveLength(2);
+    expect(new Set(result.observations.map((o) => o.station_id)).size).toBe(2);
+  });
+
+  // -------------------------------------------------------------------------
+  // Upstream row cap
+  // -------------------------------------------------------------------------
+
+  it('discloses a capped draw and names hours as the lever', async () => {
+    // Live: a WA-sized box at hours=12 caps at 400 rows covering 61 stations.
+    const { enrichment } = await survey(draw(61, 400), { hours: 12 });
+
+    expect(enrichment).toMatchObject({
+      truncated: true,
+      cap: 400,
+      shown: 61,
+      upstreamRows: 400,
+    });
+    expect(String(enrichment.notice)).toContain('400 observations');
+    expect(String(enrichment.notice)).toContain('only 61 of them');
+    expect(String(enrichment.notice)).toMatch(/lower hours/i);
+  });
+
+  it('reads the cap off the drawn rows, not off the station count', async () => {
+    // 400 rows over 61 stations: a returned count of 61 sits far below the cap
+    // and cannot reveal the truncation on its own.
+    const { result, enrichment } = await survey(draw(61, 400));
+
+    expect(result.observations).toHaveLength(61);
+    expect(enrichment.truncated).toBe(true);
+  });
+
+  it('leaves a draw one row short of the cap untruncated', async () => {
+    const { enrichment } = await survey(draw(61, 399));
+
+    expect(enrichment).toMatchObject({ truncated: false });
+    expect(enrichment).not.toHaveProperty('cap');
+    expect(enrichment).not.toHaveProperty('upstreamRows');
+  });
+
+  it('composes the cap and the limit as two disclosures in one notice', async () => {
+    const { enrichment } = await survey(draw(61, 400), { limit: 10 });
+
+    expect(enrichment).toMatchObject({
+      truncated: true,
+      cap: 400,
+      shown: 10,
+      limited: true,
+      matched: 61,
+      upstreamRows: 400,
+    });
+    const notice = String(enrichment.notice);
+    expect(notice).toContain('its per-request maximum');
+    expect(notice).toContain('10 of 61 station(s) inside the capped draw');
+    expect(notice).toContain('not the upstream cap');
+  });
+
+  it('scopes the matched count to the capped draw rather than to the box', async () => {
+    const { enrichment } = await survey(draw(61, 400), { limit: 10 });
+
+    expect(String(enrichment.notice)).toContain('inside the capped draw');
+  });
+
+  // -------------------------------------------------------------------------
+  // Mode exclusivity and both response surfaces
+  // -------------------------------------------------------------------------
+
+  it('reconciles no request on a bbox survey', async () => {
+    const { enrichment } = await survey(draw(3, 9));
+
+    for (const key of ['requested', 'returned', 'partial', 'missing']) {
+      expect(enrichment).not.toHaveProperty(key);
+    }
+  });
+
+  it('discloses no survey field on a station_ids batch', async () => {
+    mockFetchMetar.mockResolvedValue([ksea]);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ station_ids: ['KSEA'] });
+    await aviationGetMetar.handler(input, ctx);
+
+    for (const key of ['truncated', 'shown', 'limited', 'matched', 'cap', 'upstreamRows']) {
+      expect(getEnrichment(ctx)).not.toHaveProperty(key);
+    }
+  });
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    mockFetchMetar.mockResolvedValue([
+      observation('KPWT', '2026-01-15T16:35:00.000Z'),
+      observation('KPLU', '2026-01-15T16:35:00.000Z'),
+      observation('KPLU', '2026-01-15T16:00:00.000Z'),
+    ]);
+    const result = await runToolContract(aviationGetMetar, { bbox, hours: 3, limit: 1 });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      observations: [expect.objectContaining({ station_id: 'KPLU' })],
+      truncated: false,
+      shown: 1,
+      limited: true,
+      matched: 2,
+    });
+
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('## KPLU — KPLU field');
+    expect(text).not.toContain('## KPWT');
+    expect(text).toContain('**Stations returned:** 1');
+    expect(text).toContain('**Limited by the request:** true');
+    expect(text).toContain('**Stations drawn before the limit:** 2');
+  });
+
+  it('renders a capped survey on the content[] surface', async () => {
+    mockFetchMetar.mockResolvedValue(draw(61, 400));
+    const result = await runToolContract(aviationGetMetar, { bbox, hours: 12 });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+
+    expect(text).toContain('**Truncated at the upstream row cap:** true');
+    expect(text).toContain('**Upstream row maximum:** 400');
+    expect(text).toContain('400 observations');
+  });
+
+  // -------------------------------------------------------------------------
+  // What `truncated` claims — the row cap is the only thing it reads. AWC also
+  // thins a dense box by station priority, independently of the cap and with no
+  // signal in the response, so a draw under the cap is not a complete box.
+  // -------------------------------------------------------------------------
+
+  /** The advertised description of the `truncated` enrichment field. */
+  function truncatedDescription(): string {
+    return aviationGetMetar.enrichment?.truncated?.description ?? '';
+  }
+
+  it('reads truncated off the row cap alone', async () => {
+    expect((await survey(draw(3, 9))).enrichment).toMatchObject({ truncated: false, shown: 3 });
+    expect((await survey(draw(61, 400))).enrichment).toMatchObject({ truncated: true, cap: 400 });
+  });
+
+  it('claims only that the draw did not reach the row cap', () => {
+    expect(truncatedDescription()).not.toMatch(/drawn in full/i);
+    expect(truncatedDescription()).toMatch(/row cap/i);
+  });
+
+  it('says a dense box can be thinned without reaching the cap', () => {
+    const description = truncatedDescription();
+
+    expect(description).toMatch(/priority/i);
+    expect(description).toMatch(/not a completeness claim/i);
+  });
+
+  it('keeps the trailer label keyed to the cap', () => {
+    expect(aviationGetMetar.enrichmentTrailer?.truncated?.label).toBe(
+      'Truncated at the upstream row cap',
+    );
   });
 });
