@@ -47,7 +47,7 @@ const IATA_IDENT = /^[A-Za-z]{3}$/;
  * from `stationinfo`, so absence from AWC's station list says nothing about
  * whether the airport exists.
  *
- * Only one shape is diagnosable, and it is not the four-letter one. A lookup
+ * Only one shape is diagnosable, and it is not the four-character one. A lookup
  * matches the registry's own identifier, which carries whatever shape the site
  * has — `NUET2` and `46114` both resolve — so an unresolved identifier of an
  * unexpected length is simply absent, and telling its caller the format is
@@ -133,14 +133,14 @@ function upstreamRejectionHint(mode: 'station_ids' | 'bbox' | 'state'): string {
 export const aviationFindStations = tool('aviation_find_stations', {
   title: 'Find Aviation Weather Stations',
   description:
-    "Resolve an airport or weather reporting station by its identifier, or discover stations within a bounding box or US state. Returns all identifier variants (ICAO/IATA/FAA), coordinates, elevation, and available data types (METAR, TAF, SYNOP, etc.). A lookup matches the registry's own identifier, which for an airport is its 4-letter ICAO ID (e.g., KSEA, KJFK); buoys and mesonet sites carry identifiers of other shapes and resolve by those. At least one of station_ids, bbox, or state is required. limit bounds how many stations an area search returns without changing the area searched, and belongs to the bbox and state modes only.",
+    "Resolve an airport or weather reporting station by its identifier, or discover stations within a bounding box or US state. Returns all identifier variants (ICAO/IATA/FAA), coordinates, elevation, and available data types (METAR, TAF, SYNOP, etc.). A lookup matches the registry's own identifier, which for an airport is its 4-character ICAO ID (e.g., KSEA, KJFK, K0S9); buoys and mesonet sites carry identifiers of other shapes and resolve by those. At least one of station_ids, bbox, or state is required. limit bounds how many stations an area search returns without changing the area searched, and belongs to the bbox and state modes only.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     station_ids: z
       .array(
         z
           .string()
-          // Not the four-letter pattern the weather tools use: the registry
+          // Not the four-character pattern the weather tools use: the registry
           // carries buoys and mesonet sites with no ICAO, IATA, or FAA
           // identifier at all, so a shape constraint would reject a working
           // search. Empty and whitespace-only are the only rejectable entries.
@@ -151,7 +151,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
       .max(20)
       .optional()
       .describe(
-        "One or more station identifiers (e.g., KSEA, KJFK). A lookup matches the registry's own identifier: a 4-letter ICAO ID for an airport, and other shapes for the buoys and mesonet sites the registry also carries, which resolve by those. A 3-letter IATA code (e.g., SEA) never resolves, even for a station whose entry carries one. Whitespace around an entry is trimmed, so a padded identifier resolves the same as the bare one; an empty or whitespace-only entry is rejected. Use bbox or state to discover identifiers by location.",
+        "One or more station identifiers (e.g., KSEA, KJFK). A lookup matches the registry's own identifier: a 4-character ICAO ID for an airport (e.g., KSEA, K0S9), and other shapes for the buoys and mesonet sites the registry also carries, which resolve by those. A 3-letter IATA code (e.g., SEA) never resolves, even for a station whose entry carries one. Whitespace around an entry is trimmed, so a padded identifier resolves the same as the bare one; an empty or whitespace-only entry is rejected. Use bbox or state to discover identifiers by location.",
       ),
     bbox: BboxSchema.optional(),
     state: z
@@ -179,7 +179,9 @@ export const aviationFindStations = tool('aviation_find_stations', {
             icao_id: z
               .string()
               .nullable()
-              .describe('ICAO 4-letter station ID, or null if not assigned.'),
+              .describe(
+                'ICAO station ID, 4 uppercase letters or digits (e.g., KSEA, K0S9), or null if not assigned.',
+              ),
             iata_id: z.string().nullable().describe('IATA 3-letter code, or null if not assigned.'),
             faa_id: z.string().nullable().describe('FAA identifier, or null if not assigned.'),
             name: z.string().describe('Human-readable site name.'),
@@ -212,7 +214,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
       // lookup, not an incident.
       severity: 'notice',
       recovery:
-        "A lookup matches the registry's own identifier, which for an airport is its 4-letter ICAO ID (KSEA, not SEA). Use bbox or state to discover identifiers by location.",
+        "A lookup matches the registry's own identifier, which for an airport is its 4-character ICAO ID (KSEA, not SEA). Use bbox or state to discover identifiers by location.",
     },
     {
       reason: 'missing_search_criteria',

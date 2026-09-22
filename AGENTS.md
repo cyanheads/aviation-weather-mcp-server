@@ -56,7 +56,7 @@ export const aviationGetMetar = tool('aviation_get_metar', {
   annotations: { readOnlyHint: true, idempotentHint: true },
   input: z.object({
     station_ids: z
-      .array(z.string().regex(/^[A-Z]{4}$/).describe('4-letter ICAO station ID.'))
+      .array(z.string().regex(/^[A-Z0-9]{4}$/).describe('4-character ICAO station ID.'))
       .min(1).max(10)
       .describe('ICAO station IDs to query. 1–10 stations per call.'),
     hours: z.number().int().min(1).max(12).default(1)

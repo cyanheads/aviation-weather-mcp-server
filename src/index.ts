@@ -27,7 +27,7 @@ await createApp({
   prompts: [aviationPreflightBrief],
   instructions: `Aviation weather from the NWS Aviation Weather Center (aviationweather.gov). Keyless, no API key required. Covers METARs, TAFs, PIREPs, and domestic SIGMETs. AIRMETs are not served — aviation_get_advisories rejects a request for one rather than answering it with SIGMETs.
 IMPORTANT: This data is for informational purposes only. Flight operations in IMC or controlled airspace require an official preflight briefing from an authorized source (e.g., 1800wxbrief.com).
-Station IDs are ICAO format (4 letters, e.g. KSEA, KJFK). Use aviation_find_stations to resolve unknown IDs or discover stations in a region.`,
+Station IDs are ICAO format (4 uppercase letters or digits, e.g. KSEA, KJFK, K0S9). Use aviation_find_stations to resolve unknown IDs or discover stations in a region.`,
   /**
    * Every tool answers from one upstream read and none gates on
    * `ctx.requestInput`, so nothing here needs a session to carry state between
