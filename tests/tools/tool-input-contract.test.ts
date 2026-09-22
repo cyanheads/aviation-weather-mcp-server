@@ -19,6 +19,7 @@
  * @module tests/tools/tool-input-contract.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { describe, expect, it } from 'vitest';
 import { aviationFindStations } from '@/mcp-server/tools/definitions/aviation-find-stations.tool.js';
 import { aviationGetAdvisories } from '@/mcp-server/tools/definitions/aviation-get-advisories.tool.js';
@@ -43,8 +44,8 @@ const tools = [
   {
     name: 'aviation_get_metar',
     def: aviationGetMetar,
-    keys: ['hours', 'station_ids'],
-    full: { station_ids: ['KSEA'], hours: 3 },
+    keys: ['bbox', 'hours', 'limit', 'station_ids'],
+    full: { station_ids: ['KSEA'], bbox, hours: 3, limit: 25 },
   },
   {
     name: 'aviation_get_taf',
@@ -165,11 +166,107 @@ describe('tool input contract', () => {
     });
   });
 
+  describe('station identifier shape on the weather tools', () => {
+    /**
+     * The three fields that take an ICAO identifier and send it to a weather
+     * endpoint. They share one shape, so a caller who learns it on one tool can
+     * rely on it at the others — `aviation_find_stations` deliberately imposes
+     * none (decision 27) and is not in this set.
+     */
+    const stationFields = [
+      [
+        'aviation_get_metar station_ids[]',
+        (id: string) => aviationGetMetar.input.safeParse({ station_ids: [id] }).success,
+      ],
+      [
+        'aviation_get_taf station_ids[]',
+        (id: string) => aviationGetTaf.input.safeParse({ station_ids: [id] }).success,
+      ],
+      [
+        'aviation_get_pireps station_id',
+        (id: string) => aviationGetPireps.input.safeParse({ station_id: id }).success,
+      ],
+    ] as const;
+
+    describe.each(stationFields)('%s', (_field, accepts) => {
+      it('accepts a four-letter identifier', () => {
+        expect(accepts('KSEA')).toBe(true);
+      });
+
+      it.each([
+        ['K0S9', 'Port Townsend — K plus a digit-bearing FAA identifier'],
+        ['KS52', 'Methow Valley'],
+        ['K36U', 'a TAF-issuing digit-bearing station'],
+      ])('accepts the digit-bearing identifier %s (%s)', (id) => {
+        expect(accepts(id)).toBe(true);
+      });
+
+      it.each([
+        ['a lowercase identifier', 'k0s9'],
+        ['a three-character identifier', 'K0S'],
+        ['a five-character identifier', 'K0S9X'],
+        ['a three-letter IATA code', 'SEA'],
+        ['an identifier carrying a separator', 'K-S9'],
+        ['a padded identifier', 'KSEA '],
+        ['an empty identifier', ''],
+      ])('rejects %s', (_label, id) => {
+        expect(accepts(id)).toBe(false);
+      });
+    });
+
+    it('advertises the same alphanumeric pattern on all three fields', () => {
+      /** The `pattern` the advertised JSON Schema carries at `path`. */
+      function advertisedPattern(schema: z.ZodType, ...path: string[]): unknown {
+        let node: unknown = z.toJSONSchema(schema);
+        for (const key of path) node = (node as Record<string, unknown> | undefined)?.[key];
+        return (node as { pattern?: unknown } | undefined)?.pattern;
+      }
+
+      expect(advertisedPattern(aviationGetMetar.input, 'properties', 'station_ids', 'items')).toBe(
+        '^[A-Z0-9]{4}$',
+      );
+      expect(advertisedPattern(aviationGetTaf.input, 'properties', 'station_ids', 'items')).toBe(
+        '^[A-Z0-9]{4}$',
+      );
+      expect(advertisedPattern(aviationGetPireps.input, 'properties', 'station_id')).toBe(
+        '^[A-Z0-9]{4}$',
+      );
+    });
+
+    it('describes no station identifier as letters only on any tool', () => {
+      // A digit-bearing identifier is valid on every weather tool, so a
+      // description calling the shape "4-letter" would steer a caller away
+      // from the identifiers aviation_find_stations hands back.
+      for (const { def } of tools) {
+        const surface = JSON.stringify([
+          def.description,
+          z.toJSONSchema(def.input),
+          z.toJSONSchema(def.output),
+          def.errors,
+        ]);
+        expect(surface).not.toMatch(/\b(4|four)[- ]letter\b|\b4 letters\b/i);
+      }
+    });
+  });
+
   describe('declared defaults survive strict parsing', () => {
     it('applies hours and advisory_type defaults on a minimal payload', () => {
       expect(aviationGetMetar.input.parse({ station_ids: ['KSEA'] }).hours).toBe(1);
       expect(aviationGetPireps.input.parse({ station_id: 'KSEA' }).hours).toBe(3);
       expect(aviationGetAdvisories.input.parse({}).advisory_type).toBe('all');
+    });
+
+    it('advertises the sea-level floor and the FL600 ceiling on both PIREP altitude bounds', () => {
+      // The bounds are feet MSL and AWC searches neither a band below sea level
+      // nor the centre one far above FL600 derives, so both ends belong on the
+      // advertised schema where a caller sees them before the call rather than
+      // in an upstream rejection after it.
+      const advertised = z.toJSONSchema(aviationGetPireps.input) as {
+        properties?: Record<string, { minimum?: unknown; maximum?: unknown }>;
+      };
+
+      expect(advertised.properties?.altitude_min_ft).toMatchObject({ minimum: 0, maximum: 60000 });
+      expect(advertised.properties?.altitude_max_ft).toMatchObject({ minimum: 0, maximum: 60000 });
     });
 
     it('leaves distance_nm undefined when omitted, so the handler can tell it apart', () => {
