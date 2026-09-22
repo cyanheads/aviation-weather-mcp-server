@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.8](changelog/0.4.x/0.4.8.md) — 2026-09-22
+
+aviation_get_metar gains a bbox area-survey mode; aviation_get_taf surfaces text AWC left undecoded; aviation_get_pireps returns a typed rejection for a station_id AWC doesn't recognize instead of a bare HTTP 400; all ICAO identifier fields now accept digit-bearing station IDs.
+
 ## [0.4.7](changelog/0.4.x/0.4.7.md) — 2026-09-19
 
 Upgrades to mcp-ts-core 0.13.6: tool error text now closes with a reason and retryable flag, argument rejections carry a synthesized recovery hint, and a mis-cased or extra argument key is corrected before validation instead of failing the call.
