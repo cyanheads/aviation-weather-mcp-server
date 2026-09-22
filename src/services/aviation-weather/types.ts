@@ -285,6 +285,14 @@ export interface NormalizedTafPeriod {
   change_type: string | null;
   clouds: NormalizedTafCloudLayer[];
   from: string; // ISO 8601
+  /**
+   * Text AWC attached to this period without decoding it — upstream
+   * `notDecoded`, trimmed — or null when it decoded everything. Usually a
+   * cloud layer past the decoder's three-layer limit. Upstream can attach a
+   * TEMPO group's leftover to the period after it, so the text stays on the
+   * period it arrived on and is never parsed into `clouds`.
+   */
+  not_decoded: string | null;
   probability: number | null;
   /**
    * The sky condition this period forecast when it published no layer heights —

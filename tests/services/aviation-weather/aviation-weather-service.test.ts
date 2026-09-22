@@ -7,10 +7,14 @@
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  createFetchMock,
+  createMockContext,
+  type FetchMockHarness,
+} from '@cyanheads/mcp-ts-core/testing';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Keep withRetry (and everything else) real; stub only the network call so raw
 // AWC payloads flow through the real normalizeMetar / normalizeStation path.
@@ -233,7 +237,7 @@ describe('AviationWeatherService elevation conversion', () => {
   it('converts METAR elevation from meters to feet', async () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawMetarKDEN]));
     const ctx = createMockContext();
-    const [obs] = await svc.fetchMetar(['KDEN'], 1, ctx);
+    const [obs] = await svc.fetchMetar({ stationIds: ['KDEN'], hours: 1 }, ctx);
 
     // Math.round(1656 m * 3.28084) === 5433 ft. (KDEN's charted field elevation
     // is 5434 ft; the 1 ft delta is AWC rounding elev to whole meters upstream.)
@@ -243,7 +247,7 @@ describe('AviationWeatherService elevation conversion', () => {
   it('falls back to 0 feet when METAR elevation is null', async () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([{ ...rawMetarKDEN, elev: null }]));
     const ctx = createMockContext();
-    const [obs] = await svc.fetchMetar(['KDEN'], 1, ctx);
+    const [obs] = await svc.fetchMetar({ stationIds: ['KDEN'], hours: 1 }, ctx);
 
     expect(obs!.elevation_ft).toBe(0);
   });
@@ -289,7 +293,7 @@ describe('AviationWeatherService METAR unknown vs. genuine zero', () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(
       jsonResponse([{ ...rawMetarKDEN, ...overrides }]),
     );
-    const [obs] = await svc.fetchMetar(['KDEN'], 1, createMockContext());
+    const [obs] = await svc.fetchMetar({ stationIds: ['KDEN'], hours: 1 }, createMockContext());
     return obs!;
   }
 
@@ -367,7 +371,7 @@ describe('AviationWeatherService METAR ceiling', () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(
       jsonResponse([{ ...rawMetarKDEN, ...overrides }]),
     );
-    const [obs] = await svc.fetchMetar(['KDEN'], 1, createMockContext());
+    const [obs] = await svc.fetchMetar({ stationIds: ['KDEN'], hours: 1 }, createMockContext());
     return obs!;
   }
 
@@ -476,7 +480,7 @@ describe('AviationWeatherService METAR present weather', () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(
       jsonResponse([{ ...rawMetarKDEN, ...overrides }]),
     );
-    const [obs] = await svc.fetchMetar(['KDEN'], 1, createMockContext());
+    const [obs] = await svc.fetchMetar({ stationIds: ['KDEN'], hours: 1 }, createMockContext());
     return obs!;
   }
 
@@ -540,7 +544,7 @@ describe('AviationWeatherService present-weather group decoding', () => {
   /** Decode one wxString through the real METAR normalization path. */
   async function decode(wxString: string) {
     vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([{ ...rawMetarKDEN, wxString }]));
-    const [obs] = await svc.fetchMetar(['KDEN'], 1, createMockContext());
+    const [obs] = await svc.fetchMetar({ stationIds: ['KDEN'], hours: 1 }, createMockContext());
     return obs!.present_weather;
   }
 
@@ -1395,11 +1399,58 @@ describe('AviationWeatherService PIREP cloud layers', () => {
 describe('AviationWeatherService request construction', () => {
   it('sends hours= for METARs — the metar endpoint has its own hours parameter', async () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawMetarKDEN]));
-    await svc.fetchMetar(['KDEN', 'KSEA'], 6, createMockContext());
+    await svc.fetchMetar({ stationIds: ['KDEN', 'KSEA'], hours: 6 }, createMockContext());
 
     const url = lastRequestUrl();
     expect(url).toContain('/metar?ids=KDEN%2CKSEA');
     expect(url).toMatch(queryParam('hours', 6));
+  });
+
+  it('sends the bbox corners and no ids for an area METAR survey', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawMetarKDEN]));
+    await svc.fetchMetar(
+      { bbox: { minLat: 47, minLon: -123, maxLat: 48, maxLon: -122 }, hours: 3 },
+      createMockContext(),
+    );
+
+    const url = lastRequestUrl();
+    expect(url).toContain('/metar?bbox=47,-123,48,-122');
+    expect(url).toMatch(queryParam('hours', 3));
+    expect(url).not.toContain('ids=');
+  });
+
+  it('sends negative and fractional bbox corners unrounded', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawMetarKDEN]));
+    await svc.fetchMetar(
+      { bbox: { minLat: -33.5, minLon: -70.25, maxLat: -32.5, maxLon: -69.75 }, hours: 1 },
+      createMockContext(),
+    );
+
+    expect(lastRequestUrl()).toContain('/metar?bbox=-33.5,-70.25,-32.5,-69.75');
+  });
+
+  it('sends only the ids when both modes reach the service, which the tool rejects first', async () => {
+    // The handler rejects the combination as `conflicting_location`, so this
+    // pins which branch wins rather than a shape a caller can produce.
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawMetarKDEN]));
+    await svc.fetchMetar(
+      {
+        stationIds: ['KDEN'],
+        bbox: { minLat: 47, minLon: -123, maxLat: 48, maxLon: -122 },
+        hours: 1,
+      },
+      createMockContext(),
+    );
+
+    const url = lastRequestUrl();
+    expect(url).toContain('/metar?ids=KDEN');
+    expect(url).not.toContain('bbox=');
+  });
+
+  it('rejects a METAR call naming neither mode', async () => {
+    await expect(svc.fetchMetar({ hours: 1 }, createMockContext())).rejects.toThrow(
+      /stationIds or bbox/,
+    );
   });
 
   it('sends no lookback parameter for TAFs', async () => {
@@ -1840,7 +1891,7 @@ describe('AviationWeatherService METAR sky condition', () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(
       jsonResponse([{ ...rawMetarKDEN, ...overrides }]),
     );
-    const [obs] = await svc.fetchMetar(['KDEN'], 1, createMockContext());
+    const [obs] = await svc.fetchMetar({ stationIds: ['KDEN'], hours: 1 }, createMockContext());
     return obs!;
   }
 
@@ -1868,7 +1919,7 @@ describe('AviationWeatherService METAR sky condition', () => {
         },
       ]),
     );
-    const [obs] = await svc.fetchMetar(['KJDN'], 1, createMockContext());
+    const [obs] = await svc.fetchMetar({ stationIds: ['KJDN'], hours: 1 }, createMockContext());
 
     expect(obs!.clouds).toEqual([]);
     expect(obs!.sky_condition).toBeNull();
@@ -2031,5 +2082,257 @@ describe('AviationWeatherService station identifiers', () => {
 
     expect(station!.id).toBe('WASD2');
     expect(station!.icao_id).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TAF text AWC left undecoded (issue #39) — the decoder emits at most three
+// cloud layers per period and puts whatever it could not decode into a
+// per-period `notDecoded` string
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService TAF undecoded text', () => {
+  /** Normalize raw TAF forecast periods through the real service path. */
+  async function normalizeAll(periods: Partial<RawTafForecastPeriod>[]) {
+    const fcsts = periods.map((overrides) => ({ ...rawTafKSEA.fcsts[0]!, ...overrides }));
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([{ ...rawTafKSEA, fcsts }]));
+    const [taf] = await svc.fetchTaf(['KSEA'], createMockContext());
+    return taf!.forecast_periods;
+  }
+
+  /** Three decoded layers — AWC's per-period maximum — from live LGKR's `PROB40 TEMPO`. */
+  const threeLayers = [
+    { base: 1600, cover: 'SCT', type: null },
+    { base: 1800, cover: 'FEW', type: 'CB' },
+    { base: 2000, cover: 'BKN', type: null },
+  ];
+
+  it('decodes every layer AWC decoded, leaving its leftover text out of clouds', async () => {
+    // Live LGKR: `PROB40 TEMPO … SCT016 FEW018CB BKN020 BKN080` decodes three
+    // layers; `BKN080` is the fourth and is never parsed back into clouds.
+    const [period] = await normalizeAll([{ clouds: threeLayers, notDecoded: 'BKN080 ' }]);
+
+    expect(period!.clouds).toEqual([
+      { cover: 'SCT', base_ft: 1600, type: null },
+      { cover: 'FEW', base_ft: 1800, type: 'CB' },
+      { cover: 'BKN', base_ft: 2000, type: null },
+    ]);
+  });
+
+  it('carries the leftover text trimmed, beside the layers AWC decoded', async () => {
+    // Upstream pads the value — live LGKR and VOML both arrive as `"BKN080 "`.
+    const [period] = await normalizeAll([{ clouds: threeLayers, notDecoded: 'BKN080 ' }]);
+
+    expect(period!.not_decoded).toBe('BKN080');
+    expect(period!.clouds).toHaveLength(3);
+  });
+
+  it('carries a non-cloud group verbatim', async () => {
+    // Live LFRB — a vertical-visibility group, not a numbered cloud layer.
+    const [period] = await normalizeAll([{ notDecoded: 'VV///' }]);
+
+    expect(period!.not_decoded).toBe('VV///');
+    expect(period!.vertical_visibility_ft).toBeNull();
+  });
+
+  it.each([
+    ['null', null],
+    ['an empty string', ''],
+    ['a whitespace-only string', '   '],
+    ['an absent key', undefined],
+  ])('reports %s as nothing left undecoded', async (_label, notDecoded) => {
+    const [period] = await normalizeAll([
+      notDecoded === undefined ? {} : { notDecoded: notDecoded as string | null },
+    ]);
+
+    expect(period!.not_decoded).toBeNull();
+  });
+
+  it('keeps the text on the period upstream attached it to', async () => {
+    // Live LGKR: the `BKN080` comes from the TEMPO's raw text and upstream
+    // attaches it to the BECMG after it, whose own text decoded in full. The
+    // text cannot be reliably reassigned, so it is published where it arrived.
+    const periods = await normalizeAll([
+      { fcstChange: 'TEMPO', probability: 40, clouds: threeLayers, notDecoded: null },
+      {
+        fcstChange: 'BECMG',
+        clouds: [{ base: 3000, cover: 'SCT', type: null }],
+        notDecoded: 'BKN080 ',
+      },
+    ]);
+
+    expect(periods.map((p) => p.not_decoded)).toEqual([null, 'BKN080']);
+    expect(periods[0]!.clouds).toHaveLength(3);
+    expect(periods[1]!.clouds).toEqual([{ cover: 'SCT', base_ft: 3000, type: null }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Upstream error bodies (issue #45) — AWC answers a request it rejects with a
+// JSON envelope, `{"status":"error","error":"…"}`, and that text is the only
+// part of the response that says what was wrong with the request
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService upstream error bodies', () => {
+  let http: FetchMockHarness;
+
+  beforeEach(async () => {
+    // The real fetchWithTimeout runs against a fetch fake here, so the error
+    // under test is the one the framework builds from a non-2xx response —
+    // its message, code, and `data.body` — rather than a hand-written copy.
+    const actual = await vi.importActual<typeof import('@cyanheads/mcp-ts-core/utils')>(
+      '@cyanheads/mcp-ts-core/utils',
+    );
+    vi.mocked(fetchWithTimeout).mockImplementation(actual.fetchWithTimeout);
+    http = createFetchMock();
+    http.install();
+  });
+
+  afterEach(() => {
+    http.restore();
+  });
+
+  /** AWC's error envelope carrying `error`. */
+  function envelope(error: unknown): string {
+    return JSON.stringify({ status: 'error', error });
+  }
+
+  /** Serve `response` to every request and return what `call` rejected with. */
+  async function errorFor(
+    response: Response,
+    call: () => Promise<unknown> = () =>
+      svc.fetchPireps({ stationId: 'KISN', distanceNm: 60, hours: 12 }, createMockContext()),
+  ): Promise<McpError> {
+    http.route({ match: /^https:\/\/aviationweather\.gov\/api\/data\//, respond: response });
+    try {
+      await call();
+    } catch (e) {
+      return e as McpError;
+    }
+    throw new Error('service call resolved where it was expected to throw');
+  }
+
+  it('leaves a 200 carrying the envelope a retried ServiceUnavailable naming the AWC text', async () => {
+    // The pre-existing branch, pinned before the 4xx path is added beside it.
+    // It is transient, so the real backoff runs — on fake timers, to stay fast.
+    vi.useFakeTimers();
+    try {
+      const pending = errorFor(new Response(envelope('Upstream maintenance'), { status: 200 }));
+      await vi.runAllTimersAsync();
+      const err = await pending;
+
+      expect(err).toBeInstanceOf(McpError);
+      expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(err.message).toMatch(/^AWC API error: Upstream maintenance/);
+      expect(http.calls).toHaveLength(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the fetch failure message on a 400 whose body is not JSON', async () => {
+    const err = await errorFor(new Response('Bad Request', { status: 400 }));
+
+    expect(err.code).toBe(JsonRpcErrorCode.InvalidParams);
+    expect(err.message).toBe(
+      'Fetch failed for https://aviationweather.gov/api/data/pirep?…. Status: 400',
+    );
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it('keeps the fetch failure message on a 400 whose JSON is not the envelope', async () => {
+    const err = await errorFor(
+      new Response(JSON.stringify({ message: 'Invalid location specified' }), { status: 400 }),
+    );
+
+    expect(err.code).toBe(JsonRpcErrorCode.InvalidParams);
+    expect(err.message).toMatch(/^Fetch failed for .*Status: 400$/);
+  });
+
+  it.each([
+    ['an empty error string', ''],
+    ['a whitespace-only error string', '   '],
+    ['a non-string error', { detail: 'Invalid location specified' }],
+  ])('keeps the fetch failure message on an envelope carrying %s', async (_label, error) => {
+    const err = await errorFor(new Response(envelope(error), { status: 400 }));
+
+    expect(err.code).toBe(JsonRpcErrorCode.InvalidParams);
+    expect(err.message).toMatch(/^Fetch failed for .*Status: 400$/);
+  });
+
+  it('surfaces the AWC text as the message on a 400 carrying the envelope', async () => {
+    // Live: `pirep?id=KISN` (closed 2019) answers exactly this.
+    const err = await errorFor(
+      new Response(envelope('Invalid location specified'), { status: 400 }),
+    );
+
+    expect(err).toBeInstanceOf(McpError);
+    expect(err.code).toBe(JsonRpcErrorCode.InvalidParams);
+    expect(err.message).toBe('AWC API error: Invalid location specified');
+  });
+
+  it('does not retry a request AWC rejected', async () => {
+    await errorFor(new Response(envelope('Invalid location specified'), { status: 400 }));
+
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it('keeps the original fetch error as the cause, and the upstream detail on data', async () => {
+    const body = envelope('Invalid location specified');
+    const err = await errorFor(new Response(body, { status: 400 }));
+
+    expect(err.cause).toBeInstanceOf(McpError);
+    expect((err.cause as McpError).code).toBe(JsonRpcErrorCode.InvalidParams);
+    expect((err.cause as McpError).message).toMatch(/^Fetch failed for .*Status: 400$/);
+    expect(err.data).toMatchObject({ status: 400, body });
+  });
+
+  it('trims the AWC text', async () => {
+    const err = await errorFor(
+      new Response(envelope('  Invalid location specified \n'), { status: 400 }),
+    );
+
+    expect(err.message).toBe('AWC API error: Invalid location specified');
+  });
+
+  it('keeps the code the status maps to on another 4xx', async () => {
+    const err = await errorFor(new Response(envelope('No such product'), { status: 404 }));
+
+    expect(err.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(err.message).toBe('AWC API error: No such product');
+  });
+
+  it.each([
+    ['fetchMetar', () => svc.fetchMetar({ stationIds: ['K0S9'], hours: 1 }, createMockContext())],
+    ['fetchTaf', () => svc.fetchTaf(['K36U'], createMockContext())],
+    [
+      'fetchPireps',
+      () => svc.fetchPireps({ stationId: 'KISN', distanceNm: 60, hours: 12 }, createMockContext()),
+    ],
+    ['fetchAdvisories', () => svc.fetchAdvisories({ advisoryType: 'all' }, createMockContext())],
+    ['fetchStations', () => svc.fetchStations({ stationIds: ['KSEA'] }, createMockContext())],
+  ])('surfaces the AWC text through %s, whichever tool made the call', async (_method, call) => {
+    // Live: `stationinfo` with neither IDs nor a box answers this 400.
+    const text = 'Must specify station IDs or bounding box, zoom, and density';
+    const err = await errorFor(new Response(envelope(text), { status: 400 }), call);
+
+    expect(err.code).toBe(JsonRpcErrorCode.InvalidParams);
+    expect(err.message).toBe(`AWC API error: ${text}`);
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it('leaves a 5xx carrying the envelope retried and unrewritten', async () => {
+    // Only a 4xx is a rejection of the request; a 5xx is transient, retried, and
+    // keeps its own classification. Retry-After 0 keeps the backoff instant.
+    const err = await errorFor(
+      new Response(envelope('Database unavailable'), {
+        status: 503,
+        headers: { 'retry-after': '0' },
+      }),
+    );
+
+    expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(err.message).not.toContain('AWC API error');
+    expect(http.calls).toHaveLength(4);
   });
 });

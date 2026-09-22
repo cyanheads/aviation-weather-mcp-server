@@ -6,7 +6,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
+import { McpError, serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
@@ -403,6 +403,11 @@ function normalizeTafPeriod(p: RawTafForecastPeriod): NormalizedTafPeriod {
     // height (0 of 3,349 live periods across six regional draws), so a period
     // left with no layers has at most one cover to state.
     sky_condition: skyConditionWithoutLayers(clouds, p.clouds?.[0]?.cover),
+    // Published where upstream attached it, never parsed into `clouds`: AWC
+    // attaches a TEMPO group's leftover to the period after it (live LGKR,
+    // VOML, LFRB), so reassigning it would be a guess about which period a
+    // layer belongs to. A whitespace-only value is nothing left undecoded.
+    not_decoded: strOrNull(p.notDecoded),
   };
 }
 
@@ -688,6 +693,56 @@ function bboxOverlapsPolygon(
 }
 
 // ---------------------------------------------------------------------------
+// AWC error envelope
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a parsed body is AWC's error envelope, `{ "status": "error", "error":
+ * "…" }`. AWC answers a request it rejects with one under HTTP 400; `fetchJson`
+ * also guards the same shape arriving under a 2xx.
+ */
+function isAwcErrorEnvelope(value: unknown): value is { status: 'error'; error?: unknown } {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (value as { status?: unknown }).status === 'error'
+  );
+}
+
+/**
+ * Re-raise a 4xx whose body is AWC's error envelope with AWC's own text as the
+ * message.
+ *
+ * `fetchWithTimeout` throws on the status before the body is read here, so a
+ * rejected request otherwise reaches the caller as a bare `Fetch failed …
+ * Status: 400`, with AWC's explanation — `Invalid location specified`, `Must
+ * specify station IDs or bounding box, zoom, and density` — only in
+ * `data.body`. The code the status mapped to is kept, and with it the
+ * non-retryable classification; `data` is kept as it was, and the original
+ * error rides as `cause`. Anything else passes through untouched: a 5xx is
+ * transient and retried on its own terms, and a 4xx body that is not the
+ * envelope has no text of AWC's to surface.
+ */
+function withAwcErrorText(error: unknown): unknown {
+  if (!(error instanceof McpError)) return error;
+  const { status, body } = error.data ?? {};
+  if (typeof status !== 'number' || status < 400 || status > 499 || typeof body !== 'string') {
+    return error;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return error;
+  }
+  const text =
+    isAwcErrorEnvelope(parsed) && typeof parsed.error === 'string' ? strOrNull(parsed.error) : null;
+  return text
+    ? new McpError(error.code, `AWC API error: ${text}`, error.data, { cause: error })
+    : error;
+}
+
+// ---------------------------------------------------------------------------
 // Service class
 // ---------------------------------------------------------------------------
 
@@ -709,13 +764,21 @@ export class AviationWeatherService {
    * `ctx.signal` directly: the attempt signal is the union of the caller's
    * cancellation and the retry deadline, so a budget that expires mid-flight
    * aborts the request in progress instead of only between attempts.
+   *
+   * A 4xx carrying AWC's error envelope is re-raised with AWC's text as its
+   * message (`withAwcErrorText`), for every endpoint this service calls.
    */
   private fetchJson<T>(url: string, ctx: Context): Promise<T> {
     return withRetry(
       async (attempt) => {
-        const response = await fetchWithTimeout(url, this.timeoutMs, ctx, {
-          signal: attempt.signal,
-        });
+        let response: Response;
+        try {
+          response = await fetchWithTimeout(url, this.timeoutMs, ctx, {
+            signal: attempt.signal,
+          });
+        } catch (error) {
+          throw withAwcErrorText(error);
+        }
         // AWC returns HTTP 204 with empty body when no data matches the query.
         // Treat this as an empty result — callers guard with `if (!Array.isArray(raw)) return []`.
         if (response.status === 204) return [] as T;
@@ -736,14 +799,10 @@ export class AviationWeatherService {
           ctx.log.debug('AWC API returned invalid JSON', { preview: text.slice(0, 200) });
           throw serviceUnavailable('AWC API returned invalid JSON — service may be degraded.');
         }
-        // Check for AWC error shape: { "status": "error", "error": "..." }
-        if (
-          typeof parsed === 'object' &&
-          parsed !== null &&
-          'status' in parsed &&
-          (parsed as Record<string, unknown>).status === 'error'
-        ) {
-          const errMsg = (parsed as Record<string, unknown>).error;
+        // AWC's error envelope under a 2xx — the 4xx form never reaches here,
+        // since `fetchWithTimeout` throws on the status first.
+        if (isAwcErrorEnvelope(parsed)) {
+          const errMsg = parsed.error;
           throw serviceUnavailable(
             `AWC API error: ${typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg)}`,
           );
@@ -759,11 +818,40 @@ export class AviationWeatherService {
     );
   }
 
-  /** Fetch METARs for one or more ICAO station IDs. */
-  async fetchMetar(stationIds: string[], hours: number, ctx: Context): Promise<NormalizedMetar[]> {
-    const ids = stationIds.join(',');
-    const url = `${this.baseUrl}/metar?ids=${encodeURIComponent(ids)}&format=json&hours=${hours}`;
-    ctx.log.debug('Fetching METARs', { ids, hours });
+  /**
+   * Fetch METARs for one or more ICAO station IDs, or for a bounding box.
+   *
+   * `hours` is the lookback window in both modes and is the only bound the
+   * endpoint offers: it returns every observation inside the window for every
+   * station it matched, and no parameter restricts the draw to the latest
+   * reading per station — `/metar` answers an unrecognized key with HTTP 400
+   * `Unexpected query parameter provided`. A bbox caller that wants one row per
+   * station reduces the draw itself, after the 400-row cap has been read off
+   * the row count served here.
+   */
+  async fetchMetar(
+    params: {
+      stationIds?: string[];
+      bbox?: { minLat: number; minLon: number; maxLat: number; maxLon: number };
+      hours: number;
+    },
+    ctx: Context,
+  ): Promise<NormalizedMetar[]> {
+    let url: string;
+    if (params.stationIds?.length) {
+      const ids = params.stationIds.join(',');
+      url = `${this.baseUrl}/metar?ids=${encodeURIComponent(ids)}&format=json&hours=${params.hours}`;
+    } else if (params.bbox) {
+      const { minLat, minLon, maxLat, maxLon } = params.bbox;
+      url = `${this.baseUrl}/metar?bbox=${minLat},${minLon},${maxLat},${maxLon}&format=json&hours=${params.hours}`;
+    } else {
+      throw serviceUnavailable('Either stationIds or bbox is required for METARs');
+    }
+    ctx.log.debug('Fetching METARs', {
+      stationIds: params.stationIds,
+      hasBbox: !!params.bbox,
+      hours: params.hours,
+    });
     const raw = await this.fetchJson<RawMetar[]>(url, ctx);
     if (!Array.isArray(raw)) return [];
     return raw.map(normalizeMetar);
