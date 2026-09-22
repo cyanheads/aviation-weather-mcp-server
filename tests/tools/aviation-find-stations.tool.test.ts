@@ -982,7 +982,7 @@ describe('aviationFindStations identifier whitespace', () => {
     ['a lowercase ID', 'ksea'],
   ])('still accepts %s — the fix borrows no ICAO pattern', (_label, entry) => {
     // The registry legitimately carries buoys and mesonet sites with no ICAO,
-    // IATA, or FAA identifier, so a four-letter pattern here would break a
+    // IATA, or FAA identifier, so a four-character pattern here would break a
     // working search rather than catch a caller error.
     expect(aviationFindStations.input.safeParse({ station_ids: [entry] }).success).toBe(true);
   });
