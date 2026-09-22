@@ -3,7 +3,7 @@
  * @module tests/tools/aviation-get-pireps.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { aviationGetPireps } from '@/mcp-server/tools/definitions/aviation-get-pireps.tool.js';
@@ -392,6 +392,18 @@ describe('aviationGetPireps distance_nm scope', () => {
     expect(mockFetchPireps.mock.calls[0]![0]).not.toHaveProperty('distanceNm');
   });
 
+  it('centers a radial search on a digit-bearing identifier (issue #37)', async () => {
+    mockFetchPireps.mockResolvedValue([pirep]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'K0S9', distance_nm: 50 });
+    await aviationGetPireps.handler(input, ctx);
+
+    expect(mockFetchPireps).toHaveBeenCalledWith(
+      expect.objectContaining({ stationId: 'K0S9', distanceNm: 50 }),
+      ctx,
+    );
+  });
+
   it('forwards an explicit distance_nm for a station_id query', async () => {
     mockFetchPireps.mockResolvedValue([pirep]);
     const ctx = createMockContext({ errors: aviationGetPireps.errors });
@@ -465,6 +477,122 @@ describe('aviationGetPireps altitude range', () => {
 
     expect(result.pireps).toHaveLength(1);
     expect(result.pireps[0]!.altitude_ft).toBe(8000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Altitude bounds — the band is feet MSL and both ends are schema bounds, so a
+// band AWC will not search never reaches the request. Below sea level and far
+// above FL600 both derive a `level` centre the endpoint answers with HTTP 400
+// `Invalid value for level`.
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps altitude bounds', () => {
+  it.each(['altitude_min_ft', 'altitude_max_ft'] as const)('accepts a %s of 0', (field) => {
+    expect(aviationGetPireps.input.safeParse({ station_id: 'KSEA', [field]: 0 }).success).toBe(
+      true,
+    );
+  });
+
+  it('accepts a band resting on sea level', () => {
+    expect(
+      aviationGetPireps.input.safeParse({
+        station_id: 'KSEA',
+        altitude_min_ft: 0,
+        altitude_max_ft: 3000,
+      }).success,
+    ).toBe(true);
+  });
+
+  it.each(['altitude_min_ft', 'altitude_max_ft'] as const)(
+    'accepts a %s at the FL600 ceiling',
+    (field) => {
+      expect(
+        aviationGetPireps.input.safeParse({ station_id: 'KSEA', [field]: 60000 }).success,
+      ).toBe(true);
+    },
+  );
+
+  it('accepts a band resting on the ceiling', () => {
+    expect(
+      aviationGetPireps.input.safeParse({
+        station_id: 'KSEA',
+        altitude_min_ft: 57000,
+        altitude_max_ft: 60000,
+      }).success,
+    ).toBe(true);
+  });
+
+  it.each([
+    ['a lower bound one foot below sea level', { altitude_min_ft: -1 }],
+    ['an upper bound one foot below sea level', { altitude_max_ft: -1 }],
+    ['a band wholly below sea level', { altitude_min_ft: -6000, altitude_max_ft: -3000 }],
+    ['a band reaching up to sea level', { altitude_min_ft: -3000, altitude_max_ft: 0 }],
+    ['a lower bound one foot above the ceiling', { altitude_min_ft: 60001 }],
+    ['an upper bound one foot above the ceiling', { altitude_max_ft: 60001 }],
+    [
+      'a band centred far above any pilot report',
+      { altitude_min_ft: 9997000, altitude_max_ft: 10003000 },
+    ],
+  ])('rejects %s at the schema', (_label, bounds) => {
+    expect(aviationGetPireps.input.safeParse({ station_id: 'KSEA', ...bounds }).success).toBe(
+      false,
+    );
+  });
+
+  it('names the offending bound rather than the range guard', () => {
+    const result = aviationGetPireps.input.safeParse({
+      station_id: 'KSEA',
+      altitude_min_ft: -3000,
+      altitude_max_ft: 0,
+    });
+
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues[0]?.path).toEqual(['altitude_min_ft']);
+  });
+
+  it.each(['altitude_min_ft', 'altitude_max_ft'] as const)(
+    'states both bounds in the %s description',
+    (field) => {
+      const description = aviationGetPireps.input.shape[field].description ?? '';
+
+      expect(description).toMatch(/0 ft|sea level/);
+      expect(description).toMatch(/60000|FL600/);
+    },
+  );
+
+  it('leaves an inverted band inside the bounds to the handler guard', async () => {
+    // The two ends are schema bounds; their ordering is not. A band inverted at
+    // the extremes of what the schema admits still earns the declared reason,
+    // with its recovery, rather than a bare framework rejection.
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({
+      station_id: 'KSEA',
+      altitude_min_ft: 60000,
+      altitude_max_ft: 0,
+    });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_altitude_range' },
+    });
+    expect(mockFetchPireps).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a negative band', { altitude_min_ft: -3000, altitude_max_ft: 0 }],
+    ['a band above the ceiling', { altitude_min_ft: 9997000, altitude_max_ft: 10003000 }],
+  ])('rejects %s on both surfaces before any request goes out', async (_label, bounds) => {
+    const result = await runToolContract(aviationGetPireps, { station_id: 'KSEA', ...bounds });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.InvalidParams },
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('altitude_min_ft');
+    expect(mockFetchPireps).not.toHaveBeenCalled();
   });
 });
 
@@ -1617,5 +1745,220 @@ describe('aviationGetPireps request limit', () => {
     expect(text).toContain('MOD, MIXED (14,000–18,000 ft)');
     expect(text).toContain('BKN 8,000–15,000 ft');
     expect(text).toContain('1 PIREP(s) found');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unrecognized search center (issue #45) — AWC resolves a station_id center
+// itself and answers HTTP 400 `Invalid location specified` for one it does not
+// know, such as the closed KISN
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps unrecognized station_id', () => {
+  const bbox = { minLat: 47, minLon: -124, maxLat: 49, maxLon: -121 };
+
+  /** The error the service raises for AWC's HTTP 400 on the PIREP endpoint. */
+  function upstreamRejection(): McpError {
+    return new McpError(
+      JsonRpcErrorCode.InvalidParams,
+      'AWC API error: Invalid location specified',
+      { status: 400, body: '{"status":"error","error":"Invalid location specified"}' },
+    );
+  }
+
+  /** Run the handler against a service that rejects with `error`, and return the throw. */
+  async function errorFor(
+    error: unknown,
+    input: Record<string, unknown> = { station_id: 'KISN', distance_nm: 60, hours: 12 },
+  ) {
+    mockFetchPireps.mockRejectedValue(error);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    try {
+      await aviationGetPireps.handler(aviationGetPireps.input.parse(input), ctx);
+    } catch (e) {
+      return e as McpError;
+    }
+    throw new Error('handler resolved where it was expected to throw');
+  }
+
+  it('raises the declared reason for a station_id AWC does not recognize', async () => {
+    const err = await errorFor(upstreamRejection());
+
+    expect(err).toBeInstanceOf(McpError);
+    expect(err.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(err.data).toMatchObject({ reason: 'station_not_recognized' });
+    expect(err.message).toContain('KISN');
+  });
+
+  it('points the recovery at aviation_find_stations and a bbox search', async () => {
+    const err = await errorFor(upstreamRejection());
+    const hint = String((err.data as { recovery?: { hint?: string } })?.recovery?.hint);
+
+    expect(hint).toContain('aviation_find_stations');
+    expect(hint).toContain('bbox');
+  });
+
+  it('keeps the upstream error as the cause, and its detail out of the payload', async () => {
+    const upstream = upstreamRejection();
+    const err = await errorFor(upstream);
+    const payload = JSON.stringify({ message: err.message, data: err.data });
+
+    expect(err.cause).toBe(upstream);
+    expect(payload).not.toContain('Invalid location specified');
+    expect(payload).not.toContain('"status":"error"');
+  });
+
+  it('reclassifies whatever digit-bearing identifier the schema now admits', async () => {
+    const err = await errorFor(upstreamRejection(), { station_id: 'K0S9' });
+
+    expect(err.data).toMatchObject({ reason: 'station_not_recognized' });
+    expect(err.message).toContain('K0S9');
+  });
+
+  it('declares the reason in the contract with the same recovery', () => {
+    const entry = aviationGetPireps.errors?.find((e) => e.reason === 'station_not_recognized');
+
+    expect(entry).toMatchObject({ code: JsonRpcErrorCode.NotFound });
+    expect(entry?.recovery).toContain('aviation_find_stations');
+    expect(entry?.recovery).toContain('bbox');
+  });
+
+  it('reaches both response surfaces through the real tool pipeline', async () => {
+    mockFetchPireps.mockRejectedValue(upstreamRejection());
+    const result = await runToolContract(aviationGetPireps, {
+      station_id: 'KISN',
+      distance_nm: 60,
+      hours: 12,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'station_not_recognized' },
+      },
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('KISN');
+    expect(text).toContain('aviation_find_stations');
+    expect(text).toContain('bbox');
+    expect(text).toContain('reason station_not_recognized');
+  });
+
+  it('leaves an empty result at a recognized station its own no_pireps_found', async () => {
+    // Live KXWA, KISN's replacement, answers HTTP 204 — no reports, not an
+    // unknown center.
+    mockFetchPireps.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ station_id: 'KXWA', distance_nm: 60 });
+
+    await expect(aviationGetPireps.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_pireps_found' },
+    });
+  });
+
+  it('lets the same rejection bubble untouched in a bbox search', async () => {
+    // The declared reason is about a center station; a bbox search sends none.
+    const upstream = upstreamRejection();
+
+    await expect(errorFor(upstream, { bbox })).resolves.toBe(upstream);
+  });
+
+  it.each([
+    ['a 5xx outage', JsonRpcErrorCode.ServiceUnavailable],
+    ['a timeout', JsonRpcErrorCode.Timeout],
+    ['an abandoned request', JsonRpcErrorCode.RequestCancelled],
+    ['a rate limit', JsonRpcErrorCode.RateLimited],
+  ])('lets %s bubble as classified in a station_id search', async (_label, code) => {
+    const upstream = new McpError(code, 'upstream');
+    const err = await errorFor(upstream);
+
+    expect(err).toBe(upstream);
+    expect(err.code).toBe(code);
+  });
+
+  it('lets a non-McpError bubble untouched', async () => {
+    const boom = new Error('socket hang up');
+
+    await expect(errorFor(boom)).resolves.toBe(boom as unknown as McpError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scope of that reclassification — the PIREP endpoint rejects several things
+// with the same envelope and code, and only the text naming the location says
+// anything about the search center
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps upstream rejection scope', () => {
+  const bbox = { minLat: 47, minLon: -124, maxLat: 49, maxLon: -121 };
+
+  /** The error the service raises for an AWC HTTP 400 carrying `text`. */
+  function rejection(text: string): McpError {
+    return new McpError(JsonRpcErrorCode.InvalidParams, `AWC API error: ${text}`, {
+      status: 400,
+      body: JSON.stringify({ status: 'error', error: text }),
+    });
+  }
+
+  /** Run the handler against a service that rejects with `error`, and return the throw. */
+  async function errorFor(error: unknown, input: Record<string, unknown>) {
+    mockFetchPireps.mockRejectedValue(error);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    try {
+      await aviationGetPireps.handler(aviationGetPireps.input.parse(input), ctx);
+    } catch (e) {
+      return e as McpError;
+    }
+    throw new Error('handler resolved where it was expected to throw');
+  }
+
+  it('reads the unrecognized-center text as the declared reason', async () => {
+    const err = await errorFor(rejection('Invalid location specified'), { station_id: 'KISN' });
+
+    expect(err.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(err.data).toMatchObject({ reason: 'station_not_recognized' });
+  });
+
+  it.each([
+    ['a band the endpoint will not search', 'Invalid value for level'],
+    ['an intensity it does not accept', 'Invalid value for inten'],
+    [
+      'a search area it could not read',
+      'Must specify station IDs or bounding box, zoom, and density',
+    ],
+  ])('keeps AWC text for %s on a station_id search', async (_label, text) => {
+    const upstream = rejection(text);
+    const err = await errorFor(upstream, { station_id: 'KSEA' });
+
+    expect(err).toBe(upstream);
+    expect(err.code).toBe(JsonRpcErrorCode.InvalidParams);
+    expect(err.message).toContain(text);
+    expect(err.data).not.toMatchObject({ reason: 'station_not_recognized' });
+  });
+
+  it('answers a non-location rejection identically in both search modes', async () => {
+    const text = 'Invalid value for level';
+    const radial = await errorFor(rejection(text), { station_id: 'KSEA' });
+    const area = await errorFor(rejection(text), { bbox });
+
+    expect(radial.code).toBe(area.code);
+    expect(radial.message).toBe(area.message);
+  });
+
+  it('carries AWC text to both surfaces rather than blaming the station', async () => {
+    mockFetchPireps.mockRejectedValue(rejection('Invalid value for level'));
+    const result = await runToolContract(aviationGetPireps, { station_id: 'KSEA' });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.InvalidParams,
+        message: 'AWC API error: Invalid value for level',
+      },
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('Invalid value for level');
+    expect(text).not.toContain('does not recognize');
   });
 });

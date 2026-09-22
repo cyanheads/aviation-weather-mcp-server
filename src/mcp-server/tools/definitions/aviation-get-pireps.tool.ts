@@ -4,7 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 import {
@@ -14,6 +14,7 @@ import {
   pushablePirepLevel,
 } from '@/services/aviation-weather/awc-limits.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
+import type { NormalizedPirep } from '@/services/aviation-weather/types.js';
 
 const BboxSchema = z
   .object({
@@ -94,6 +95,27 @@ const PirepCloudLayerSchema = z
 
 /** Radius applied to a station_id search when distance_nm is omitted. */
 const DEFAULT_DISTANCE_NM = 100;
+
+/**
+ * AWC's rejection text for a `/pirep` center identifier it cannot resolve. The
+ * endpoint answers `{"status":"error","error":"Invalid location specified"}`
+ * under HTTP 400, which the service surfaces as the error message. It is the
+ * only part of that rejection that names the center: the status and the code it
+ * classifies to are shared with every other parameter the endpoint refuses.
+ */
+const AWC_UNRECOGNIZED_CENTER = 'Invalid location specified';
+
+/**
+ * Ceiling of the altitude band, in feet MSL — FL600, above the altitude any
+ * pilot report carries.
+ *
+ * The bound is upstream-facing as much as domain-facing. `pushablePirepLevel`
+ * centres the requested band, so an unbounded top derives a `level` centre of
+ * the same magnitude: a band of 9,997,000–10,003,000 ft sends `level=100000`,
+ * which AWC answers with HTTP 400 `Invalid value for level` — a rejection
+ * naming a parameter the caller never set and cannot see.
+ */
+const PIREP_ALTITUDE_CEILING_FT = 60000;
 
 /**
  * What a request-imposed `limit` withheld, stated so it cannot be read as the
@@ -180,10 +202,10 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
   input: z.object({
     station_id: z
       .string()
-      .regex(/^[A-Z]{4}$/)
+      .regex(/^[A-Z0-9]{4}$/)
       .optional()
       .describe(
-        'ICAO station ID as center point for radial search (e.g., KSEA). Use with distance_nm.',
+        'ICAO station ID as center point for radial search — 4 uppercase letters or digits (e.g., KSEA, K0S9). Use with distance_nm.',
       ),
     bbox: BboxSchema.optional(),
     distance_nm: z
@@ -205,16 +227,20 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     altitude_min_ft: z
       .number()
       .int()
+      .min(0)
+      .max(PIREP_ALTITUDE_CEILING_FT)
       .optional()
       .describe(
-        'Filter by minimum altitude in feet MSL (e.g., 18000 for FL180). Reports with an unknown altitude (altitude_ft null) cannot be shown to satisfy a bound and are dropped whenever either bound is set. Optional.',
+        'Filter by minimum altitude in feet MSL (e.g., 18000 for FL180), from 0 to 60000 ft — AWC searches no band below sea level, and none centred above FL600, which is already above the altitude any pilot report carries. Reports with an unknown altitude (altitude_ft null) cannot be shown to satisfy a bound and are dropped whenever either bound is set. Optional.',
       ),
     altitude_max_ft: z
       .number()
       .int()
+      .min(0)
+      .max(PIREP_ALTITUDE_CEILING_FT)
       .optional()
       .describe(
-        'Filter by maximum altitude in feet MSL (e.g., 35000 for FL350). Reports with an unknown altitude (altitude_ft null) cannot be shown to satisfy a bound and are dropped whenever either bound is set. Optional.',
+        'Filter by maximum altitude in feet MSL (e.g., 35000 for FL350), from 0 to 60000 ft — AWC searches no band below sea level, and none centred above FL600, which is already above the altitude any pilot report carries. Reports with an unknown altitude (altitude_ft null) cannot be shown to satisfy a bound and are dropped whenever either bound is set. Optional.',
       ),
     min_intensity: z
       .enum(['lgt', 'mod', 'sev'])
@@ -297,6 +323,16 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       severity: 'notice',
       recovery:
         'Expand the distance_nm or hours parameters, or try a different region. PIREPs are sparse; absence of reports does not mean smooth conditions.',
+    },
+    {
+      reason: 'station_not_recognized',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'AWC does not recognize station_id as a PIREP search center — a closed or retired airport, for example — and rejects the request.',
+      // An identifier the upstream does not know is an ordinary answer to the
+      // lookup, as a registry miss is on aviation_find_stations.
+      severity: 'notice',
+      recovery:
+        'Confirm the identifier with aviation_find_stations, or search the same area with bbox, which needs no center station.',
     },
     {
       reason: 'missing_location',
@@ -447,16 +483,46 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     });
 
     const svc = getAviationWeatherService();
-    let pireps = await svc.fetchPireps(
-      {
-        ...(input.station_id ? { stationId: input.station_id, distanceNm: radiusNm } : {}),
-        ...(input.bbox ? { bbox: input.bbox } : {}),
-        hours: input.hours,
-        ...(level != null ? { level } : {}),
-        ...(input.min_intensity ? { minIntensity: input.min_intensity } : {}),
-      },
-      ctx,
-    );
+    let pireps: NormalizedPirep[];
+    try {
+      pireps = await svc.fetchPireps(
+        {
+          ...(input.station_id ? { stationId: input.station_id, distanceNm: radiusNm } : {}),
+          ...(input.bbox ? { bbox: input.bbox } : {}),
+          hours: input.hours,
+          ...(level != null ? { level } : {}),
+          ...(input.min_intensity ? { minIntensity: input.min_intensity } : {}),
+        },
+        ctx,
+      );
+    } catch (error) {
+      // AWC resolves a station_id center itself and answers HTTP 400 `Invalid
+      // location specified` for one it does not know (live KISN, closed 2019).
+      // Its text is what identifies that rejection, so the text is what this
+      // reads: the endpoint refuses other parameters under the same 400 and the
+      // same classification — `Invalid value for level` for a band outside what
+      // it searches — and reading one of those as an unknown center blames the
+      // identifier for something the caller can fix elsewhere. The one shape
+      // that names the center is re-raised as the declared reason, with the
+      // upstream error kept as the cause. Every other rejection keeps AWC's own
+      // text on a radial search exactly as it does on a bbox one, and every
+      // other classification — a 5xx, a timeout, an abandoned request — bubbles
+      // unchanged.
+      if (
+        input.station_id &&
+        error instanceof McpError &&
+        error.code === JsonRpcErrorCode.InvalidParams &&
+        error.message.includes(AWC_UNRECOGNIZED_CENTER)
+      ) {
+        throw ctx.fail(
+          'station_not_recognized',
+          `AWC does not recognize ${input.station_id} as a PIREP search center.`,
+          { ...ctx.recoveryFor('station_not_recognized') },
+          { cause: error },
+        );
+      }
+      throw error;
+    }
 
     const rawCount = pireps.length;
 
