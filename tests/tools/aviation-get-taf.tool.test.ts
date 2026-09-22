@@ -43,6 +43,7 @@ const basePeriod: NormalizedTafPeriod = {
   weather: { raw: '-RA', decoded: 'light rain' },
   clouds: [{ cover: 'BKN', base_ft: 2500, type: null }],
   sky_condition: null,
+  not_decoded: null,
 };
 
 const tempoPeriod: NormalizedTafPeriod = {
@@ -60,6 +61,7 @@ const tempoPeriod: NormalizedTafPeriod = {
     { cover: 'BKN', base_ft: 1500, type: 'CB' },
   ],
   sky_condition: null,
+  not_decoded: null,
 };
 
 /** TAF with epoch-seconds timestamps (as issued by the service after normalization). */
@@ -93,6 +95,7 @@ const sparseTaf: NormalizedTaf = {
       weather: null,
       clouds: [],
       sky_condition: 'NSC',
+      not_decoded: null,
     },
   ],
   raw_taf: 'KLAX 151200Z 1512/1612 27008KT CAVOK',
@@ -115,6 +118,7 @@ const windlessPeriod: NormalizedTafPeriod = {
   weather: { raw: 'BR', decoded: 'mist' },
   clouds: [],
   sky_condition: null,
+  not_decoded: null,
 };
 
 /**
@@ -786,11 +790,31 @@ describe('aviationGetTaf partial-batch disclosure', () => {
     (id) => {
       // Comparing the requested IDs against upstream `icaoId` is only a sound
       // set operation because the input contract fixes them at four uppercase
-      // letters — a relaxed input would surface a casing mismatch as a missing
-      // station rather than as the input error it is.
+      // letters or digits — a relaxed input would surface a casing mismatch as
+      // a missing station rather than as the input error it is.
       expect(aviationGetTaf.input.safeParse({ station_ids: [id] }).success).toBe(false);
     },
   );
+
+  it('sends a digit-bearing identifier upstream and reconciles it (issue #37)', async () => {
+    // K36U issues TAFs and carries a digit in its K + FAA-ID form.
+    const k36u: NormalizedTaf = { ...kseaTaf, station_id: 'K36U', name: 'Heber Valley' };
+    mockFetchTaf.mockResolvedValue([kseaTaf, k36u]);
+    const result = await runToolContract(aviationGetTaf, { station_ids: ['KSEA', 'K36U'] });
+
+    expect(mockFetchTaf).toHaveBeenCalledWith(['KSEA', 'K36U'], expect.anything());
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      returned: ['KSEA', 'K36U'],
+      partial: false,
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('## K36U — Heber Valley');
+  });
+
+  it('describes the identifier shape as letters or digits', () => {
+    expect(aviationGetTaf.input.shape.station_ids.element.description ?? '').toMatch(/digit/i);
+  });
 
   it('rejects an empty batch rather than reconciling nothing', () => {
     expect(aviationGetTaf.input.safeParse({ station_ids: [] }).success).toBe(false);
@@ -964,6 +988,155 @@ describe('aviationGetTaf sky condition', () => {
 
     expect(text).toContain('**Clouds:** not amended');
     expect(text).not.toMatch(/\bclear\b/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Text AWC left undecoded (issue #39) — the decoder emits at most three cloud
+// layers per period and puts the rest in a per-period string that never
+// reached either response surface
+// ---------------------------------------------------------------------------
+
+describe('aviationGetTaf undecoded text', () => {
+  const periodShape =
+    aviationGetTaf.output.shape.forecasts.element.shape.forecast_periods.element.shape;
+
+  /**
+   * Live LGKR: the `BKN080` ceiling of a `PROB40 TEMPO … SCT016 FEW018CB BKN020
+   * BKN080` is the fourth layer, past the decode limit, and upstream attaches
+   * it to the `BECMG` period that follows rather than to the TEMPO.
+   */
+  const ceilingLeftoverPeriod: NormalizedTafPeriod = {
+    ...basePeriod,
+    change_type: 'BECMG',
+    not_decoded: 'BKN080',
+  };
+
+  /** Live LFRB — a vertical-visibility group, not a numbered cloud layer. */
+  const obscurationLeftoverPeriod: NormalizedTafPeriod = {
+    ...basePeriod,
+    change_type: 'BECMG',
+    not_decoded: 'VV///',
+  };
+
+  it('renders no undecoded line on a period AWC decoded in full', () => {
+    const text = render(tempoPeriod);
+
+    expect(text).toContain('**Clouds:** OVC @ 800 ft, BKN @ 1500 ft (CB)');
+    expect(text).not.toMatch(/not decoded/i);
+  });
+
+  it('carries the undecoded text to structuredContent', async () => {
+    expect((await handle(ceilingLeftoverPeriod)).not_decoded).toBe('BKN080');
+  });
+
+  it('reports a fully decoded period as null rather than an empty string', async () => {
+    expect((await handle(basePeriod)).not_decoded).toBeNull();
+  });
+
+  it('renders the text on its own line after the clouds, marked partial and pointing to the raw TAF', () => {
+    const text = render(ceilingLeftoverPeriod);
+    const clouds = text.indexOf('**Clouds:** BKN @ 2500 ft');
+    const leftover = text.indexOf('**Not decoded:** `BKN080`');
+
+    expect(clouds).toBeGreaterThan(-1);
+    expect(leftover).toBeGreaterThan(clouds);
+    const line = text.slice(leftover).split('\n')[0]!;
+    expect(line).toMatch(/partial/i);
+    expect(line).toMatch(/raw TAF/);
+  });
+
+  it('never parses the text into clouds, for a cloud group or any other', async () => {
+    for (const period of [ceilingLeftoverPeriod, obscurationLeftoverPeriod]) {
+      const result = await handle(period);
+      expect(result.clouds).toEqual([{ cover: 'BKN', base_ft: 2500, type: null }]);
+      expect(render(period)).toContain('**Clouds:** BKN @ 2500 ft\n');
+    }
+  });
+
+  it('carries a non-cloud group through verbatim on both surfaces', async () => {
+    expect((await handle(obscurationLeftoverPeriod)).not_decoded).toBe('VV///');
+    expect(render(obscurationLeftoverPeriod)).toContain('**Not decoded:** `VV///`');
+  });
+
+  it('keeps the text on the period upstream attached it to, not the one it came from', async () => {
+    // The TEMPO carries the three decoded layers; the BECMG after it carries
+    // the leftover. Reassigning it would be the server guessing.
+    mockFetchTaf.mockResolvedValue([
+      { ...kseaTaf, forecast_periods: [tempoPeriod, ceilingLeftoverPeriod] },
+    ]);
+    const result = await runToolContract(aviationGetTaf, { station_ids: ['KSEA'] });
+
+    const periods = (
+      result.structuredContent as { forecasts: { forecast_periods: NormalizedTafPeriod[] }[] }
+    ).forecasts[0]!.forecast_periods;
+    expect(periods.map((p) => p.not_decoded)).toEqual([null, 'BKN080']);
+
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    const [tempoBlock, becmgBlock] = text.split('### **BECMG**');
+    expect(tempoBlock).not.toContain('**Not decoded:**');
+    expect(becmgBlock).toContain('**Not decoded:** `BKN080`');
+  });
+
+  it('renders a deep period on a second station on both surfaces', async () => {
+    // forecasts[1].forecast_periods[2] — past the first index at both levels.
+    mockFetchTaf.mockResolvedValue([
+      { ...kseaTaf, forecast_periods: [basePeriod] },
+      { ...sparseTaf, forecast_periods: [basePeriod, tempoPeriod, obscurationLeftoverPeriod] },
+    ]);
+    const result = await runToolContract(aviationGetTaf, { station_ids: ['KSEA', 'KLAX'] });
+
+    const forecasts = (
+      result.structuredContent as { forecasts: { forecast_periods: NormalizedTafPeriod[] }[] }
+    ).forecasts;
+    expect(forecasts[0]!.forecast_periods[0]!.not_decoded).toBeNull();
+    expect(forecasts[1]!.forecast_periods.map((p) => p.not_decoded)).toEqual([null, null, 'VV///']);
+
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text.match(/\*\*Not decoded:\*\*/g)).toHaveLength(1);
+    expect(text.split('## KLAX')[1]).toContain('**Not decoded:** `VV///`');
+  });
+
+  it('accepts periods carrying the text against the declared output schema', async () => {
+    mockFetchTaf.mockResolvedValue([
+      {
+        ...kseaTaf,
+        forecast_periods: [basePeriod, ceilingLeftoverPeriod, obscurationLeftoverPeriod],
+      },
+    ]);
+    const ctx = createMockContext({ errors: aviationGetTaf.errors });
+    const result = await aviationGetTaf.handler(
+      aviationGetTaf.input.parse({ station_ids: ['KSEA'] }),
+      ctx,
+    );
+
+    expect(result).toEqual(expect.schemaMatching(aviationGetTaf.output));
+  });
+
+  it('admits the text and null, and requires the field', () => {
+    expect(periodShape.not_decoded.safeParse('BKN080').success).toBe(true);
+    expect(periodShape.not_decoded.safeParse(null).success).toBe(true);
+    expect(periodShape.not_decoded.safeParse(undefined).success).toBe(false);
+  });
+
+  it('describes the field as partial-decode text published where upstream attached it', () => {
+    const description = periodShape.not_decoded.description ?? '';
+
+    expect(description).toMatch(/three/i);
+    expect(description).toContain('raw_taf');
+    expect(description).toMatch(/never/i);
+    expect(description).toMatch(/null/);
+  });
+
+  it('names the three-layer decode limit in the clouds description, dropping any completeness claim', () => {
+    const description = periodShape.clouds.description ?? '';
+
+    expect(description).toMatch(/three/i);
+    expect(description).toContain('not_decoded');
+    expect(description).toContain('raw_taf');
+    expect(description).not.toMatch(
+      /\ball (of the |the )?(reported |forecast )?(cloud )?layers\b/i,
+    );
   });
 });
 

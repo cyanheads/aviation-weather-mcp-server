@@ -127,7 +127,7 @@ const ForecastPeriodSchema = z
     clouds: z
       .array(TafCloudLayerSchema)
       .describe(
-        'Forecast cloud layers for this period. Empty whenever the period published no layer heights, which covers a forecast clear sky and a period carrying no cloud element at all; sky_condition distinguishes them. An empty array is not a forecast of a clear sky on its own.',
+        'Forecast cloud layers for this period, as AWC decoded them — at most three, so a further layer is left out of this array and its text surfaces in not_decoded, with raw_taf the complete source. Empty whenever the period published no layer heights, which covers a forecast clear sky and a period carrying no cloud element at all; sky_condition distinguishes them. An empty array is not a forecast of a clear sky on its own.',
       ),
     sky_condition: z
       .string()
@@ -135,21 +135,27 @@ const ForecastPeriodSchema = z
       .describe(
         'The sky condition this period forecast when it published no layer heights: SKC or NSC for a clear or insignificant-cloud forecast (a CAVOK group arrives as NSC), OVX for a forecast obscuration carrying no vertical visibility. Null when clouds carries layers — those are the statement — and also when the period carried no cloud element at all. An empty clouds array beside a null here forecasts nothing about cloud; on a TEMPO, PROB, or BECMG group that means the prevailing forecast stands unchanged, never that the sky will be clear.',
       ),
+    not_decoded: z
+      .string()
+      .nullable()
+      .describe(
+        'Text AWC attached to this period without decoding it, trimmed — usually a cloud layer past the three-layer decode limit, sometimes another group such as VV///. Null when nothing was left undecoded. Non-null marks a partial decode. Upstream can attach the leftover of one group, such as a TEMPO, to the period after it, so the text is published on the period it arrived on and never reassigned or parsed into clouds; raw_taf is the complete forecast.',
+      ),
   })
   .describe('A single TAF forecast period.');
 
 export const aviationGetTaf = tool('aviation_get_taf', {
   title: 'Get Terminal Aerodrome Forecast (TAF)',
   description:
-    'Get the Terminal Aerodrome Forecast (TAF) for one or more airports. Returns each forecast period with valid times, surface wind, low-level wind shear, visibility, decoded weather conditions, cloud layers, and the vertical visibility into a forecast obscuration, plus the raw TAF string. TAFs cover the next 24–30 hours and are issued only for airports with scheduled commercial service; check data_types from aviation_find_stations to confirm TAF availability. Accepts 1–4 ICAO station IDs (e.g., KSEA, KJFK).',
+    'Get the Terminal Aerodrome Forecast (TAF) for one or more airports. Returns each forecast period with valid times, surface wind, low-level wind shear, visibility, decoded weather conditions, cloud layers, and the vertical visibility into a forecast obscuration, plus the raw TAF string. TAFs cover the next 24–30 hours and are issued only for airports with scheduled commercial service; check data_types from aviation_find_stations to confirm TAF availability. Accepts 1–4 ICAO station IDs (e.g., KSEA, KJFK, K36U).',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     station_ids: z
       .array(
         z
           .string()
-          .regex(/^[A-Z]{4}$/)
-          .describe('4-letter ICAO station ID (e.g., KSEA, KJFK).'),
+          .regex(/^[A-Z0-9]{4}$/)
+          .describe('ICAO station ID: 4 uppercase letters or digits (e.g., KSEA, KJFK, K36U).'),
       )
       .min(1)
       .max(4)
@@ -160,7 +166,11 @@ export const aviationGetTaf = tool('aviation_get_taf', {
       .array(
         z
           .object({
-            station_id: z.string().describe('ICAO 4-letter station identifier (e.g., KSEA).'),
+            station_id: z
+              .string()
+              .describe(
+                'ICAO station identifier, 4 uppercase letters or digits (e.g., KSEA, K36U).',
+              ),
             name: z.string().describe('Human-readable station or airport name.'),
             issued_at: z.string().describe('TAF issue time in ISO 8601 format (UTC).'),
             valid_from: z
@@ -311,6 +321,15 @@ export const aviationGetTaf = tool('aviation_get_taf', {
             unamendedCloudReading(period.change_type),
           )}`,
         );
+        // Usually the highest layer past the three-layer decode limit, and often
+        // the only broken or overcast one, so dropping it silently cost the
+        // period its ceiling. Upstream can attach it to the period after the one
+        // whose text it came from, which the line says rather than guessing.
+        if (period.not_decoded != null) {
+          lines.push(
+            `**Not decoded:** \`${period.not_decoded}\` (partial decode — AWC attached this text to the period without decoding it, and it can belong to the group before; the raw TAF below is the complete forecast)`,
+          );
+        }
         lines.push('');
       }
 
