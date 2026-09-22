@@ -25,10 +25,96 @@ const TAF_STATIONS_PER_CALL = 4;
  */
 const CRUISE_BAND_HALF_WIDTH_FT = 3000;
 
+/**
+ * The band `aviation_get_pireps` accepts, in feet MSL — its `altitude_min_ft`
+ * and `altitude_max_ft` bounds, mirrored here as `METAR_STATIONS_PER_CALL` and
+ * `TAF_STATIONS_PER_CALL` mirror those tools' own limits.
+ *
+ * A derived band outside it is a call that tool rejects at the schema, so the
+ * briefing would instruct a step the model cannot complete. The prompt test
+ * pins these to what the tool advertises, so moving one without the other
+ * fails there rather than in a briefing.
+ */
+const CRUISE_BAND_FLOOR_FT = 0;
+const CRUISE_BAND_CEILING_FT = 60000;
+
+/** Confine a derived band bound to what `aviation_get_pireps` accepts. */
+function clampToPirepBand(ft: number): number {
+  return Math.min(CRUISE_BAND_CEILING_FT, Math.max(CRUISE_BAND_FLOOR_FT, ft));
+}
+
+/**
+ * Feet per flight level — the resolution `/pirep`'s `level` centre is expressed
+ * in, and the grid a band has to sit on to be pushed upstream at all.
+ *
+ * A band of the full ±3,000 ft width is contained by one centre only, its own
+ * midpoint, and that centre is a whole flight level: a cruise altitude off this
+ * grid therefore yields a band `pushablePirepLevel` declines to send, rather
+ * than lose reports in the sliver rounding would leave undrawn (design decision
+ * 19). 9,501 ft would otherwise instruct 6,501–12,501 ft, which the tool filters
+ * client-side out of a page the 400-row cap may already have cut — the outcome
+ * bounding the search to a cruise band exists to avoid.
+ */
+const FEET_PER_FLIGHT_LEVEL = 100;
+
+/**
+ * The PIREP altitude band for a planned cruise altitude: centred on the
+ * flight-level grid AWC searches, then held inside the range
+ * `aviation_get_pireps` accepts.
+ *
+ * Rounding precedes the clamp so the clamp keeps the last word at either end,
+ * and neither step can reorder the bounds — both are derived from one centre
+ * and passed through the same monotonic clamp, so `min <= max` holds for every
+ * altitude the six-digit input admits.
+ */
+function cruiseAltitudeBand(suppliedFt: number): {
+  centreFt: number;
+  suppliedFt: number;
+  min: number;
+  max: number;
+} {
+  const centreFt = Math.round(suppliedFt / FEET_PER_FLIGHT_LEVEL) * FEET_PER_FLIGHT_LEVEL;
+  return {
+    centreFt,
+    suppliedFt,
+    min: clampToPirepBand(centreFt - CRUISE_BAND_HALF_WIDTH_FT),
+    max: clampToPirepBand(centreFt + CRUISE_BAND_HALF_WIDTH_FT),
+  };
+}
+
+/** How the band's centre is described, naming the rounding only where it moved. */
+function centrePhrase({ centreFt, suppliedFt }: { centreFt: number; suppliedFt: number }): string {
+  return centreFt === suppliedFt
+    ? `the planned cruise altitude of ${suppliedFt} ft MSL`
+    : `${centreFt} ft MSL, the planned cruise altitude of ${suppliedFt} ft rounded to the nearest ${FEET_PER_FLIGHT_LEVEL} ft`;
+}
+
+/**
+ * How the band itself is described, so the sentence matches the bounds beside
+ * it.
+ *
+ * A cruise altitude at or above `CRUISE_BAND_CEILING_FT + CRUISE_BAND_HALF_WIDTH_FT`
+ * clamps both ends onto the ceiling, leaving a single altitude whose centre
+ * sits outside it — the only case where naming the centre would describe
+ * nothing. The floor cannot collapse a band the same way, since the top of a
+ * band centred at or above 0 ft is always at least the half-width.
+ */
+function bandPhrase(band: { centreFt: number; suppliedFt: number; min: number; max: number }) {
+  return band.min === band.max
+    ? `the highest altitude \`aviation_get_pireps\` searches, since the planned cruise altitude of ${band.suppliedFt} ft MSL is above the ${CRUISE_BAND_FLOOR_FT}–${CRUISE_BAND_CEILING_FT} ft range it accepts`
+    : `the ±${CRUISE_BAND_HALF_WIDTH_FT} ft band around ${centrePhrase(band)}, held inside the ${CRUISE_BAND_FLOOR_FT}–${CRUISE_BAND_CEILING_FT} ft range \`aviation_get_pireps\` accepts`;
+}
+
 /** Degrees of margin added to each side of the route-waypoint envelope. */
 const ROUTE_CORRIDOR_MARGIN_DEG = 1;
 
-const ICAO = '[A-Z]{4}';
+/**
+ * The shape `aviation_get_metar`, `aviation_get_taf`, and `aviation_get_pireps`
+ * enforce on a station ID — letters or digits, since a US airport whose FAA
+ * identifier carries a digit takes a K + FAA-ID form (K0S9, KS52).
+ */
+const ICAO = '[A-Z0-9]{4}';
+const ICAO_PATTERN = new RegExp(`^${ICAO}$`);
 const DECIMAL_DEGREES = String.raw`-?\d{1,3}(?:\.\d+)?`;
 const WAYPOINT = String.raw`\s*${DECIMAL_DEGREES}\s*,\s*${DECIMAL_DEGREES}\s*`;
 
@@ -103,19 +189,25 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
   args: z.object({
     departure_icao: z
       .string()
-      .regex(/^[A-Z]{4}$/)
-      .describe('Departure airport ICAO identifier, 4 uppercase letters (e.g., KSEA).'),
+      .regex(ICAO_PATTERN)
+      .describe(
+        'Departure airport ICAO identifier, 4 uppercase letters or digits (e.g., KSEA, K0S9).',
+      ),
     destination_icao: z
       .string()
-      .regex(/^[A-Z]{4}$/)
-      .describe('Destination airport ICAO identifier, 4 uppercase letters (e.g., KJFK).'),
+      .regex(ICAO_PATTERN)
+      .describe(
+        'Destination airport ICAO identifier, 4 uppercase letters or digits (e.g., KJFK, KS52).',
+      ),
     alternates: z
       .union([
         z.literal(''),
         z
           .string()
           .regex(ALTERNATES_PATTERN)
-          .describe('Comma-separated 4-letter ICAO identifiers (e.g., "KBFI,KBOS").'),
+          .describe(
+            'Comma-separated 4-character ICAO identifiers, uppercase letters or digits (e.g., "KBFI,K0S9").',
+          ),
       ])
       .optional()
       .describe('Optional comma-separated alternate airport ICAO IDs (e.g., "KBFI,KBOS").'),
@@ -172,18 +264,20 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
       ? Number.parseInt(args.cruise_altitude, 10)
       : undefined;
     /**
-     * The floor is clamped because a briefing instruction reading
-     * `altitude_min_ft: -1500` is nonsense on its face; the ceiling needs no
-     * clamp, since the input is bounded to six digits and PIREP altitudes are
-     * MSL with no upper limit worth asserting here.
+     * The centre is put on the flight-level grid and both ends are then clamped
+     * into the band `aviation_get_pireps` accepts. The floor because
+     * `altitude_min_ft: -1500` is nonsense on its face, and the ceiling because
+     * `cruise_altitude` admits six digits while the tool stops at FL600 — so an
+     * unclamped top instructs a call the schema rejects.
+     *
+     * Clamping both is what keeps the band ordered: clamping only the top would
+     * leave the floor above it for a cruise altitude far enough up, and the
+     * tool rejects an inverted band as readily as an out-of-range one. The same
+     * clamp on both ends collapses that case to a degenerate band at the
+     * ceiling instead.
      */
     const cruiseBand =
-      cruiseAltitudeFt === undefined
-        ? undefined
-        : {
-            min: Math.max(0, cruiseAltitudeFt - CRUISE_BAND_HALF_WIDTH_FT),
-            max: cruiseAltitudeFt + CRUISE_BAND_HALF_WIDTH_FT,
-          };
+      cruiseAltitudeFt === undefined ? undefined : cruiseAltitudeBand(cruiseAltitudeFt);
 
     /**
      * The corridor box is the waypoint envelope plus a margin. Two waypoints on
@@ -219,7 +313,7 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
       : 'No departure time was supplied, so no forecast period can be tied to a flight window — cover the whole valid period and state that the departure-time assessment could not be made';
 
     const pirepAltitudeLine = cruiseBand
-      ? `Pass \`altitude_min_ft: ${cruiseBand.min}\` and \`altitude_max_ft: ${cruiseBand.max}\` — the planned cruise altitude of ${cruiseAltitudeFt} ft MSL ±${CRUISE_BAND_HALF_WIDTH_FT} ft`
+      ? `Pass \`altitude_min_ft: ${cruiseBand.min}\` and \`altitude_max_ft: ${cruiseBand.max}\` — ${bandPhrase(cruiseBand)}`
       : 'No cruise altitude was supplied, so the search cannot be bounded to a cruise level — report the altitudes as flown and state that the cruise-level hazard assessment could not be made';
 
     const advisoriesCall = routeBbox

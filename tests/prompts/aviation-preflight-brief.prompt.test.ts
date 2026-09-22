@@ -3,8 +3,11 @@
  * @module tests/prompts/aviation-preflight-brief.prompt.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { describe, expect, it } from 'vitest';
 import { aviationPreflightBrief } from '@/mcp-server/prompts/definitions/aviation-preflight-brief.prompt.js';
+import { aviationGetPireps } from '@/mcp-server/tools/definitions/aviation-get-pireps.tool.js';
+import { pushablePirepLevel } from '@/services/aviation-weather/awc-limits.js';
 
 type Args = Record<string, string>;
 
@@ -163,7 +166,41 @@ describe('aviationPreflightBrief', () => {
   });
 
   describe('identifier validation', () => {
-    it('rejects a departure identifier that is not four uppercase letters', () => {
+    it('accepts digit-bearing identifiers and briefs them like any other (issue #37)', async () => {
+      // K0S9 and KS52 are METAR stations whose K + FAA-ID form carries digits;
+      // K36U also issues TAFs. Every weather tool the briefing calls takes them.
+      const text = await render({
+        departure_icao: 'K0S9',
+        destination_icao: 'KS52',
+        alternates: 'K36U, KBFI',
+      });
+
+      expect(callLines(text, 'aviation_get_metar').flatMap(stationsOn)).toEqual([
+        'K0S9',
+        'KS52',
+        'K36U',
+        'KBFI',
+      ]);
+      expect(callLines(text, 'aviation_get_taf').flatMap(stationsOn)).toEqual([
+        'K0S9',
+        'KS52',
+        'K36U',
+        'KBFI',
+      ]);
+      expect(text).toContain('Call `aviation_get_pireps` centered on K0S9 and KS52');
+    });
+
+    it('describes each identifier argument as letters or digits', () => {
+      const args = aviationPreflightBrief.args!.shape;
+
+      expect(args.departure_icao.description ?? '').toMatch(/digit/i);
+      expect(args.destination_icao.description ?? '').toMatch(/digit/i);
+      expect(JSON.stringify(z.toJSONSchema(aviationPreflightBrief.args!))).not.toMatch(
+        /\b(4|four)[- ]letter\b|\b4 uppercase letters\b(?! or digits)/i,
+      );
+    });
+
+    it('rejects a departure identifier that is not four uppercase letters or digits', () => {
       expect(() =>
         aviationPreflightBrief.args!.parse({
           departure_icao: 'ksea',
@@ -187,6 +224,22 @@ describe('aviationPreflightBrief', () => {
           departure_icao: 'KSEA',
           destination_icao: 'KJFK',
           alternates: 'KBFI,SEA',
+        }),
+      ).toThrow();
+    });
+
+    it.each([
+      ['a lowercase departure', { departure_icao: 'k0s9' }],
+      ['a three-character departure', { departure_icao: 'K0S' }],
+      ['a five-character destination', { destination_icao: 'K0S9X' }],
+      ['an alternate carrying a lowercase entry', { alternates: 'KBFI,k0s9' }],
+      ['an alternate carrying a five-character entry', { alternates: 'KBFI,KS52X' }],
+    ])('rejects %s', (_label, override) => {
+      expect(() =>
+        aviationPreflightBrief.args!.parse({
+          departure_icao: 'KSEA',
+          destination_icao: 'KJFK',
+          ...override,
         }),
       ).toThrow();
     });
@@ -324,6 +377,212 @@ describe('aviationPreflightBrief', () => {
 
       expect(text).toContain('No cruise altitude was supplied');
     });
+
+    /**
+     * The band the briefing instructs, read back out of the rendered text. A
+     * bound the prompt emitted as a negative number does not match, which is
+     * itself the failure — the tool would reject it.
+     */
+    function bandFrom(text: string): { altitude_min_ft: number; altitude_max_ft: number } | null {
+      const min = /`altitude_min_ft: (\d+)`/.exec(text)?.[1];
+      const max = /`altitude_max_ft: (\d+)`/.exec(text)?.[1];
+      return min && max ? { altitude_min_ft: Number(min), altitude_max_ft: Number(max) } : null;
+    }
+
+    /** The maximum `aviation_get_pireps` advertises on its altitude bounds. */
+    function advertisedCeiling(): unknown {
+      const schema = z.toJSONSchema(aviationGetPireps.input) as {
+        properties?: Record<string, { maximum?: unknown }>;
+      };
+      return schema.properties?.altitude_max_ft?.maximum;
+    }
+
+    it('clamps the band ceiling for a cruise altitude near it', async () => {
+      const text = await render({
+        departure_icao: 'KSEA',
+        destination_icao: 'KJFK',
+        cruise_altitude: '59000',
+      });
+
+      expect(text).toContain('`altitude_min_ft: 56000`');
+      expect(text).toContain('`altitude_max_ft: 60000`');
+    });
+
+    it('collapses to the ceiling rather than inverting for an absurd cruise altitude', async () => {
+      // `cruise_altitude` admits six digits, so the band can be derived far
+      // above anything the tool accepts. Clamping only the top would leave
+      // min above max — a band the tool rejects as inverted, which is the
+      // same broken recommendation in a different disguise.
+      const band = bandFrom(
+        await render({
+          departure_icao: 'KSEA',
+          destination_icao: 'KJFK',
+          cruise_altitude: '999999',
+        }),
+      );
+
+      expect(band).toEqual({ altitude_min_ft: 60000, altitude_max_ft: 60000 });
+    });
+
+    it('clamps at exactly the ceiling the tool advertises', async () => {
+      // Pins the prompt's own constant to the tool's bound, so moving one
+      // without the other fails here rather than in a briefing.
+      const band = bandFrom(
+        await render({
+          departure_icao: 'KSEA',
+          destination_icao: 'KJFK',
+          cruise_altitude: '999999',
+        }),
+      );
+
+      expect(band?.altitude_max_ft).toBe(advertisedCeiling());
+    });
+
+    it('names the half-width and the cruise altitude on an unclamped band', async () => {
+      const text = await render({
+        departure_icao: 'KSEA',
+        destination_icao: 'KJFK',
+        cruise_altitude: '9500',
+      });
+
+      expect(text).toContain('±3000 ft band around the planned cruise altitude of 9500 ft MSL');
+      // Nothing was rounded, so the line says nothing about rounding.
+      expect(text).not.toContain('rounded');
+    });
+
+    it('describes a band the ceiling collapsed by what it is, not by a centre outside it', async () => {
+      // Above 63,000 ft the clamp collapses the band to a single altitude, and
+      // the derived centre then sits nowhere near the bounds beside it — so
+      // "the ±3,000 ft band around 1000000 ft MSL" would describe nothing.
+      const text = await render({
+        departure_icao: 'KSEA',
+        destination_icao: 'KJFK',
+        cruise_altitude: '999999',
+      });
+
+      expect(text).toContain('`altitude_min_ft: 60000` and `altitude_max_ft: 60000`');
+      expect(text).toContain('highest altitude `aviation_get_pireps` searches');
+      expect(text).not.toContain('±3000 ft band around 1000000');
+    });
+
+    it('names the rounded centre when the cruise altitude is off the grid', async () => {
+      // The band is centred on 9,500 ft, so a line claiming ±3,000 ft around
+      // 9,501 ft would not describe the bounds beside it.
+      const text = await render({
+        departure_icao: 'KSEA',
+        destination_icao: 'KJFK',
+        cruise_altitude: '9501',
+      });
+
+      expect(text).toContain('**Cruise altitude:** 9501 ft MSL');
+      expect(text).toContain('±3000 ft band around 9500 ft MSL');
+      expect(text).toContain('9501 ft rounded to the nearest 100 ft');
+    });
+
+    it.each([
+      ['at the floor', '2000', 0, 5000],
+      ['at the ceiling', '59000', 56000, 60000],
+    ])(
+      'says what bounded a band clamped %s rather than asserting a symmetry the numbers deny',
+      async (_label, cruise_altitude, min, max) => {
+        const text = await render({
+          departure_icao: 'KSEA',
+          destination_icao: 'KJFK',
+          cruise_altitude,
+        });
+
+        expect(text).toContain(`\`altitude_min_ft: ${min}\``);
+        expect(text).toContain(`\`altitude_max_ft: ${max}\``);
+        expect(text).toContain('range `aviation_get_pireps` accepts');
+      },
+    );
+
+    it.each(['0', '1', '2000', '59000', '60000', '99000', '999999'])(
+      'derives a band AWC can search upstream for a clamped cruise altitude of %s ft',
+      async (cruise_altitude) => {
+        // Clamping narrows the band below the full ±3,000 ft width, which
+        // leaves slack for the centre's rounding to a whole flight level — so
+        // a clamped band is pushed upstream rather than filtered client-side
+        // out of a page the row cap may already have cut.
+        const band = bandFrom(
+          await render({ departure_icao: 'KSEA', destination_icao: 'KJFK', cruise_altitude }),
+        );
+
+        expect(band).not.toBeNull();
+        expect(pushablePirepLevel(band!.altitude_min_ft, band!.altitude_max_ft)).toBeDefined();
+      },
+    );
+
+    it('derives a band AWC can search from a cruise altitude off the flight-level grid', async () => {
+      // 9,501 ft is the shape this guards: a full-width band centred one foot
+      // off a whole flight level fits no centre at all, so its bounds would be
+      // filtered client-side out of a page the 400-row cap may already have
+      // cut — the outcome the band exists to avoid.
+      const band = bandFrom(
+        await render({
+          departure_icao: 'KSEA',
+          destination_icao: 'KJFK',
+          cruise_altitude: '9501',
+        }),
+      );
+
+      expect(band).toEqual({ altitude_min_ft: 6500, altitude_max_ft: 12500 });
+      expect(pushablePirepLevel(band!.altitude_min_ft, band!.altitude_max_ft)).toBe(95);
+    });
+
+    it('derives an ordered, pushable band from every cruise altitude swept', async () => {
+      /**
+       * Dense across both clamp regions and the rounding boundaries between
+       * them, sparse but deliberately off-grid through the middle, plus the
+       * extremes the six-digit input admits. A failure names the altitudes
+       * rather than only the count.
+       */
+      const sweep = [
+        ...Array.from({ length: 6001 }, (_, i) => i),
+        ...Array.from({ length: 4501 }, (_, i) => 56000 + i),
+        ...Array.from({ length: 1000 }, (_, i) => 6000 + i * 50),
+        ...Array.from({ length: 1000 }, (_, i) => 6000 + i * 50 + 1),
+        99000,
+        123456,
+        987654,
+        999999,
+      ];
+
+      const broken: { cruise: number; band: unknown }[] = [];
+      for (const cruise of sweep) {
+        const band = bandFrom(
+          await render({
+            departure_icao: 'KSEA',
+            destination_icao: 'KJFK',
+            cruise_altitude: String(cruise),
+          }),
+        );
+        const ordered = band != null && band.altitude_min_ft <= band.altitude_max_ft;
+        const pushable =
+          band != null &&
+          pushablePirepLevel(band.altitude_min_ft, band.altitude_max_ft) !== undefined;
+        if (!ordered || !pushable) broken.push({ cruise, band });
+      }
+
+      expect(broken).toEqual([]);
+    });
+
+    it.each(['0', '1', '2000', '9500', '35000', '57000', '59999', '60000', '99000', '999999'])(
+      'recommends a band aviation_get_pireps accepts for a cruise altitude of %s ft',
+      async (cruise_altitude) => {
+        // The failure mode this guards: a briefing that instructs a call the
+        // tool's own schema then rejects.
+        const band = bandFrom(
+          await render({ departure_icao: 'KSEA', destination_icao: 'KJFK', cruise_altitude }),
+        );
+
+        expect(band).not.toBeNull();
+        expect(band!.altitude_min_ft).toBeLessThanOrEqual(band!.altitude_max_ft);
+        expect(aviationGetPireps.input.safeParse({ station_id: 'KSEA', ...band }).success).toBe(
+          true,
+        );
+      },
+    );
   });
 
   describe('route_waypoints', () => {
