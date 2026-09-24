@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-09-24 · ⚠️ Breaking
+
+aviation_get_pireps publishes outside air temperature and wind aloft and renames remarks to weather (breaking); aviation_get_metar area surveys filter by flight category, and large results that set no limit now name the lever.
+
 ## [0.4.8](changelog/0.4.x/0.4.8.md) — 2026-09-22
 
 aviation_get_metar gains a bbox area-survey mode; aviation_get_taf surfaces text AWC left undecoded; aviation_get_pireps returns a typed rejection for a station_id AWC doesn't recognize instead of a bare HTTP 400; all ICAO identifier fields now accept digit-bearing station IDs.
