@@ -51,9 +51,33 @@ const pirep: NormalizedPirep = {
   ],
   clouds: [{ cover: 'BKN', base_ft: 8000, top_ft: 15000 }],
   visibility_sm: 10,
-  remarks: 'LIGHT CHOP BELOW 220',
+  temp_c: null,
+  wind: null,
+  weather: null,
   raw_pirep:
     'KSEA UA /OV KSEA /TM 1830 /FL270 /TP B737 /TB MOD CAT OCNL 240-280 /IC LGT RIME 100-140',
+};
+
+/**
+ * A report carrying all three decoded groups — `/WX +RA`, `/TA 06`, and
+ * `/WV 19003KT` — beside `/RM` text AWC does not decode. Modeled on a live
+ * report whose weather the tool used to publish as `remarks`.
+ */
+const aloftPirep: NormalizedPirep = {
+  observed_at: '2026-01-15T15:12:00.000Z',
+  lat: 35.1,
+  lon: -113.8,
+  altitude_ft: 10000,
+  aircraft_type: 'S22T',
+  pirep_type: 'PIREP',
+  turbulence: [{ base_ft: null, top_ft: null, intensity: 'NEG', type: null, frequency: null }],
+  icing: [],
+  clouds: null,
+  visibility_sm: null,
+  temp_c: 6,
+  wind: { direction_deg: 190, speed_kt: 3 },
+  weather: { raw: '+RA', decoded: 'heavy rain' },
+  raw_pirep: 'GXF UA /OV GBN/TM 1512/FL100/TP S22T/WX +RA/TA 06/WV 19003KT/TB NEG/RM ZAB/FDCS',
 };
 
 /** Minimal PIREP — most optional fields null/empty. */
@@ -68,7 +92,9 @@ const minimalPirep: NormalizedPirep = {
   icing: [],
   clouds: null,
   visibility_sm: null,
-  remarks: null,
+  temp_c: null,
+  wind: null,
+  weather: null,
   raw_pirep: 'KPDX UA /OV KPDX /TM 1700 /FL080 /TP UNKN /SK NEG',
 };
 
@@ -87,7 +113,9 @@ const unknownAltitudePirep: NormalizedPirep = {
   icing: [],
   clouds: [{ cover: 'OVC', base_ft: 2400, top_ft: null }],
   visibility_sm: null,
-  remarks: null,
+  temp_c: null,
+  wind: null,
+  weather: null,
   raw_pirep: 'CAK UA /OV CAK/TM 0745/FLDURD/TP C208/SK OVC024',
 };
 
@@ -103,7 +131,9 @@ const clearSkyPirep: NormalizedPirep = {
   icing: [],
   clouds: [{ cover: 'CLR', base_ft: null, top_ft: null }],
   visibility_sm: null,
-  remarks: null,
+  temp_c: null,
+  wind: null,
+  weather: null,
   raw_pirep: 'ORD UA /OV JOT290013/TM 0925/FL110/TP B753/SK CLR/TB NEG',
 };
 
@@ -119,7 +149,9 @@ const groundLevelPirep: NormalizedPirep = {
   icing: [],
   clouds: null,
   visibility_sm: null,
-  remarks: null,
+  temp_c: null,
+  wind: null,
+  weather: null,
   raw_pirep: 'EVV UA /OV EVV/TM 0125/FL000/TP E145/TB NEG/RM DURD RY22 EVV',
 };
 
@@ -887,6 +919,11 @@ describe('aviationGetPireps output schema language', () => {
     expect(cloudLayer.cover.description).toMatch(/rather than a cloud layer/);
   });
 
+  it('says a sky-clear cover never carries bounds', () => {
+    // AWC attaches synthesized bounds to SKC; normalization drops them (#52).
+    expect(cloudLayer.cover.description).toMatch(/SKC and CLR .*never carry a base or top/);
+  });
+
   it('describes the unknown altitude by the rule rather than by an example token', () => {
     // The three-token list read as exhaustive; the field goes null for any
     // group AWC could not resolve, whatever it happens to spell.
@@ -1173,6 +1210,148 @@ describe('aviationGetPireps.format hazard altitude bounds', () => {
     expect(text).toContain('36.037, -80.5');
     expect(text).not.toContain('36.0370');
     expect(text).not.toContain('-80.5000');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Temperature, wind aloft, and flight weather (issue #41) — `remarks` held the
+// `/WX` group under a name that pointed at `/RM`, and `/TA` and `/WV` were
+// decoded upstream and then dropped
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps temperature, wind, and weather', () => {
+  const report = aviationGetPireps.output.shape.pireps.element.shape;
+
+  /** Run one report through the real tool pipeline and return both surfaces. */
+  async function surfaces(reports: NormalizedPirep[]) {
+    mockFetchPireps.mockResolvedValue(reports);
+    const result = await runToolContract(aviationGetPireps, { station_id: 'KSEA' });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    return { structured: result.structuredContent as { pireps: unknown[] }, text };
+  }
+
+  it('publishes temperature, wind, and weather on both surfaces', async () => {
+    const { structured, text } = await surfaces([aloftPirep]);
+
+    expect(structured.pireps[0]).toMatchObject({
+      temp_c: 6,
+      wind: { direction_deg: 190, speed_kt: 3 },
+      weather: { raw: '+RA', decoded: 'heavy rain' },
+    });
+    expect(text).toContain('**Temperature:** 6°C | **Wind:** 190° magnetic at 3 kt');
+    expect(text).toContain('**Weather:** +RA (heavy rain)');
+  });
+
+  it('carries a sub-zero temperature and a strong wind aloft through unchanged', async () => {
+    const { structured, text } = await surfaces([
+      { ...aloftPirep, temp_c: -47, wind: { direction_deg: 255, speed_kt: 56 } },
+    ]);
+
+    expect(structured.pireps[0]).toMatchObject({
+      temp_c: -47,
+      wind: { direction_deg: 255, speed_kt: 56 },
+    });
+    expect(text).toContain('**Temperature:** -47°C | **Wind:** 255° magnetic at 56 kt');
+  });
+
+  it('renders a temperature of 0 as a reading', async () => {
+    const { structured, text } = await surfaces([{ ...aloftPirep, temp_c: 0, wind: null }]);
+
+    expect(structured.pireps[0]).toMatchObject({ temp_c: 0, wind: null });
+    expect(text).toContain('**Temperature:** 0°C');
+    expect(text).not.toContain('**Wind:**');
+  });
+
+  it('renders wind alone when the report carried no temperature', async () => {
+    const { text } = await surfaces([{ ...aloftPirep, temp_c: null }]);
+
+    expect(text).toContain('**Wind:** 190° magnetic at 3 kt');
+    expect(text).not.toContain('**Temperature:**');
+  });
+
+  it('marks a PIREP wind magnetic and leaves an AIREP wind unmarked', async () => {
+    // A PIREP /WV direction is magnetic (AIM TBL 7-1-18) and renders beside
+    // METAR's true-north winds, so content[] has to say so. An AIREP's
+    // reference is not stated, so its line asserts none.
+    const airep: NormalizedPirep = {
+      ...aloftPirep,
+      pirep_type: 'AIREP',
+      temp_c: -51,
+      wind: { direction_deg: 291, speed_kt: 35 },
+      raw_pirep: 'ARP UAL604 3823N 11419W 0859 F370 MS51 291/035KT',
+    };
+    const { structured, text } = await surfaces([aloftPirep, airep]);
+
+    expect(structured.pireps).toEqual([
+      expect.objectContaining({ pirep_type: 'PIREP', wind: { direction_deg: 190, speed_kt: 3 } }),
+      expect.objectContaining({ pirep_type: 'AIREP', wind: { direction_deg: 291, speed_kt: 35 } }),
+    ]);
+    expect(text).toContain('**Wind:** 190° magnetic at 3 kt');
+    expect(text).toContain('**Temperature:** -51°C | **Wind:** 291° at 35 kt');
+    expect(text).not.toContain('291° magnetic');
+  });
+
+  it('renders no temperature, wind, or weather line for a report carrying none', async () => {
+    const { structured, text } = await surfaces([minimalPirep]);
+
+    expect(structured.pireps[0]).toMatchObject({ temp_c: null, wind: null, weather: null });
+    expect(text).not.toContain('**Temperature:**');
+    expect(text).not.toContain('**Wind:**');
+    expect(text).not.toContain('**Weather:**');
+  });
+
+  it('keeps remarks off every surface', async () => {
+    const { structured, text } = await surfaces([aloftPirep, minimalPirep]);
+
+    expect(report).not.toHaveProperty('remarks');
+    for (const row of structured.pireps) expect(row).not.toHaveProperty('remarks');
+    expect(text).not.toContain('Remarks');
+  });
+
+  it('rejects a report without the three fields at the output schema', () => {
+    const { temp_c, wind, weather, ...withoutFields } = aloftPirep;
+
+    expect(aviationGetPireps.output.safeParse({ pireps: [aloftPirep] }).success).toBe(true);
+    expect(aviationGetPireps.output.safeParse({ pireps: [withoutFields] }).success).toBe(false);
+  });
+
+  it('describes each value by what it holds, not only by the PIREP group', () => {
+    // AIREPs populate temperature and wind from their own groups, so a
+    // description naming only /TA or /WV would be wrong for them.
+    expect(report.temp_c.description).toMatch(/AIREP/);
+    expect(report.wind.description).toMatch(/AIREP/);
+    expect(report.temp_c.description).toMatch(/0 is a (real )?reading/);
+    // The weather value is the /WX group, and /RM stays in raw_pirep alone.
+    expect(report.weather.description).toContain('/WX');
+    expect(report.weather.description).toMatch(/\/RM/);
+  });
+
+  it('references a PIREP wind direction to magnetic north, not true', () => {
+    // AIM TBL 7-1-18: /WV is "Direction in degrees magnetic north", and AWC
+    // passes it through unconverted. The METAR and TAF wording must not be
+    // copied here.
+    const description = report.wind.unwrap().shape.direction_deg.description ?? '';
+
+    expect(description).toMatch(/magnetic north/);
+    expect(description).toMatch(/not converted/);
+    expect(description).not.toMatch(/degrees true/);
+    // The variation directive is scoped to a PIREP; an AIREP's reference is
+    // unsourced, so the field shared with AIREPs must not claim it.
+    expect(description).toMatch(/combining a PIREP's direction with a true track/);
+    expect(description).toMatch(/an AIREP's reference is not stated/);
+  });
+
+  it('says undecodable /WX text survives only in raw_pirep', () => {
+    const description = report.weather.description ?? '';
+
+    expect(description).toMatch(/cannot decode is dropped or trimmed/);
+    expect(description).toMatch(/raw_pirep is the only source/);
+  });
+
+  it('names the new values in the tool description', () => {
+    expect(aviationGetPireps.description).toMatch(/temperature/i);
+    expect(aviationGetPireps.description).toMatch(/wind/i);
+    expect(aviationGetPireps.description).toMatch(/weather/i);
   });
 });
 
@@ -1745,6 +1924,346 @@ describe('aviationGetPireps request limit', () => {
     expect(text).toContain('MOD, MIXED (14,000–18,000 ft)');
     expect(text).toContain('BKN 8,000–15,000 ft');
     expect(text).toContain('1 PIREP(s) found');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The limit lever on a large unbounded result (issue #46) — a result that is
+// large only because no limit was set named neither the size nor the lever
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps size notice', () => {
+  const conus = { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 };
+  /** The report count above which a call that set no limit is told about it. */
+  const THRESHOLD = 50;
+
+  /** Distinct reports, newest first by construction. */
+  function page(count: number, altitude_ft: number | null = 8000): NormalizedPirep[] {
+    return Array.from({ length: count }, (_, i) => ({
+      ...minimalPirep,
+      altitude_ft,
+      observed_at: new Date(Date.UTC(2026, 0, 15, 6, 0, 0) - i * 60_000).toISOString(),
+      raw_pirep: `REPORT${i}`,
+    }));
+  }
+
+  /** Run the handler and return both the payload and the enrichment. */
+  async function runFor(input: Record<string, unknown>, reports: NormalizedPirep[]) {
+    mockFetchPireps.mockResolvedValue(reports);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const result = await aviationGetPireps.handler(aviationGetPireps.input.parse(input), ctx);
+    return { result, enrichment: getEnrichment(ctx) };
+  }
+
+  /** The enrichment with the one field this issue changes taken out. */
+  function withoutNotice(enrichment: Record<string, unknown>) {
+    const { notice, ...rest } = enrichment;
+    return rest;
+  }
+
+  it('keeps the rows, their order, and every non-notice field of a large unbounded result', async () => {
+    // Characterization — the size sentence may only add to `notice`.
+    const reports = page(THRESHOLD + 1);
+    const { result, enrichment } = await runFor(
+      { station_id: 'KORD', hours: 12 },
+      [...reports].reverse(),
+    );
+
+    expect(result.pireps.map((p) => p.raw_pirep)).toEqual(reports.map((p) => p.raw_pirep));
+    expect(withoutNotice(enrichment)).toEqual({ truncated: false, shown: THRESHOLD + 1 });
+  });
+
+  it('carries no size sentence at exactly the threshold', async () => {
+    const { enrichment } = await runFor({ station_id: 'KORD', hours: 12 }, page(THRESHOLD));
+
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('names limit one report past the threshold, and what it keeps', async () => {
+    const { enrichment } = await runFor({ station_id: 'KORD', hours: 12 }, page(THRESHOLD + 1));
+    const notice = String(enrichment.notice);
+
+    expect(notice).toContain(`${THRESHOLD + 1} reports`);
+    expect(notice).toContain('no limit was set');
+    expect(notice).toMatch(/limit bounds the response without changing what is searched/);
+    expect(notice).toContain('most recent');
+    expect(notice).toContain('min_intensity');
+  });
+
+  it('drops min_intensity from the size sentence once the call has set it', async () => {
+    const { enrichment } = await runFor(
+      { station_id: 'KORD', hours: 12, min_intensity: 'mod' },
+      page(THRESHOLD + 1),
+    );
+    const notice = String(enrichment.notice);
+
+    expect(notice).toContain('no limit was set');
+    expect(notice).not.toContain('min_intensity');
+  });
+
+  it.each([
+    ['a limit that withheld reports', 10],
+    ['a limit that withheld nothing', AWC_MAX_ROWS],
+  ])('never carries the size sentence beside %s', async (_label, limit) => {
+    const { enrichment } = await runFor(
+      { station_id: 'KORD', hours: 12, limit },
+      page(THRESHOLD + 30),
+    );
+
+    expect(String(enrichment.notice ?? '')).not.toContain('no limit was set');
+  });
+
+  it('compares the threshold against the reports left after the altitude filter', async () => {
+    // 80 drawn, 50 at cruise: the filter is what the caller sees, and 50 is not
+    // past the threshold.
+    const reports = [...page(30, 8000), ...page(THRESHOLD, 33000)];
+    const { enrichment } = await runFor(
+      { station_id: 'KORD', hours: 12, altitude_min_ft: 30000 },
+      reports,
+    );
+
+    expect(enrichment).toMatchObject({ shown: THRESHOLD });
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('follows the cap guidance on a capped result, in one notice', async () => {
+    const { enrichment } = await runFor({ bbox: conus, hours: 12 }, page(AWC_MAX_ROWS));
+    const notice = String(enrichment.notice);
+
+    expect(enrichment).toMatchObject({ truncated: true, shown: AWC_MAX_ROWS, cap: AWC_MAX_ROWS });
+    expect(notice).toContain('per-request maximum');
+    expect(notice).toContain(`${AWC_MAX_ROWS} reports because no limit was set`);
+    expect(notice.indexOf('per-request maximum')).toBeLessThan(notice.indexOf('no limit was set'));
+  });
+
+  it('leaves a capped page the altitude filter narrowed below the threshold without it', async () => {
+    const reports = [...page(AWC_MAX_ROWS - 2, 8000), ...page(2, 33000)];
+    const { enrichment } = await runFor({ bbox: conus, altitude_min_ft: 30000 }, reports);
+
+    expect(String(enrichment.notice)).toContain('per-request maximum');
+    expect(String(enrichment.notice)).not.toContain('no limit was set');
+  });
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    mockFetchPireps.mockResolvedValue(page(THRESHOLD + 1));
+    const result = await runToolContract(aviationGetPireps, { station_id: 'KORD', hours: 12 });
+
+    expect(result.structuredContent).toMatchObject({
+      truncated: false,
+      shown: THRESHOLD + 1,
+      notice: expect.stringContaining('no limit was set'),
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain(`${THRESHOLD + 1} PIREP(s) found`);
+    expect(text).toMatch(/limit bounds the response without changing what is searched/);
+  });
+
+  it('names the threshold behaviour in the notice description', () => {
+    expect(aviationGetPireps.enrichment?.notice?.description ?? '').toMatch(/no limit/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cap guidance names only usable levers (issue #53) — it offered distance_nm
+// to a bbox search, a smaller bbox to a radial one, and a shorter hours at 1
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps cap guidance levers', () => {
+  const conus = { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 };
+
+  /** A capped page of distinct reports at one altitude. */
+  function capped(altitude_ft: number | null = 8000): NormalizedPirep[] {
+    return Array.from({ length: AWC_MAX_ROWS }, (_, i) => ({
+      ...minimalPirep,
+      altitude_ft,
+      observed_at: new Date(Date.UTC(2026, 0, 15, 6, 0, 0) - i * 60_000).toISOString(),
+    }));
+  }
+
+  async function noticeFor(input: Record<string, unknown>) {
+    mockFetchPireps.mockResolvedValue(capped());
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    await aviationGetPireps.handler(aviationGetPireps.input.parse(input), ctx);
+    return String(getEnrichment(ctx).notice);
+  }
+
+  it('keeps the bbox lever sentence and drops distance_nm on an area search', async () => {
+    const notice = await noticeFor({ bbox: conus, hours: 12 });
+
+    expect(notice).toContain(
+      'Narrow the search — a smaller bbox, a shorter hours, min_intensity, an altitude band 6,000 ft or narrower — and re-run.',
+    );
+    expect(notice).not.toContain('distance_nm');
+  });
+
+  it('offers distance_nm and not a smaller bbox on a radial search', async () => {
+    const notice = await noticeFor({ station_id: 'KORD', hours: 12 });
+
+    expect(notice).toContain(
+      'Narrow the search — a smaller distance_nm, a shorter hours, min_intensity, an altitude band 6,000 ft or narrower — and re-run.',
+    );
+    expect(notice).not.toContain('a smaller bbox');
+  });
+
+  it('does not offer a shorter hours at the minimum of 1', async () => {
+    const notice = await noticeFor({ bbox: conus, hours: 1 });
+
+    expect(notice).toContain(
+      'Narrow the search — a smaller bbox, min_intensity, an altitude band 6,000 ft or narrower — and re-run.',
+    );
+    expect(notice).not.toContain('a shorter hours');
+  });
+
+  it('offers a shorter hours one step above the minimum', async () => {
+    expect(await noticeFor({ bbox: conus, hours: 2 })).toContain('a shorter hours');
+  });
+
+  it('does not offer a smaller distance_nm at the minimum of 10', async () => {
+    const notice = await noticeFor({ station_id: 'KORD', distance_nm: 10, hours: 12 });
+
+    expect(notice).toContain(
+      'Narrow the search — a shorter hours, min_intensity, an altitude band 6,000 ft or narrower — and re-run.',
+    );
+    expect(notice).not.toContain('distance_nm');
+  });
+
+  it('offers a smaller distance_nm one step above the minimum', async () => {
+    expect(await noticeFor({ station_id: 'KORD', distance_nm: 11, hours: 12 })).toContain(
+      'Narrow the search — a smaller distance_nm, a shorter hours,',
+    );
+  });
+
+  it('applies the same rule to the recovery of an altitude-emptied capped page', async () => {
+    mockFetchPireps.mockResolvedValue(capped(8000));
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    const input = aviationGetPireps.input.parse({ bbox: conus, hours: 1, altitude_min_ft: 30000 });
+
+    let hint = '';
+    try {
+      await aviationGetPireps.handler(input, ctx);
+    } catch (e) {
+      hint = String((e as { data?: { recovery?: { hint?: string } } }).data?.recovery?.hint);
+    }
+
+    expect(hint).toContain(
+      'upstream cap — a smaller bbox, min_intensity, an altitude band 6,000 ft or narrower — then reapply',
+    );
+    expect(hint).not.toContain('distance_nm');
+    expect(hint).not.toContain('a shorter hours');
+  });
+
+  it('reaches both surfaces with only the usable levers', async () => {
+    mockFetchPireps.mockResolvedValue(capped());
+    const result = await runToolContract(aviationGetPireps, { bbox: conus, hours: 12 });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+
+    expect(String((result.structuredContent as { notice?: string }).notice)).not.toContain(
+      'distance_nm',
+    );
+    expect(text).toContain('Narrow the search — a smaller bbox, a shorter hours,');
+    expect(text).not.toContain('distance_nm');
+    // The cap guidance still leads, and the size sentence still follows it.
+    expect(text.indexOf('per-request maximum')).toBeLessThan(text.indexOf('no limit was set'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Empty-result hints name only usable levers (issue #53) — no_pireps_found told
+// a bbox search to expand distance_nm, and any search to expand hours at 12
+// ---------------------------------------------------------------------------
+
+describe('aviationGetPireps empty-result levers', () => {
+  const box = { minLat: 47, minLon: -124, maxLat: 49, maxLon: -121 };
+  const SPARSE = 'PIREPs are sparse; absence of reports does not mean smooth conditions.';
+
+  async function hintFor(input: Record<string, unknown>, reports: NormalizedPirep[] = []) {
+    mockFetchPireps.mockResolvedValue(reports);
+    const ctx = createMockContext({ errors: aviationGetPireps.errors });
+    try {
+      await aviationGetPireps.handler(aviationGetPireps.input.parse(input), ctx);
+    } catch (e) {
+      return String((e as { data?: { recovery?: { hint?: string } } }).data?.recovery?.hint);
+    }
+    throw new Error('handler resolved where it was expected to throw');
+  }
+
+  it('keeps the radial hint byte-identical where both levers are usable', async () => {
+    expect(await hintFor({ station_id: 'KSEA' })).toBe(
+      `Expand the distance_nm or hours parameters, or try a different region. ${SPARSE}`,
+    );
+  });
+
+  it('offers a wider bbox, not distance_nm, on an area search', async () => {
+    expect(await hintFor({ bbox: box })).toBe(
+      `Widen the bbox or expand the hours parameter, or try a different region. ${SPARSE}`,
+    );
+  });
+
+  it('drops hours at its maximum of 12', async () => {
+    expect(await hintFor({ station_id: 'KSEA', hours: 12 })).toBe(
+      `Expand the distance_nm parameter, or try a different region. ${SPARSE}`,
+    );
+    expect(await hintFor({ bbox: box, hours: 12 })).toBe(
+      `Widen the bbox, or try a different region. ${SPARSE}`,
+    );
+  });
+
+  it('drops distance_nm at its maximum of 500', async () => {
+    expect(await hintFor({ station_id: 'KSEA', distance_nm: 500, hours: 12 })).toBe(
+      `Try a different region. ${SPARSE}`,
+    );
+    expect(await hintFor({ station_id: 'KSEA', distance_nm: 500, hours: 11 })).toBe(
+      `Expand the hours parameter, or try a different region. ${SPARSE}`,
+    );
+  });
+
+  it('names only usable levers when an upstream narrowing emptied the draw', async () => {
+    const hint = await hintFor({ bbox: box, min_intensity: 'sev' });
+
+    expect(hint).toBe(
+      `Relax min_intensity, or widen the bbox or expand the hours parameter. ${SPARSE}`,
+    );
+  });
+
+  it('names only usable levers when the altitude filter emptied a narrowed draw', async () => {
+    // A 48 ft band pushes level=181, so the draw was narrowed upstream; the
+    // reports it held all sit outside the band.
+    const reports = Array.from({ length: 3 }, () => ({ ...minimalPirep, altitude_ft: 30000 }));
+    const hint = await hintFor(
+      { bbox: box, hours: 12, altitude_min_ft: 18001, altitude_max_ft: 18049 },
+      reports,
+    );
+
+    expect(hint).toMatch(
+      /^Relax altitude_min_ft \/ altitude_max_ft to widen the draw, or widen the bbox\. /,
+    );
+    expect(hint).not.toContain('distance_nm');
+    expect(hint).not.toContain('hours');
+  });
+
+  it('keeps the declared recovery accurate for both search modes', () => {
+    const recovery =
+      aviationGetPireps.errors?.find((e) => e.reason === 'no_pireps_found')?.recovery ?? '';
+
+    expect(recovery).toMatch(/bbox on an area search/);
+    expect(recovery).toMatch(/below 12/);
+    expect(recovery).toMatch(/a larger distance_nm \(up to 500\) on a station_id search/);
+  });
+
+  it('carries the branched hint on both surfaces', async () => {
+    mockFetchPireps.mockResolvedValue([]);
+    const result = await runToolContract(aviationGetPireps, { bbox: box, hours: 12 });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    const structured = result.structuredContent as {
+      error?: { data?: { recovery?: { hint?: string } } };
+    };
+
+    expect(result.isError).toBe(true);
+    expect(structured.error?.data?.recovery?.hint).toBe(
+      `Widen the bbox, or try a different region. ${SPARSE}`,
+    );
+    expect(text).toContain('Widen the bbox, or try a different region.');
+    expect(text).not.toContain('distance_nm');
   });
 });
 

@@ -1502,3 +1502,193 @@ describe('aviationFindStations request limit', () => {
     expect(text).not.toContain('Washington DC');
   });
 });
+
+// ---------------------------------------------------------------------------
+// The limit lever on a large unbounded result (issue #46) — a result that is
+// large only because no limit was set named neither the size nor the lever
+// ---------------------------------------------------------------------------
+
+describe('aviationFindStations size notice', () => {
+  const box = { minLat: 32, minLon: -124, maxLat: 42, maxLon: -114 };
+  /** The station count above which a call that set no limit is told about it. */
+  const THRESHOLD = 130;
+
+  /** Distinct stations in reverse identifier order, so any reordering shows. */
+  function page(count: number, state = 'CA'): NormalizedStation[] {
+    return Array.from({ length: count }, (_, i) => {
+      const id = `K${String(count - 1 - i).padStart(3, '0')}`;
+      return { ...ksea, id, icao_id: id, name: `Station ${id}`, state };
+    });
+  }
+
+  function mockDraw(stations: NormalizedStation[], preFilterRows?: number) {
+    mockFetchStations.mockImplementation(async (params) => {
+      if (preFilterRows != null) params.onPreFilterRows?.(preFilterRows);
+      return stations;
+    });
+  }
+
+  /** Run the handler and return both the payload and the enrichment. */
+  async function runFor(input: Record<string, unknown>) {
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const result = await aviationFindStations.handler(aviationFindStations.input.parse(input), ctx);
+    return { result, enrichment: getEnrichment(ctx) };
+  }
+
+  it('keeps the rows, their upstream order, and every non-notice field of a large unbounded result', async () => {
+    // Characterization — the size sentence may only add to `notice`.
+    const stations = page(THRESHOLD + 1);
+    mockDraw(stations, THRESHOLD + 40);
+    const { result, enrichment } = await runFor({ state: 'CA' });
+    const { notice, ...rest } = enrichment;
+
+    expect(result.stations).toEqual(stations);
+    expect(rest).toEqual({ truncated: false, shown: THRESHOLD + 1 });
+  });
+
+  it.each([
+    ['a state search', { state: 'CA' }],
+    ['a bbox search', { bbox: box }],
+  ])('carries no size sentence at exactly the threshold on %s', async (_label, input) => {
+    mockDraw(page(THRESHOLD));
+
+    expect((await runFor(input)).enrichment).not.toHaveProperty('notice');
+  });
+
+  it.each([
+    ['a state search', { state: 'CA' }],
+    ['a bbox search', { bbox: box }],
+  ])(
+    'names limit one station past the threshold on %s, and what it keeps',
+    async (_label, input) => {
+      mockDraw(page(THRESHOLD + 1));
+      const notice = String((await runFor(input)).enrichment.notice);
+
+      expect(notice).toContain(`${THRESHOLD + 1} stations because no limit was set`);
+      expect(notice).toMatch(/limit bounds the response without changing the area searched/);
+      expect(notice).toMatch(/first stations by ICAO identifier ascending/);
+      expect(notice).toContain('identifier-less stations last');
+    },
+  );
+
+  it.each([
+    ['a limit that withheld stations', 10],
+    ['a limit that withheld nothing', AWC_MAX_ROWS],
+  ])('never carries the size sentence beside %s', async (_label, limit) => {
+    mockDraw(page(THRESHOLD + 30));
+
+    const notice = String((await runFor({ state: 'CA', limit })).enrichment.notice ?? '');
+    expect(notice).not.toContain('no limit was set');
+  });
+
+  it('compares the threshold against the stations the state filter left', async () => {
+    // 300 rows drawn (under the cap), 130 in-state: the filter is what the caller sees.
+    mockDraw(page(THRESHOLD), 300);
+
+    expect((await runFor({ state: 'CA' })).enrichment).not.toHaveProperty('notice');
+  });
+
+  it('follows the cap guidance on a capped result, in one notice', async () => {
+    mockDraw(page(279, 'TX'), AWC_MAX_ROWS);
+    const { enrichment } = await runFor({ state: 'TX' });
+    const notice = String(enrichment.notice);
+
+    expect(enrichment).toMatchObject({ truncated: true, shown: 279, upstreamRows: AWC_MAX_ROWS });
+    expect(notice).toContain('per-request maximum');
+    expect(notice).toContain('279 stations because no limit was set');
+    expect(notice.indexOf('per-request maximum')).toBeLessThan(notice.indexOf('no limit was set'));
+  });
+
+  it('never carries the size sentence on an identifier lookup', async () => {
+    // Upstream deduplicates a 20-identifier lookup, so it cannot reach the
+    // threshold; the mode is excluded outright rather than by that arithmetic.
+    mockDraw(page(THRESHOLD + 1));
+    const { enrichment } = await runFor({ station_ids: ['K000'] });
+
+    expect(enrichment).toMatchObject({ partial: false });
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    mockDraw(page(THRESHOLD + 1));
+    const result = await runToolContract(aviationFindStations, { bbox: box });
+
+    expect(result.structuredContent).toMatchObject({
+      truncated: false,
+      shown: THRESHOLD + 1,
+      notice: expect.stringContaining('no limit was set'),
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain(`${THRESHOLD + 1} station(s) found`);
+    expect(text).toMatch(/limit bounds the response without changing the area searched/);
+  });
+
+  it('names the threshold behaviour in the notice description', () => {
+    expect(aviationFindStations.enrichment?.notice?.description ?? '').toMatch(/no limit/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Empty-result hint names only usable levers (issue #53) — station_not_found
+// told a bbox or state search to "use bbox or state"
+// ---------------------------------------------------------------------------
+
+describe('aviationFindStations empty-result levers', () => {
+  const IDS_HINT =
+    "A lookup matches the registry's own identifier, which for an airport is its 4-character ICAO ID (KSEA, not SEA). Use bbox or state to discover identifiers by location.";
+
+  async function hintFor(input: Record<string, unknown>) {
+    mockFetchStations.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    try {
+      await aviationFindStations.handler(aviationFindStations.input.parse(input), ctx);
+    } catch (e) {
+      return String((e as { data?: { recovery?: { hint?: string } } }).data?.recovery?.hint);
+    }
+    throw new Error('handler resolved where it was expected to throw');
+  }
+
+  it('keeps the identifier-lookup hint byte-identical', async () => {
+    expect(await hintFor({ station_ids: ['ZZZZ'] })).toBe(IDS_HINT);
+  });
+
+  it('tells an empty bbox search to widen the box, not to use bbox', async () => {
+    expect(await hintFor({ bbox: { minLat: 0, minLon: -30, maxLat: 1, maxLon: -29 } })).toBe(
+      'The registry lists no station inside this bounding box. Widen the box, or name the stations directly with station_ids.',
+    );
+  });
+
+  it('tells an empty state search to use an explicit bbox, not to use state', async () => {
+    expect(await hintFor({ state: 'WA' })).toBe(
+      'The registry returned no station for this state. Search the same area with an explicit bbox, or name the stations directly with station_ids.',
+    );
+  });
+
+  it('keeps the declared recovery accurate for every mode', () => {
+    const recovery =
+      aviationFindStations.errors?.find((e) => e.reason === 'station_not_found')?.recovery ?? '';
+
+    expect(recovery).toContain('ICAO');
+    // A state search has no box to widen, so the contract scopes each fix.
+    expect(recovery).toMatch(
+      /a bbox search wants a wider box, and a state search an explicit bbox/,
+    );
+    expect(recovery).not.toMatch(/an area search that found nothing wants a wider bbox/);
+  });
+
+  it('carries the branched hint on both surfaces', async () => {
+    mockFetchStations.mockResolvedValue([]);
+    const result = await runToolContract(aviationFindStations, {
+      bbox: { minLat: 0, minLon: -30, maxLat: 1, maxLon: -29 },
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+
+    expect(result.isError).toBe(true);
+    expect(
+      (result.structuredContent as { error?: { data?: { recovery?: { hint?: string } } } }).error
+        ?.data?.recovery?.hint,
+    ).toMatch(/^The registry lists no station inside this bounding box\./);
+    expect(text).toContain('Widen the box');
+    expect(text).not.toContain('Use bbox or state');
+  });
+});

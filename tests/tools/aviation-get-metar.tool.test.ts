@@ -1576,7 +1576,7 @@ describe('aviationGetMetar bbox survey', () => {
     expect(text).not.toContain('## KPWT');
     expect(text).toContain('**Stations returned:** 1');
     expect(text).toContain('**Limited by the request:** true');
-    expect(text).toContain('**Stations drawn before the limit:** 2');
+    expect(text).toContain('**Stations matched before the limit:** 2');
   });
 
   it('renders a capped survey on the content[] surface', async () => {
@@ -1621,5 +1621,661 @@ describe('aviationGetMetar bbox survey', () => {
     expect(aviationGetMetar.enrichmentTrailer?.truncated?.label).toBe(
       'Truncated at the upstream row cap',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Survey helpers shared by the size-notice (#46) and flight-category (#51)
+// blocks
+// ---------------------------------------------------------------------------
+
+const surveyBox = { minLat: 24, minLon: -125, maxLat: 50, maxLon: -66 };
+
+/** One observation at a station, time, and flight category. */
+function categorized(
+  station_id: string,
+  flight_category: string,
+  observed_at = '2026-01-15T16:53:00.000Z',
+): NormalizedMetar {
+  return { ...ksea, station_id, name: `${station_id} field`, flight_category, observed_at };
+}
+
+/**
+ * One observation per station, `K000` upward, served in reverse station order
+ * so the survey's own ordering shows. `categoryOf` assigns each station's
+ * flight category by index.
+ */
+function stationsDraw(
+  count: number,
+  categoryOf: (i: number) => string = () => 'VFR',
+): NormalizedMetar[] {
+  return Array.from({ length: count }, (_, i) =>
+    categorized(`K${String(i).padStart(3, '0')}`, categoryOf(i)),
+  ).reverse();
+}
+
+/**
+ * `rows` observations over `stations` stations — enough repeat readings to
+ * reach the upstream cap while holding the station count where a test wants it.
+ */
+function repeatedDraw(
+  stations: number,
+  rows: number,
+  categoryOf: (i: number) => string = () => 'VFR',
+): NormalizedMetar[] {
+  return Array.from({ length: rows }, (_, i) =>
+    categorized(
+      `K${String(i % stations).padStart(3, '0')}`,
+      categoryOf(i % stations),
+      `2026-01-15T${String(4 + Math.floor(i / stations)).padStart(2, '0')}:53:00.000Z`,
+    ),
+  );
+}
+
+/** Run the handler over a bbox draw and return the payload and the enrichment. */
+async function surveyFor(drawn: NormalizedMetar[], input: Record<string, unknown> = {}) {
+  mockFetchMetar.mockResolvedValue(drawn);
+  const ctx = createMockContext({ errors: aviationGetMetar.errors });
+  const parsed = aviationGetMetar.input.parse({ bbox: surveyBox, ...input });
+  const result = await aviationGetMetar.handler(parsed, ctx);
+  return { result, enrichment: getEnrichment(ctx) };
+}
+
+/** IFR every fifth station, LIFR every seventh, unknown every eleventh. */
+function mixed(i: number): string {
+  if (i % 11 === 0) return 'unknown';
+  if (i % 7 === 0) return 'LIFR';
+  if (i % 5 === 0) return 'IFR';
+  return i % 2 === 0 ? 'MVFR' : 'VFR';
+}
+
+/** Run a bbox call through the real tool pipeline and join its text blocks. */
+async function surveyContract(drawn: NormalizedMetar[], input: Record<string, unknown> = {}) {
+  mockFetchMetar.mockResolvedValue(drawn);
+  const result = await runToolContract(aviationGetMetar, { bbox: surveyBox, ...input });
+  const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+  return { result, text };
+}
+
+// ---------------------------------------------------------------------------
+// The limit lever on a large unbounded survey (issue #46) — a survey that is
+// large only because no limit was set named neither the size nor the lever,
+// and the cap guidance never mentioned limit either
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar size notice', () => {
+  /** The station count above which a survey that set no limit is told about it. */
+  const THRESHOLD = 40;
+
+  it('keeps the rows, their order, and every non-notice field of a large unbounded survey', async () => {
+    // Characterization — the size sentence may only add to `notice`.
+    const { result, enrichment } = await surveyFor(stationsDraw(THRESHOLD + 1));
+    const { notice, ...rest } = enrichment;
+
+    expect(result.observations.map((o) => o.station_id)).toEqual(
+      Array.from({ length: THRESHOLD + 1 }, (_, i) => `K${String(i).padStart(3, '0')}`),
+    );
+    expect(rest).toEqual({ truncated: false, shown: THRESHOLD + 1 });
+  });
+
+  it('carries no size sentence at exactly the threshold', async () => {
+    const { enrichment } = await surveyFor(stationsDraw(THRESHOLD));
+
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('names limit one station past the threshold, and what it keeps', async () => {
+    const notice = String((await surveyFor(stationsDraw(THRESHOLD + 1))).enrichment.notice);
+
+    expect(notice).toContain(`${THRESHOLD + 1} stations because no limit was set`);
+    expect(notice).toMatch(/limit bounds the response without changing the area searched/);
+    expect(notice).toContain('first stations by station ID ascending');
+    expect(notice).toContain('an alphabetical slice, not a region');
+    expect(notice).toContain('a smaller bbox');
+    expect(notice).toContain('flight_category');
+  });
+
+  it('counts stations after the reduction to the latest observation, not rows', async () => {
+    // 120 rows over 40 stations: 40 is the threshold, not past it.
+    const { enrichment } = await surveyFor(repeatedDraw(THRESHOLD, 120));
+
+    expect(enrichment).toMatchObject({ shown: THRESHOLD });
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it.each([
+    ['a limit that withheld stations', 10],
+    ['a limit that withheld nothing', 400],
+  ])('never carries the size sentence beside %s', async (_label, limit) => {
+    const { enrichment } = await surveyFor(stationsDraw(THRESHOLD + 30), { limit });
+
+    expect(String(enrichment.notice ?? '')).not.toContain('no limit was set');
+  });
+
+  it('follows the cap guidance on a capped survey, in one notice', async () => {
+    const { enrichment } = await surveyFor(repeatedDraw(61, 400));
+    const notice = String(enrichment.notice);
+
+    expect(enrichment).toMatchObject({ truncated: true, shown: 61, upstreamRows: 400 });
+    expect(notice).toContain('its per-request maximum');
+    expect(notice).toContain('61 stations because no limit was set');
+    expect(notice.indexOf('per-request maximum')).toBeLessThan(notice.indexOf('no limit was set'));
+  });
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    const { result, text } = await surveyContract(stationsDraw(THRESHOLD + 1));
+
+    expect(result.structuredContent).toMatchObject({
+      truncated: false,
+      shown: THRESHOLD + 1,
+      notice: expect.stringContaining('no limit was set'),
+    });
+    expect(text).toContain('## K000 — K000 field');
+    expect(text).toMatch(/limit bounds the response without changing the area searched/);
+  });
+
+  it('names the threshold behaviour in the notice description', () => {
+    expect(aviationGetMetar.enrichment?.notice?.description ?? '').toMatch(/no limit/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Flight-category filter on a bbox survey (issue #51) — "where is it IFR" was
+// answerable only by reading every station in the box
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar flight_category filter', () => {
+  it('returns only the stations whose category the filter names, in station order', async () => {
+    const { result } = await surveyFor(stationsDraw(30, mixed), {
+      flight_category: ['IFR', 'LIFR'],
+    });
+
+    expect(result.observations.map((o) => [o.station_id, o.flight_category])).toEqual([
+      ['K005', 'IFR'],
+      ['K007', 'LIFR'],
+      ['K010', 'IFR'],
+      ['K014', 'LIFR'],
+      ['K015', 'IFR'],
+      ['K020', 'IFR'],
+      ['K021', 'LIFR'],
+      ['K025', 'IFR'],
+      ['K028', 'LIFR'],
+    ]);
+  });
+
+  it('filters the latest observation per station, after the reduction', async () => {
+    // KAAA was IFR an hour ago and is VFR now; KBBB went the other way.
+    const { result } = await surveyFor(
+      [
+        categorized('KAAA', 'IFR', '2026-01-15T15:53:00.000Z'),
+        categorized('KAAA', 'VFR', '2026-01-15T16:53:00.000Z'),
+        categorized('KBBB', 'VFR', '2026-01-15T15:53:00.000Z'),
+        categorized('KBBB', 'IFR', '2026-01-15T16:53:00.000Z'),
+      ],
+      { flight_category: ['IFR'], hours: 2 },
+    );
+
+    expect(result.observations.map((o) => [o.station_id, o.observed_at])).toEqual([
+      ['KBBB', '2026-01-15T16:53:00.000Z'],
+    ]);
+  });
+
+  it('never matches a station reported as unknown, even with every category named', async () => {
+    const { result, enrichment } = await surveyFor(stationsDraw(12, mixed), {
+      flight_category: ['VFR', 'MVFR', 'IFR', 'LIFR'],
+    });
+
+    // K000 and K011 are unknown.
+    expect(result.observations.map((o) => o.station_id)).not.toContain('K000');
+    expect(result.observations.map((o) => o.station_id)).not.toContain('K011');
+    expect(enrichment).toMatchObject({ surveyed: 12, shown: 10 });
+    expect(String(enrichment.notice)).toMatch(/2 of those .*unknown/);
+  });
+
+  it('discloses the count before the filter and the count after it', async () => {
+    const { enrichment } = await surveyFor(stationsDraw(30, mixed), {
+      flight_category: ['IFR', 'LIFR'],
+    });
+
+    expect(enrichment).toMatchObject({ truncated: false, surveyed: 30, shown: 9 });
+    const notice = String(enrichment.notice);
+    expect(notice).toContain('flight_category');
+    expect(notice).toContain('kept 9 of the 30 station(s)');
+  });
+
+  it('states the counts and no notice when the filter removed nothing', async () => {
+    const { enrichment } = await surveyFor(
+      stationsDraw(5, () => 'IFR'),
+      {
+        flight_category: ['IFR'],
+      },
+    );
+
+    expect(enrichment).toEqual({ truncated: false, shown: 5, surveyed: 5 });
+  });
+
+  it('adds no surveyed field to a survey that set no filter', async () => {
+    const { enrichment } = await surveyFor(stationsDraw(5, mixed));
+
+    expect(enrichment).not.toHaveProperty('surveyed');
+  });
+
+  it('applies before the limit, so the limit selects from the stations that matched', async () => {
+    const { result, enrichment } = await surveyFor(stationsDraw(30, mixed), {
+      flight_category: ['IFR', 'LIFR'],
+      limit: 3,
+    });
+
+    expect(result.observations.map((o) => o.station_id)).toEqual(['K005', 'K007', 'K010']);
+    expect(enrichment).toMatchObject({ surveyed: 30, matched: 9, shown: 3, limited: true });
+    const notice = String(enrichment.notice);
+    expect(notice.indexOf('kept 9 of the 30')).toBeLessThan(notice.indexOf('limited this result'));
+    expect(notice).toContain('3 of 9 station(s) matching flight_category');
+  });
+
+  it('returns an empty result naming the filter as the stage that emptied it', async () => {
+    const { result, enrichment } = await surveyFor(
+      stationsDraw(20, () => 'VFR'),
+      {
+        flight_category: ['IFR', 'LIFR'],
+      },
+    );
+
+    expect(result.observations).toEqual([]);
+    expect(enrichment).toMatchObject({ truncated: false, shown: 0, surveyed: 20 });
+    const notice = String(enrichment.notice);
+    expect(notice).toContain('flight_category filter (IFR, LIFR) emptied this result');
+    expect(notice).toContain('none of the 20 station(s)');
+    expect(notice).toMatch(/drop flight_category/i);
+  });
+
+  it('keeps an empty draw a no_stations_found error, ahead of the filter', async () => {
+    mockFetchMetar.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ bbox: surveyBox, flight_category: ['IFR'] });
+
+    await expect(aviationGetMetar.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_stations_found' },
+    });
+    expect(getEnrichment(ctx)).not.toHaveProperty('surveyed');
+  });
+
+  it('scopes the filter counts to a capped draw', async () => {
+    const { enrichment } = await surveyFor(repeatedDraw(61, 400, mixed), {
+      flight_category: ['IFR', 'LIFR'],
+    });
+    const notice = String(enrichment.notice);
+
+    expect(enrichment).toMatchObject({ truncated: true, cap: 400, surveyed: 61, shown: 18 });
+    expect(notice).toContain('its per-request maximum');
+    expect(notice).toContain('kept 18 of the 61 station(s) inside the capped draw');
+    expect(notice.indexOf('per-request maximum')).toBeLessThan(notice.indexOf('kept 18'));
+  });
+
+  it('says a capped draw the filter emptied covers only that draw', async () => {
+    const { result, enrichment } = await surveyFor(repeatedDraw(61, 400), {
+      flight_category: ['LIFR'],
+    });
+    const notice = String(enrichment.notice);
+
+    expect(result.observations).toEqual([]);
+    expect(enrichment).toMatchObject({ truncated: true, shown: 0, surveyed: 61 });
+    expect(notice).toContain('emptied this result');
+    expect(notice).toContain('inside the capped draw');
+  });
+
+  it('composes the cap, the filter, and the size sentence into one notice, in that order', async () => {
+    // 400 rows over 80 stations, 48 of them IFR: past the threshold after the
+    // filter, so all three statements are owed.
+    const { enrichment } = await surveyFor(
+      repeatedDraw(80, 400, (i) => (i < 48 ? 'IFR' : 'VFR')),
+      { flight_category: ['IFR'] },
+    );
+    const notice = String(enrichment.notice);
+
+    expect(enrichment).toMatchObject({ truncated: true, surveyed: 80, shown: 48 });
+    const cap = notice.indexOf('per-request maximum');
+    const filter = notice.indexOf('kept 48 of the 80');
+    const size = notice.indexOf('48 stations because no limit was set');
+    expect(cap).toBeGreaterThanOrEqual(0);
+    expect(filter).toBeGreaterThan(cap);
+    expect(size).toBeGreaterThan(filter);
+    // The filter is already set, so the size sentence does not re-offer it.
+    expect(notice.slice(size)).not.toContain('flight_category');
+  });
+
+  it('compares the size threshold against the stations left after the filter', async () => {
+    // 90 stations surveyed, 40 kept: at the threshold, so no size sentence.
+    const { enrichment } = await surveyFor(
+      stationsDraw(90, (i) => (i < 40 ? 'IFR' : 'VFR')),
+      { flight_category: ['IFR'] },
+    );
+
+    expect(enrichment).toMatchObject({ surveyed: 90, shown: 40 });
+    expect(String(enrichment.notice)).toContain('kept 40 of the 90');
+    expect(String(enrichment.notice)).not.toContain('no limit was set');
+  });
+
+  it('names the size lever one station past the threshold after the filter', async () => {
+    const { enrichment } = await surveyFor(
+      stationsDraw(90, (i) => (i < 41 ? 'IFR' : 'VFR')),
+      { flight_category: ['IFR'] },
+    );
+
+    expect(String(enrichment.notice)).toContain('41 stations because no limit was set');
+  });
+
+  // -------------------------------------------------------------------------
+  // Input
+  // -------------------------------------------------------------------------
+
+  it.each([
+    ['an empty array', []],
+    ['a category the tool does not define', ['unknown']],
+    ['a lowercase category', ['ifr']],
+    ['a bare string', 'IFR'],
+  ])('rejects %s at the schema', (_label, flight_category) => {
+    expect(aviationGetMetar.input.safeParse({ bbox: surveyBox, flight_category }).success).toBe(
+      false,
+    );
+  });
+
+  it('rejects flight_category alongside station_ids, before any upstream request', async () => {
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    const input = aviationGetMetar.input.parse({ station_ids: ['KSEA'], flight_category: ['IFR'] });
+
+    await expect(aviationGetMetar.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'conflicting_flight_category',
+        recovery: { hint: expect.stringContaining('bbox') },
+      },
+    });
+    expect(mockFetchMetar).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['conflicting_location', { station_ids: ['KSEA'], bbox: surveyBox, flight_category: ['IFR'] }],
+    ['conflicting_limit', { station_ids: ['KSEA'], limit: 5, flight_category: ['IFR'] }],
+  ])('reports %s ahead of conflicting_flight_category', async (reason, raw) => {
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+
+    await expect(
+      aviationGetMetar.handler(aviationGetMetar.input.parse(raw), ctx),
+    ).rejects.toMatchObject({ data: { reason } });
+  });
+
+  it('declares the rejection in the error contract', () => {
+    const entry = aviationGetMetar.errors?.find((e) => e.reason === 'conflicting_flight_category');
+
+    expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError });
+    expect(entry?.recovery).toContain('bbox');
+  });
+
+  it('does not change what is drawn', async () => {
+    await surveyFor(stationsDraw(5, mixed), { flight_category: ['IFR'], hours: 2 });
+
+    expect(mockFetchMetar).toHaveBeenCalledWith({ bbox: surveyBox, hours: 2 }, expect.anything());
+  });
+
+  // -------------------------------------------------------------------------
+  // Both response surfaces
+  // -------------------------------------------------------------------------
+
+  it('reaches structuredContent and content[] through the real tool pipeline', async () => {
+    const { result, text } = await surveyContract(stationsDraw(30, mixed), {
+      flight_category: ['LIFR'],
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      observations: [
+        expect.objectContaining({ station_id: 'K007', flight_category: 'LIFR' }),
+        expect.objectContaining({ station_id: 'K014' }),
+        expect.objectContaining({ station_id: 'K021' }),
+        expect.objectContaining({ station_id: 'K028' }),
+      ],
+      truncated: false,
+      shown: 4,
+      surveyed: 30,
+      notice: expect.stringContaining('kept 4 of the 30'),
+    });
+    expect(text).toContain('## K007 — K007 field');
+    expect(text).toContain('**Flight Category:** LIFR');
+    expect(text).not.toContain('## K005');
+    expect(text).toContain('**Stations surveyed before the flight category filter:** 30');
+    expect(text).toContain('kept 4 of the 30');
+  });
+
+  it('renders a filter-emptied survey on both surfaces without an error', async () => {
+    const { result, text } = await surveyContract(
+      stationsDraw(20, () => 'VFR'),
+      {
+        flight_category: ['IFR'],
+      },
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      observations: [],
+      shown: 0,
+      surveyed: 20,
+      notice: expect.stringContaining('emptied this result'),
+    });
+    expect(text).toContain('No station in this result');
+    expect(text).toContain('emptied this result');
+  });
+
+  it('describes the filter on the input and the tool', () => {
+    const description = aviationGetMetar.input.shape.flight_category.description ?? '';
+
+    expect(description).toMatch(/after .*latest observation/i);
+    expect(description).toMatch(/before .*limit/i);
+    expect(description).toContain('unknown');
+    expect(aviationGetMetar.description).toContain('flight_category');
+  });
+
+  it('names each category once in the notice when the input repeats one', async () => {
+    const { enrichment } = await surveyFor(stationsDraw(30, mixed), {
+      flight_category: ['IFR', 'IFR', 'LIFR'],
+    });
+
+    expect(String(enrichment.notice)).toContain('The flight_category filter (IFR, LIFR) kept 9');
+  });
+
+  it('names each category once on a filter-emptied result too', async () => {
+    const { enrichment } = await surveyFor(
+      stationsDraw(20, () => 'VFR'),
+      {
+        flight_category: ['LIFR', 'LIFR'],
+      },
+    );
+
+    expect(String(enrichment.notice)).toContain('filter (LIFR) emptied this result');
+    expect(String(enrichment.notice)).toContain('reported LIFR.');
+  });
+
+  it('scopes a limit on a capped, filtered draw to the stations that matched inside it', async () => {
+    const { enrichment } = await surveyFor(repeatedDraw(61, 400, mixed), {
+      flight_category: ['IFR', 'LIFR'],
+      limit: 5,
+    });
+
+    expect(enrichment).toMatchObject({ truncated: true, matched: 18, shown: 5, limited: true });
+    expect(String(enrichment.notice)).toContain(
+      'The request limited this result to the first 5 of 18 station(s) matching flight_category inside the capped draw, ordered by station ID ascending.',
+    );
+  });
+
+  it('labels matched as the stations matched before the limit on the content[] trailer', async () => {
+    const { text } = await surveyContract(stationsDraw(30, mixed), {
+      flight_category: ['IFR', 'LIFR'],
+      limit: 3,
+    });
+
+    expect(text).toContain('**Stations surveyed before the flight category filter:** 30');
+    expect(text).toContain('**Stations matched before the limit:** 9');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cap guidance names only usable levers (issue #53) — at the minimum hours of
+// 1 the survey was still told to lower hours first
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar cap guidance levers', () => {
+  const HOURS_SENTENCE =
+    'A wide hours spends the cap on repeat readings from the stations it did reach, so lower hours first; then re-run over smaller bbox quadrants and union the results.';
+
+  it('leads with the quadrants at the minimum hours of 1', async () => {
+    const notice = String((await surveyFor(repeatedDraw(61, 400), { hours: 1 })).enrichment.notice);
+
+    expect(notice).toContain(
+      'the draw reached only 61 of them. Re-run over smaller bbox quadrants and union the results.',
+    );
+    expect(notice).not.toMatch(/lower hours/);
+  });
+
+  it.each([2, 12])('keeps the hours sentence byte-identical at hours=%i', async (hours) => {
+    const notice = String((await surveyFor(repeatedDraw(61, 400), { hours })).enrichment.notice);
+
+    expect(notice).toContain(`the draw reached only 61 of them. ${HOURS_SENTENCE}`);
+  });
+
+  it('keeps cap → filter → limit order at hours=1', async () => {
+    const notice = String(
+      (
+        await surveyFor(repeatedDraw(61, 400, mixed), {
+          hours: 1,
+          flight_category: ['IFR', 'LIFR'],
+          limit: 5,
+        })
+      ).enrichment.notice,
+    );
+
+    const cap = notice.indexOf('union the results.');
+    const filter = notice.indexOf('kept 18 of the 61');
+    const limit = notice.indexOf('limited this result');
+    expect(cap).toBeGreaterThanOrEqual(0);
+    expect(filter).toBeGreaterThan(cap);
+    expect(limit).toBeGreaterThan(filter);
+  });
+
+  it('reaches both surfaces without the hours lever at hours=1', async () => {
+    const { result, text } = await surveyContract(repeatedDraw(61, 400), { hours: 1 });
+
+    expect(String((result.structuredContent as { notice?: string }).notice)).not.toMatch(
+      /lower hours/,
+    );
+    expect(text).toContain('Re-run over smaller bbox quadrants and union the results.');
+    expect(text).not.toMatch(/lower hours/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Empty-result and partial-batch hints name only usable levers (issue #53) —
+// "raise hours" and "Widen hours" were offered at the maximum of 12
+// ---------------------------------------------------------------------------
+
+describe('aviationGetMetar empty-result levers', () => {
+  const BBOX_HINT_TAIL =
+    'Confirm the box holds reporting stations with aviation_find_stations, whose data_types names the ones that transmit METARs.';
+
+  async function emptyBoxHint(hours: number) {
+    mockFetchMetar.mockResolvedValue([]);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    try {
+      await aviationGetMetar.handler(aviationGetMetar.input.parse({ bbox: surveyBox, hours }), ctx);
+    } catch (e) {
+      return String((e as { data?: { recovery?: { hint?: string } } }).data?.recovery?.hint);
+    }
+    throw new Error('handler resolved where it was expected to throw');
+  }
+
+  async function missingNotice(hours: number) {
+    mockFetchMetar.mockResolvedValue([ksea]);
+    const ctx = createMockContext({ errors: aviationGetMetar.errors });
+    await aviationGetMetar.handler(
+      aviationGetMetar.input.parse({ station_ids: ['KSEA', 'KZZZ'], hours }),
+      ctx,
+    );
+    return String(getEnrichment(ctx).notice);
+  }
+
+  it('keeps the empty-box hint byte-identical below the hours maximum', async () => {
+    expect(await emptyBoxHint(1)).toBe(
+      `Widen the bounding box or raise hours, then re-run. ${BBOX_HINT_TAIL}`,
+    );
+  });
+
+  it('drops raise hours from the empty-box hint at the maximum of 12', async () => {
+    expect(await emptyBoxHint(12)).toBe(`Widen the bounding box, then re-run. ${BBOX_HINT_TAIL}`);
+  });
+
+  it('keeps the missing-station notice byte-identical below the hours maximum', async () => {
+    expect(await missingNotice(11)).toMatch(
+      /11-hour lookback\. Widen hours, or verify the IDs with aviation_find_stations\.$/,
+    );
+  });
+
+  it('drops Widen hours from the missing-station notice at the maximum of 12', async () => {
+    expect(await missingNotice(12)).toMatch(
+      /12-hour lookback\. Verify the IDs with aviation_find_stations\.$/,
+    );
+  });
+
+  it('keeps the declared recovery accurate at every hours value', () => {
+    const recovery =
+      aviationGetMetar.errors?.find((e) => e.reason === 'no_stations_found')?.recovery ?? '';
+
+    expect(recovery).toMatch(/raise hours while it is below 12/);
+  });
+
+  it('says only drop, not widen, when the filter already named every category', async () => {
+    const { enrichment } = await surveyFor(
+      stationsDraw(12, () => 'unknown'),
+      {
+        flight_category: ['VFR', 'MVFR', 'IFR', 'LIFR'],
+      },
+    );
+    const notice = String(enrichment.notice);
+
+    expect(notice).toContain('emptied this result');
+    expect(notice).toMatch(/Drop flight_category to see them\.$/);
+    expect(notice).not.toMatch(/Widen or drop/);
+  });
+
+  it('keeps the widen-or-drop wording when the filter left categories out', async () => {
+    const { enrichment } = await surveyFor(
+      stationsDraw(12, () => 'VFR'),
+      {
+        flight_category: ['LIFR'],
+      },
+    );
+
+    expect(String(enrichment.notice)).toMatch(/Widen or drop flight_category to see them\.$/);
+  });
+
+  it('carries both hints on both surfaces at hours=12', async () => {
+    mockFetchMetar.mockResolvedValue([]);
+    const empty = await runToolContract(aviationGetMetar, { bbox: surveyBox, hours: 12 });
+    const emptyText = empty.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(empty.isError).toBe(true);
+    expect(
+      (empty.structuredContent as { error?: { data?: { recovery?: { hint?: string } } } }).error
+        ?.data?.recovery?.hint,
+    ).toBe(`Widen the bounding box, then re-run. ${BBOX_HINT_TAIL}`);
+    expect(emptyText).not.toMatch(/raise hours/);
+
+    mockFetchMetar.mockResolvedValue([ksea]);
+    const partial = await runToolContract(aviationGetMetar, {
+      station_ids: ['KSEA', 'KZZZ'],
+      hours: 12,
+    });
+    const partialText = partial.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(String((partial.structuredContent as { notice?: string }).notice)).toMatch(
+      /Verify the IDs with aviation_find_stations\.$/,
+    );
+    expect(partialText).not.toMatch(/Widen hours/);
   });
 });

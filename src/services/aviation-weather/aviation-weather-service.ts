@@ -18,6 +18,7 @@ import type {
   NormalizedIcingLayer,
   NormalizedMetar,
   NormalizedPirep,
+  NormalizedPirepWind,
   NormalizedPresentWeather,
   NormalizedStation,
   NormalizedTaf,
@@ -509,6 +510,26 @@ function pirepCloudAltitude(value: number | null): number | null {
   return value == null || value === 0 ? null : value;
 }
 
+/**
+ * Sky-clear covers, which state that there is no layer and so have no extent
+ * to report. AWC nonetheless decodes `/SK SKC` with a base borrowed from the
+ * report's altitude (or the top of the layer beneath it) and a top of 60000,
+ * the same synthesis decision 20 drops from icing; `CLR` arrives as `0/0`.
+ */
+const SKY_CLEAR_COVERS = new Set(['SKC', 'CLR']);
+
+/**
+ * Wind aloft, from AWC's decode of a PIREP `/WV` group or an AIREP's
+ * `dddfffKT` group. Upstream fills both fields or neither — a gust-suffixed
+ * `/WV 03020G30` is left undecoded — so a half-populated pair is not a reading
+ * to publish, and a calm `0`/`0` is.
+ */
+function pirepWind(raw: RawPirep): NormalizedPirepWind | null {
+  return typeof raw.wdir === 'number' && typeof raw.wspd === 'number'
+    ? { direction_deg: raw.wdir, speed_kt: raw.wspd }
+    : null;
+}
+
 function normalizePirep(raw: RawPirep): NormalizedPirep {
   // Build turbulence layers — omit entries with empty intensity
   const turbulence: NormalizedTurbulenceLayer[] = [];
@@ -555,14 +576,19 @@ function normalizePirep(raw: RawPirep): NormalizedPirep {
   }
 
   // Clouds — a layer with neither base nor top (CLR, SKC, VMC, IMC) still
-  // carries its cover, so keep it rather than filtering it away.
+  // carries its cover, so keep it rather than filtering it away. A sky-clear
+  // cover publishes no bounds whatever upstream attached to it.
   const clouds =
     raw.clouds && raw.clouds.length > 0
-      ? raw.clouds.map((c) => ({
-          cover: c.cover,
-          base_ft: pirepCloudAltitude(c.base),
-          top_ft: pirepCloudAltitude(c.top),
-        }))
+      ? raw.clouds.map((c) =>
+          SKY_CLEAR_COVERS.has(c.cover)
+            ? { cover: c.cover, base_ft: null, top_ft: null }
+            : {
+                cover: c.cover,
+                base_ft: pirepCloudAltitude(c.base),
+                top_ft: pirepCloudAltitude(c.top),
+              },
+        )
       : null;
 
   const visib =
@@ -583,7 +609,11 @@ function normalizePirep(raw: RawPirep): NormalizedPirep {
     icing,
     clouds,
     visibility_sm: visib,
-    remarks: strOrNull(raw.wxString),
+    temp_c: raw.temp ?? null,
+    wind: pirepWind(raw),
+    // `wxString` is AWC's decode of the `/WX` group, never of `/RM`, and takes
+    // the same raw/decoded pair METAR and TAF publish for the same field.
+    weather: normalizePresentWeather(raw.wxString),
     raw_pirep: raw.rawOb,
   };
 }

@@ -80,7 +80,7 @@ const PirepCloudLayerSchema = z
     cover: z
       .string()
       .describe(
-        'Cloud cover code: FEW, SCT, BKN, OVC, SKC, or CLR. The field also carries the flight-condition markers VMC and IMC, which describe the flight environment rather than a cloud layer and arrive with no base or top.',
+        'Cloud cover code: FEW, SCT, BKN, OVC, SKC, or CLR. SKC and CLR state a clear sky and never carry a base or top. The field also carries the flight-condition markers VMC and IMC, which describe the flight environment rather than a cloud layer and arrive with no base or top.',
       ),
     base_ft: z
       .number()
@@ -95,6 +95,36 @@ const PirepCloudLayerSchema = z
 
 /** Radius applied to a station_id search when distance_nm is omitted. */
 const DEFAULT_DISTANCE_NM = 100;
+
+/** The schema floor of distance_nm — below it, the radius cannot narrow. */
+const MIN_DISTANCE_NM = 10;
+
+/** The schema ceilings of the two widening levers — past them, neither widens. */
+const MAX_DISTANCE_NM = 500;
+const MAX_HOURS = 12;
+
+/**
+ * The parameters that widen an empty PIREP search, naming only the ones this
+ * call can still pull — the widening counterpart of `narrowingLevers`.
+ * `distance_nm` belongs to the `station_id` search and is rejected beside a
+ * `bbox`; a wider box belongs to the area search; and neither `distance_nm`
+ * nor `hours` goes past its schema maximum. Null when nothing is left to widen.
+ */
+function wideningLevers(
+  mode: 'station_id' | 'bbox',
+  hours: number,
+  radiusNm: number,
+): string | null {
+  const expandable = [
+    mode === 'station_id' && radiusNm < MAX_DISTANCE_NM ? 'distance_nm' : null,
+    hours < MAX_HOURS ? 'hours' : null,
+  ].filter(Boolean);
+  const expand =
+    expandable.length > 0
+      ? `expand the ${expandable.join(' or ')} ${expandable.length > 1 ? 'parameters' : 'parameter'}`
+      : null;
+  return [mode === 'bbox' ? 'widen the bbox' : null, expand].filter(Boolean).join(' or ') || null;
+}
 
 /**
  * AWC's rejection text for a `/pirep` center identifier it cannot resolve. The
@@ -146,17 +176,48 @@ function limitNotice(
 }
 
 /**
- * The parameters that narrow a PIREP query before the upstream row cap applies,
- * naming only the ones this query has not already pulled. `min_intensity` and
- * an altitude band inside the upstream width are both sent to AWC, so once
- * either is in the query it has already done its narrowing, and offering it
- * back sends the caller in a circle.
+ * Reports past which a call that set no `limit` is told the lever exists. It is
+ * the largest multiple of 10 whose `structuredContent` fits the framework's
+ * 24,000-byte overflow budget at the heaviest measured per-report cost —
+ * see decision 36 in docs/design.md.
  */
-function narrowingLevers(level: number | undefined, minIntensity: string | undefined): string {
+const SIZE_NOTICE_THRESHOLD = 50;
+
+/**
+ * The size lever, for a result that is large only because the call set no
+ * `limit`. It states what the lever keeps, since a caller choosing between it
+ * and a narrower search needs to know a limit selects by recency. The severity
+ * lever is offered only where the caller has not already pulled it, for the
+ * reason `limitNotice` gives.
+ */
+function sizeNotice(shown: number, minIntensity: string | undefined): string {
+  const severityLever = minIntensity
+    ? ''
+    : ' Set min_intensity as well to have AWC narrow to the severe reports before a limit selects by recency.';
+  return `This result returned ${shown} reports because no limit was set. Setting limit bounds the response without changing what is searched, keeping the most recent reports.${severityLever}`;
+}
+
+/**
+ * The parameters that narrow a PIREP query before the upstream row cap applies,
+ * naming only the ones this query can still pull. `min_intensity` and an
+ * altitude band inside the upstream width are both sent to AWC, so once either
+ * is in the query it has already done its narrowing, and offering it back sends
+ * the caller in a circle. The same goes for a lever the call cannot use at all:
+ * `distance_nm` belongs to the `station_id` search and is rejected beside a
+ * `bbox`, a `bbox` belongs to the area search, `distance_nm` cannot go below
+ * 10, and `hours` cannot go below 1.
+ */
+function narrowingLevers(
+  mode: 'station_id' | 'bbox',
+  hours: number,
+  radiusNm: number,
+  level: number | undefined,
+  minIntensity: string | undefined,
+): string {
   return [
-    'a smaller bbox',
-    'a smaller distance_nm',
-    'a shorter hours',
+    mode === 'bbox' ? 'a smaller bbox' : null,
+    mode === 'station_id' && radiusNm > MIN_DISTANCE_NM ? 'a smaller distance_nm' : null,
+    hours > 1 ? 'a shorter hours' : null,
     minIntensity ? null : 'min_intensity',
     level != null
       ? null
@@ -197,7 +258,7 @@ function altitudeExtent(base_ft: number | null, top_ft: number | null): string {
 export const aviationGetPireps = tool('aviation_get_pireps', {
   title: 'Get Pilot Reports (PIREPs)',
   description:
-    'Get recent Pilot Reports (PIREPs) near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, and the raw PIREP string. Requires either station_id (ICAO center point for radial search, e.g., KSEA) or bbox (area search) — not both. distance_nm belongs to the station_id search only, and altitude_min_ft must not exceed altitude_max_ft. min_intensity restricts the result to reports carrying a turbulence or icing layer at that intensity or above. limit bounds how many reports come back without changing what is searched, keeping the most recent. Coverage is US-centric; PIREPs are sparse and absence of reports does not imply smooth conditions.',
+    'Get recent Pilot Reports (PIREPs) near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, outside air temperature, wind aloft, flight weather, and the raw PIREP string. Requires either station_id (ICAO center point for radial search, e.g., KSEA) or bbox (area search) — not both. distance_nm belongs to the station_id search only, and altitude_min_ft must not exceed altitude_max_ft. min_intensity restricts the result to reports carrying a turbulence or icing layer at that intensity or above. limit bounds how many reports come back without changing what is searched, keeping the most recent. Coverage is US-centric; PIREPs are sparse and absence of reports does not imply smooth conditions.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     station_id: z
@@ -211,8 +272,8 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     distance_nm: z
       .number()
       .int()
-      .min(10)
-      .max(500)
+      .min(MIN_DISTANCE_NM)
+      .max(MAX_DISTANCE_NM)
       .optional()
       .describe(
         'Search radius in nautical miles around station_id, defaulting to 100 when omitted. Belongs to the station_id search only — supplying it alongside bbox is rejected.',
@@ -221,7 +282,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       .number()
       .int()
       .min(1)
-      .max(12)
+      .max(MAX_HOURS)
       .default(3)
       .describe('How many hours of history to return. Default 3.'),
     altitude_min_ft: z
@@ -297,10 +358,42 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
               .number()
               .nullable()
               .describe('In-flight visibility in statute miles, or null if not reported.'),
-            remarks: z
-              .string()
+            temp_c: z
+              .number()
               .nullable()
-              .describe('Weather remarks or additional conditions, or null if none.'),
+              .describe(
+                'Outside air temperature in degrees Celsius at the report altitude, as AWC decoded it — the /TA group on a PIREP, the MS or PS temperature group on an AIREP. 0 is a real reading; null means the report carried none or gave it as unknown (/TA UNKN).',
+              ),
+            wind: z
+              .object({
+                direction_deg: z
+                  .number()
+                  .describe(
+                    "Wind direction aloft in degrees, as reported and not converted. A PIREP /WV group is referenced to magnetic north (AIM TBL 7-1-18), unlike the true-north METAR and TAF winds, so apply the local magnetic variation before combining a PIREP's direction with a true track; an AIREP's reference is not stated here.",
+                  ),
+                speed_kt: z.number().describe('Wind speed aloft in knots. 0 is a reported calm.'),
+              })
+              .nullable()
+              .describe(
+                'Wind aloft at the report altitude, as AWC decoded it — the /WV group on a PIREP, the direction/speed group (e.g., 291/035KT) on an AIREP. Null unless AWC decoded both direction and speed. AWC leaves some forms undecoded — a gust suffix (/WV 03020G30), a single-digit AIREP speed (252/9 KT), a variation (/WV +/- 5KT) — and those return null here, with raw_pirep as the only source.',
+              ),
+            weather: z
+              .object({
+                raw: z
+                  .string()
+                  .describe(
+                    'Weather groups exactly as encoded, space-delimited (e.g., "+RA", "FG -RA").',
+                  ),
+                decoded: z
+                  .string()
+                  .describe(
+                    'Plain-English reading of each group, joined with "; " (e.g., "heavy rain", "fog; light rain"). A group the decoder does not recognize is carried through as its own raw token, so compare against raw when a reading still looks coded.',
+                  ),
+              })
+              .nullable()
+              .describe(
+                'Flight weather AWC decoded from the /WX group, or null when it decoded no weather phenomena from it. A flight visibility AWC can read (FV07SM, 10SM) lands in visibility_sm instead. /WX text AWC cannot decode is dropped or trimmed — CEILING 017 returns null and RA FL300 AOB returns RA alone — so raw_pirep is the only source for it. This is not the /RM remarks text, which AWC does not decode either — raw_pirep carries it.',
+              ),
             raw_pirep: z
               .string()
               .describe(
@@ -322,7 +415,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       // rather than an incident.
       severity: 'notice',
       recovery:
-        'Expand the distance_nm or hours parameters, or try a different region. PIREPs are sparse; absence of reports does not mean smooth conditions.',
+        'Widen the search — a larger distance_nm (up to 500) on a station_id search, a larger bbox on an area search, or a longer hours while it is below 12 — or try a different region. PIREPs are sparse; absence of reports does not mean smooth conditions.',
     },
     {
       reason: 'station_not_recognized',
@@ -408,7 +501,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       .string()
       .optional()
       .describe(
-        'Guidance for whichever disclosures fired: the levers that narrow the query before the cap applies, and what a requested limit withheld. Both can fire on one result, and the text keeps them apart.',
+        'Guidance for whichever disclosures fired: the levers that narrow the query before the cap applies, what a requested limit withheld, and — on a result of more than 50 reports from a call that set no limit — that limit bounds the response without changing what is searched, keeping the most recent. The cap and either limit statement can fire on one result, and the text keeps them apart.',
       ),
   },
 
@@ -467,11 +560,14 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     }
 
     const radiusNm = input.distance_nm ?? DEFAULT_DISTANCE_NM;
+    const mode = input.station_id ? 'station_id' : 'bbox';
 
     // Push what upstream can express, so the row cap applies to a page already
     // narrowed. Computed after the inverted-range guard, so no centre is ever
     // derived from a range that cannot match.
     const level = pushablePirepLevel(altMin, altMax);
+    // The narrowing levers this call can still pull, for the cap guidance.
+    const levers = narrowingLevers(mode, input.hours, radiusNm, level, input.min_intensity);
 
     ctx.log.info('Fetching PIREPs', {
       stationId: input.station_id,
@@ -582,6 +678,8 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
 
       let message: string;
       let recovery: string;
+      const sparse = 'PIREPs are sparse; absence of reports does not mean smooth conditions.';
+      const widen = wideningLevers(mode, input.hours, radiusNm);
 
       if (altFiltered && partialDraw) {
         const why = [
@@ -592,18 +690,19 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
           .join(' and ');
         message = `No PIREPs matched the altitude filter (${altRange}) in the part of the search area this query drew: ${why}, so the area was searched only in part — the ${rawCount} report(s) drawn describe that slice, not the whole area.`;
         recovery = capped
-          ? `Narrow the search until it falls under the ${AWC_MAX_ROWS}-report upstream cap — ${narrowingLevers(level, input.min_intensity)} — then reapply the altitude filter. ${altitudeLeverNote(level)}`
-          : `Relax ${relaxable} to widen the draw, or expand the distance_nm or hours parameters. ${altitudeLeverNote(level)}`;
+          ? `Narrow the search until it falls under the ${AWC_MAX_ROWS}-report upstream cap — ${levers} — then reapply the altitude filter. ${altitudeLeverNote(level)}`
+          : `Relax ${relaxable} to widen the draw${widen ? `, or ${widen}` : ''}. ${altitudeLeverNote(level)}`;
       } else if (altFiltered) {
         message = `No PIREPs in the search area matched the altitude filter (${altRange}). ${rawCount} report(s) were found at other or unreported altitudes.`;
         recovery = `Remove or adjust altitude_min_ft / altitude_max_ft. ${rawCount} PIREP(s) exist in the area at other or unreported altitudes.`;
       } else if (drawScope) {
         message = `No PIREPs matching ${drawScope} were found in the search area for the past ${input.hours} hour(s). That narrowing was applied upstream, so reports outside it were never drawn.`;
-        recovery = `Relax ${relaxable}, or expand the distance_nm or hours parameters. PIREPs are sparse; absence of reports does not mean smooth conditions.`;
+        recovery = `Relax ${relaxable}${widen ? `, or ${widen}` : ''}. ${sparse}`;
       } else {
         message = `No PIREPs found in the search area for the past ${input.hours} hour(s).`;
-        recovery =
-          'Expand the distance_nm or hours parameters, or try a different region. PIREPs are sparse; absence of reports does not mean smooth conditions.';
+        recovery = widen
+          ? `${widen.charAt(0).toUpperCase()}${widen.slice(1)}, or try a different region. ${sparse}`
+          : `Try a different region. ${sparse}`;
       }
 
       throw ctx.fail('no_pireps_found', message, { recovery: { hint: recovery } });
@@ -615,31 +714,36 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     // recent matches rather than an arbitrary slice.
     const matched = pireps.length;
     const shownReports = input.limit != null ? pireps.slice(0, input.limit) : pireps;
+    const shown = shownReports.length;
     const limited = input.limit != null && matched > input.limit;
 
+    // The cap, the limit, and the size lever are separate disclosures sharing
+    // one notice, and every notice writer is last-wins — so each states its own
+    // case in turn and the notice is written once. The size sentence never
+    // meets the limit one: it is owed only to a call that set no limit.
+    const narrowed =
+      matched < rawCount
+        ? ` — the altitude filter then narrowed that capped page to ${matched} report(s)`
+        : '';
+    const notice = [
+      capped
+        ? `AWC served ${rawCount} reports for this query, its per-request maximum, so reports inside the search area and the ${input.hours}-hour window are missing from this result${narrowed}. Narrow the search — ${levers} — and re-run. ${altitudeLeverNote(level)}`
+        : null,
+      limited ? limitNotice(shown, matched, capped, input.min_intensity) : null,
+      input.limit == null && shown > SIZE_NOTICE_THRESHOLD
+        ? sizeNotice(shown, input.min_intensity)
+        : null,
+    ]
+      .filter(Boolean)
+      .join(' ');
+
     if (capped) {
-      const narrowed =
-        matched < rawCount
-          ? ` — the altitude filter then narrowed that capped page to ${matched} report(s)`
-          : '';
-      ctx.enrich.truncated({
-        shown: shownReports.length,
-        cap: AWC_MAX_ROWS,
-        // The cap and the limit are separate disclosures sharing one notice, so
-        // the cap states its own case first and the limit appends its own.
-        guidance: [
-          `AWC served ${rawCount} reports for this query, its per-request maximum, so reports inside the search area and the ${input.hours}-hour window are missing from this result${narrowed}. Narrow the search — ${narrowingLevers(level, input.min_intensity)} — and re-run. ${altitudeLeverNote(level)}`,
-          limited ? limitNotice(shownReports.length, matched, true, input.min_intensity) : null,
-        ]
-          .filter(Boolean)
-          .join(' '),
-      });
+      ctx.enrich.truncated({ shown, cap: AWC_MAX_ROWS, guidance: notice });
       // Restating the served count is only informative where the filter moved it.
       if (matched < rawCount) ctx.enrich({ upstreamRows: rawCount });
     } else {
-      ctx.enrich({ truncated: false, shown: shownReports.length });
-      if (limited)
-        ctx.enrich.notice(limitNotice(shownReports.length, matched, false, input.min_intensity));
+      ctx.enrich({ truncated: false, shown });
+      if (notice) ctx.enrich.notice(notice);
     }
 
     // A caller who set no limit already knows none applied, so the affirmative
@@ -648,7 +752,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     if (input.limit != null) ctx.enrich({ limited });
     if (limited) ctx.enrich({ matched });
 
-    ctx.log.info('PIREPs retrieved', { count: shownReports.length, matched, rawCount });
+    ctx.log.info('PIREPs retrieved', { count: shown, matched, rawCount });
     return { pireps: shownReports };
   },
 
@@ -690,7 +794,17 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       }
 
       if (p.visibility_sm != null) lines.push(`**Visibility:** ${p.visibility_sm} sm`);
-      if (p.remarks) lines.push(`**Remarks:** ${p.remarks}`);
+      const aloft = [
+        p.temp_c != null ? `**Temperature:** ${p.temp_c}°C` : null,
+        // A PIREP /WV direction is magnetic (AIM TBL 7-1-18) and sits beside
+        // METAR's true-north winds, so the line says so; an AIREP's reference
+        // is not stated, so its line asserts none.
+        p.wind
+          ? `**Wind:** ${p.wind.direction_deg}°${p.pirep_type === 'PIREP' ? ' magnetic' : ''} at ${p.wind.speed_kt} kt`
+          : null,
+      ].filter(Boolean);
+      if (aloft.length > 0) lines.push(aloft.join(' | '));
+      if (p.weather) lines.push(`**Weather:** ${p.weather.raw} (${p.weather.decoded})`);
       lines.push(`**Raw:** \`${p.raw_pirep}\``);
       lines.push('');
     }

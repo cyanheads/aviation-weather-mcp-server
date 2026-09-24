@@ -44,8 +44,14 @@ const tools = [
   {
     name: 'aviation_get_metar',
     def: aviationGetMetar,
-    keys: ['bbox', 'hours', 'limit', 'station_ids'],
-    full: { station_ids: ['KSEA'], bbox, hours: 3, limit: 25 },
+    keys: ['bbox', 'flight_category', 'hours', 'limit', 'station_ids'],
+    full: {
+      station_ids: ['KSEA'],
+      bbox,
+      hours: 3,
+      limit: 25,
+      flight_category: ['IFR', 'LIFR'],
+    },
   },
   {
     name: 'aviation_get_taf',

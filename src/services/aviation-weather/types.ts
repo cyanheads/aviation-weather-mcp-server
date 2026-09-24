@@ -360,6 +360,16 @@ export interface NormalizedPirepCloudLayer {
   top_ft: number | null;
 }
 
+/**
+ * Wind aloft at a report's altitude. AWC decodes direction and speed together
+ * or leaves both null, so the pair is one nullable object rather than two
+ * nullable scalars.
+ */
+export interface NormalizedPirepWind {
+  direction_deg: number;
+  speed_kt: number;
+}
+
 export interface NormalizedPirep {
   aircraft_type: string | null;
   /** Null when the report gave no flight level (`/FLUNKN/`, `/FLDURC/`, `/FLDURD/`). */
@@ -371,9 +381,17 @@ export interface NormalizedPirep {
   observed_at: string; // ISO 8601
   pirep_type: string; // 'PIREP' | 'AIREP'
   raw_pirep: string;
-  remarks: string | null;
+  /** Outside air temperature in °C. Null when absent or reported unknown; 0 is a reading. */
+  temp_c: number | null;
   turbulence: NormalizedTurbulenceLayer[];
   visibility_sm: number | null;
+  /**
+   * The `/WX` flight-weather group, raw and decoded — never `/RM` remarks,
+   * which AWC does not decode. Null when the report carried no phenomena.
+   */
+  weather: NormalizedPresentWeather | null;
+  /** Null unless AWC decoded both direction and speed. */
+  wind: NormalizedPirepWind | null;
 }
 
 export interface NormalizedAdvisory {

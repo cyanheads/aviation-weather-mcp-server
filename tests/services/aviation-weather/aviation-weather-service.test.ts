@@ -13,6 +13,7 @@ import {
   createFetchMock,
   createMockContext,
   type FetchMockHarness,
+  runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -24,7 +25,11 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async (importActual) => {
 });
 
 import { fetchWithTimeout } from '@cyanheads/mcp-ts-core/utils';
-import { AviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
+import { aviationGetPireps } from '@/mcp-server/tools/definitions/aviation-get-pireps.tool.js';
+import {
+  AviationWeatherService,
+  initAviationWeatherService,
+} from '@/services/aviation-weather/aviation-weather-service.js';
 import type {
   RawAirSigmet,
   RawMetar,
@@ -55,7 +60,9 @@ function queryParam(key: string, value: number | string): RegExp {
 const svc = new AviationWeatherService({} as AppConfig, {} as StorageService);
 
 beforeEach(() => {
-  vi.mocked(fetchWithTimeout).mockReset();
+  // A test that forgets to mock its response fails loudly on this rejection
+  // instead of reading an undefined Response.
+  vi.mocked(fetchWithTimeout).mockReset().mockRejectedValue(new Error('unmocked fetch'));
 });
 
 // ---------------------------------------------------------------------------
@@ -1389,6 +1396,231 @@ describe('AviationWeatherService PIREP cloud layers', () => {
   it('returns null when the report carried no sky-condition group', async () => {
     expect(await normalizeClouds(null)).toBeNull();
     expect(await normalizeClouds([])).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // Synthesized sky-clear bounds (issue #52) — AWC decodes `/SK SKC` into a
+  // layer whose base is the report's own altitude, or the top of the layer
+  // beneath it, and whose top is always 60000
+  // -------------------------------------------------------------------------
+
+  it('publishes an SKC layer with no bounds, whatever AWC synthesized for it', async () => {
+    // Live `CAD UA /OV CAD/TM 1607/FL050/TP C172/SK SKC/…` and
+    // `MLI UA /OV KMLI/TM 1455/FL030/TP CRJ9/SK SKC DURD`.
+    expect(await normalizeClouds([{ cover: 'SKC', base: 5000, top: 60000 }])).toEqual([
+      { cover: 'SKC', base_ft: null, top_ft: null },
+    ]);
+    expect(await normalizeClouds([{ cover: 'SKC', base: 3000, top: 60000 }])).toEqual([
+      { cover: 'SKC', base_ft: null, top_ft: null },
+    ]);
+  });
+
+  it('drops the synthesized top of an SKC layer AWC gave no base', async () => {
+    expect(await normalizeClouds([{ cover: 'SKC', base: 0, top: 60000 }])).toEqual([
+      { cover: 'SKC', base_ft: null, top_ft: null },
+    ]);
+  });
+
+  it('keeps the real layer beneath a stacked SKC', async () => {
+    // Live `CNO … /SK OVC011-TOP017/SKC`: the SKC base is the OVC top.
+    const clouds = await normalizeClouds([
+      { cover: 'OVC', base: 1100, top: 1700 },
+      { cover: 'SKC', base: 1700, top: 60000 },
+    ]);
+
+    expect(clouds).toEqual([
+      { cover: 'OVC', base_ft: 1100, top_ft: 1700 },
+      { cover: 'SKC', base_ft: null, top_ft: null },
+    ]);
+  });
+});
+
+describe('aviation_get_pireps SKC layer on both response surfaces', () => {
+  // The tool tests mock the service at the normalized level, so this runs the
+  // real normalization under the real tool to reach both surfaces.
+  async function surfaces(rawOb: string, clouds: RawPirep['clouds']) {
+    initAviationWeatherService({} as AppConfig, {} as StorageService);
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([{ ...rawPirep, fltLvl: 50, rawOb, clouds }]),
+    );
+    const result = await runToolContract(aviationGetPireps, { station_id: 'KCAD' });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    return { structured: result.structuredContent as { pireps: { clouds: unknown }[] }, text };
+  }
+
+  it('renders an SKC report as SKC alone', async () => {
+    const { structured, text } = await surfaces('CAD UA /OV CAD/TM 1607/FL050/TP C172/SK SKC', [
+      { cover: 'SKC', base: 5000, top: 60000 },
+    ]);
+
+    expect(structured.pireps[0]!.clouds).toEqual([{ cover: 'SKC', base_ft: null, top_ft: null }]);
+    expect(text).toContain('**Clouds:** SKC\n');
+    expect(text).not.toContain('60,000');
+  });
+
+  it('keeps the real layer beneath a stacked SKC on both surfaces', async () => {
+    const { structured, text } = await surfaces(
+      'CNO UA /OV CNO260002/TM 1538/FLDURC/TP C501/SK OVC011-TOP017/SKC',
+      [
+        { cover: 'OVC', base: 1100, top: 1700 },
+        { cover: 'SKC', base: 1700, top: 60000 },
+      ],
+    );
+
+    expect(structured.pireps[0]!.clouds).toEqual([
+      { cover: 'OVC', base_ft: 1100, top_ft: 1700 },
+      { cover: 'SKC', base_ft: null, top_ft: null },
+    ]);
+    expect(text).toContain('**Clouds:** OVC 1,100–1,700 ft, SKC\n');
+  });
+
+  it('leaves a CLR report as it was', async () => {
+    const { structured, text } = await surfaces(
+      'ORD UA /OV JOT290013/TM 0925/FL110/TP B753/SK CLR',
+      [{ cover: 'CLR', base: 0, top: 0 }],
+    );
+
+    expect(structured.pireps[0]!.clouds).toEqual([{ cover: 'CLR', base_ft: null, top_ft: null }]);
+    expect(text).toContain('**Clouds:** CLR\n');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PIREP temperature, wind aloft, and flight weather (issue #41) — AWC decodes
+// `/TA`, `/WV`, and `/WX` into `temp`, `wdir`/`wspd`, and `wxString`; the
+// report published only the last, under a name that pointed at `/RM`
+// ---------------------------------------------------------------------------
+
+describe('AviationWeatherService PIREP temperature, wind, and weather', () => {
+  /** Normalize one raw PIREP through the real service path. */
+  async function normalize(overrides: Partial<RawPirep>) {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([{ ...rawPirep, ...overrides }]));
+    const [report] = await svc.fetchPireps(
+      { stationId: 'KSEA', distanceNm: 100, hours: 3 },
+      createMockContext(),
+    );
+    return report! as typeof report & Record<string, unknown>;
+  }
+
+  it('leaves every other field of a normalized report as it was', async () => {
+    // Characterization — the three fields are additions and a rename, so the
+    // rest of the record has to come through unchanged.
+    const report = await normalize({
+      temp: -47,
+      wdir: 255,
+      wspd: 56,
+      wxString: '-RA',
+      visib: 5,
+      clouds: [{ cover: 'OVC', base: 2000, top: 2700 }],
+      tbInt1: 'MOD',
+      tbBas1: 240,
+      tbTop1: 280,
+      tbType1: 'CAT',
+      tbFreq1: 'OCNL',
+    });
+    const { temp_c, wind, weather, remarks, ...rest } = report;
+
+    expect(rest).toEqual({
+      observed_at: new Date(rawPirep.obsTime * 1000).toISOString(),
+      lat: 47.5,
+      lon: -122.3,
+      altitude_ft: 27000,
+      aircraft_type: 'B737',
+      pirep_type: 'PIREP',
+      turbulence: [
+        { base_ft: 24000, top_ft: 28000, intensity: 'MOD', type: 'CAT', frequency: 'OCNL' },
+      ],
+      icing: [],
+      clouds: [{ cover: 'OVC', base_ft: 2000, top_ft: 2700 }],
+      visibility_sm: 5,
+      raw_pirep: rawPirep.rawOb,
+    });
+  });
+
+  it('reads /TA M47/WV 25556KT as −47 °C and 255° at 56 kt', async () => {
+    const report = await normalize({
+      temp: -47,
+      wdir: 255,
+      wspd: 56,
+      rawOb: 'OFK UA /OV OFK/TM 1540/FL390/TP B738/TA M47/WV 25556KT',
+    });
+
+    expect(report.temp_c).toBe(-47);
+    expect(report.wind).toEqual({ direction_deg: 255, speed_kt: 56 });
+  });
+
+  it('keeps a decoded temperature of 0 as a reading', async () => {
+    expect((await normalize({ temp: 0 })).temp_c).toBe(0);
+  });
+
+  it.each<[string, Partial<RawPirep>]>([
+    ['/TA UNKN, which AWC leaves null', { temp: null }],
+    // The base fixture carries no `temp` key at all.
+    ['no temperature group, which AWC omits', {}],
+  ])('reports %s as an unknown temperature', async (_label, overrides) => {
+    expect((await normalize(overrides)).temp_c).toBeNull();
+  });
+
+  it('reads an AIREP wind that carries no /WV group', async () => {
+    // AIREPs encode wind as `291/035KT`; AWC decodes it into the same fields.
+    const report = await normalize({
+      pirepType: 'AIREP',
+      wdir: 291,
+      wspd: 35,
+      rawOb: 'ARP UAL604 3823N 11419W 0859 F370 MS51 291/035KT TB OCNL LGT CHOP',
+    });
+
+    expect(report.wind).toEqual({ direction_deg: 291, speed_kt: 35 });
+  });
+
+  it('keeps a calm wind aloft as a reading', async () => {
+    expect((await normalize({ wdir: 0, wspd: 0 })).wind).toEqual({
+      direction_deg: 0,
+      speed_kt: 0,
+    });
+  });
+
+  it.each<[string, Partial<RawPirep>]>([
+    ['a gust-suffixed /WV group AWC left undecoded', { wdir: null, wspd: null }],
+    // The base fixture carries neither key.
+    ['a report with no wind group', {}],
+    ['a direction with no speed', { wdir: 30, wspd: null }],
+    ['a speed with no direction', { wdir: null, wspd: 20 }],
+  ])('reports %s as no wind', async (_label, wind) => {
+    const report = await normalize({
+      ...wind,
+      rawOb: 'ABQ UA /OV ABQ/TM 1500/FL120/TP C172/WV 03020G30',
+    });
+
+    expect(report.wind).toBeNull();
+  });
+
+  it('decodes the /WX flight weather into the raw and decoded pair', async () => {
+    expect((await normalize({ wxString: '-RA' })).weather).toEqual({
+      raw: '-RA',
+      decoded: 'light rain',
+    });
+  });
+
+  it('decodes every group of a multi-group /WX value', async () => {
+    expect((await normalize({ wxString: 'FG -RA' })).weather).toEqual({
+      raw: 'FG -RA',
+      decoded: 'fog; light rain',
+    });
+  });
+
+  it.each([null, '', '   '])('reports a %p wxString as no weather', async (wxString) => {
+    expect((await normalize({ wxString })).weather).toBeNull();
+  });
+
+  it('publishes no remarks field — wxString is the /WX group, never /RM', async () => {
+    const report = await normalize({
+      wxString: 'HZ',
+      rawOb: 'DFW UA /OV DFW/TM 1500/FL050/TP B738/WX FV25SM HZ/TA 24/WV 17020KT/RM ZFW',
+    });
+
+    expect(report).not.toHaveProperty('remarks');
+    expect(report.weather).toEqual({ raw: 'HZ', decoded: 'haze' });
   });
 });
 

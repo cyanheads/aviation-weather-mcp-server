@@ -115,6 +115,23 @@ function limitNotice(shown: number, matched: number, capped: boolean): string {
 }
 
 /**
+ * Stations past which an area search that set no `limit` is told the lever
+ * exists. It is the largest multiple of 10 whose `structuredContent` fits the
+ * framework's 24,000-byte overflow budget at the heaviest measured per-station
+ * cost — see decision 36 in docs/design.md.
+ */
+const SIZE_NOTICE_THRESHOLD = 130;
+
+/**
+ * The size lever, for an area result that is large only because the call set
+ * no `limit`. It names the order a limit selects under, since that order —
+ * not the geography — decides which stations a bounded result keeps.
+ */
+function sizeNotice(shown: number): string {
+  return `This result returned ${shown} stations because no limit was set. Setting limit bounds the response without changing the area searched, keeping the first stations by ICAO identifier ascending, with identifier-less stations last.`;
+}
+
+/**
  * Recovery guidance for a request the registry rejected, branched on the mode
  * that built the query. The catch that raises this reads a classification
  * rather than a mode, so a single hint would advise a bbox caller about
@@ -128,6 +145,22 @@ function upstreamRejectionHint(mode: 'station_ids' | 'bbox' | 'state'): string {
     return 'The bounding box this call sent was refused rather than answered. Retry with a smaller box, or name the stations directly with station_ids.';
   }
   return 'The state search builds its own bounding box, so the state code is not what needs changing. Search the same area with an explicit bbox, or name the stations directly with station_ids.';
+}
+
+/**
+ * Recovery guidance for a search that resolved to nothing, branched on the mode
+ * for decision 28's reason: the contract entry has to hold for every mode, and a
+ * single hint would tell an area search to "use bbox or state" — the mode it is
+ * already in.
+ */
+function notFoundHint(mode: 'station_ids' | 'bbox' | 'state'): string {
+  if (mode === 'station_ids') {
+    return "A lookup matches the registry's own identifier, which for an airport is its 4-character ICAO ID (KSEA, not SEA). Use bbox or state to discover identifiers by location.";
+  }
+  if (mode === 'bbox') {
+    return 'The registry lists no station inside this bounding box. Widen the box, or name the stations directly with station_ids.';
+  }
+  return 'The registry returned no station for this state. Search the same area with an explicit bbox, or name the stations directly with station_ids.';
 }
 
 export const aviationFindStations = tool('aviation_find_stations', {
@@ -209,12 +242,14 @@ export const aviationFindStations = tool('aviation_find_stations', {
     {
       reason: 'station_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'None of the requested IDs match any known station.',
+      when: 'None of the requested IDs match any known station, or the bbox or state search found none.',
       // An identifier the registry does not list is an ordinary answer to a
       // lookup, not an incident.
       severity: 'notice',
+      // The hint the throw site sends is branched on the search mode — see
+      // `notFoundHint`. This entry states the mode-agnostic form.
       recovery:
-        "A lookup matches the registry's own identifier, which for an airport is its 4-character ICAO ID (KSEA, not SEA). Use bbox or state to discover identifiers by location.",
+        "An identifier lookup matches the registry's own identifier, which for an airport is its 4-character ICAO ID (KSEA, not SEA), and bbox or state discovers identifiers by location; a bbox search wants a wider box, and a state search an explicit bbox.",
     },
     {
       reason: 'missing_search_criteria',
@@ -326,7 +361,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
       .string()
       .optional()
       .describe(
-        'Guidance for whichever disclosures fired: the lever that narrows a truncated draw, what a requested limit withheld, or the cause and fix for identifiers that resolved to nothing. The cap and the limit can both fire on one result, and the text keeps them apart; the reconciliation cannot join them, since only bbox and state reach the row cap or accept a limit, and only station_ids reconciles a request.',
+        'Guidance for whichever disclosures fired: the lever that narrows a truncated draw, what a requested limit withheld, that limit bounds the response without changing the area searched (on a bbox or state result of more than 130 stations from a call that set no limit), or the cause and fix for identifiers that resolved to nothing. The cap and either limit statement can fire on one result, and the text keeps them apart; the reconciliation cannot join them, since only bbox and state reach the row cap or take a limit, and only station_ids reconciles a request.',
       ),
   },
 
@@ -404,6 +439,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
       ...(input.limit != null ? { limit: input.limit } : {}),
     });
 
+    const mode = stationIds?.length ? 'station_ids' : input.bbox ? 'bbox' : 'state';
     const svc = getAviationWeatherService();
     // Reported only by the state mode, which filters its draw inside the
     // service; the other modes return the draw as served.
@@ -435,7 +471,6 @@ export const aviationFindStations = tool('aviation_find_stations', {
         // the hint is chosen here rather than taken from the contract entry —
         // otherwise a bbox caller is advised about station_ids entries they
         // never sent.
-        const mode = stationIds?.length ? 'station_ids' : input.bbox ? 'bbox' : 'state';
         throw ctx.fail(
           'upstream_rejected',
           'The AWC station registry rejected this request as malformed.',
@@ -448,7 +483,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
 
     if (stations.length === 0) {
       throw ctx.fail('station_not_found', 'No stations found matching the search criteria.', {
-        ...ctx.recoveryFor('station_not_found'),
+        recovery: { hint: notFoundHint(mode) },
       });
     }
 
@@ -459,34 +494,42 @@ export const aviationFindStations = tool('aviation_find_stations', {
     const matched = stations.length;
     const shownStations =
       input.limit != null ? stations.toSorted(byStationIdentifier).slice(0, input.limit) : stations;
+    const shown = shownStations.length;
     const limited = input.limit != null && matched > input.limit;
 
     // The cap applies to the draw, not to what survives the state filter, so a
     // state query holding 279 stations can still be a cut page.
     const drawnRows = preFilterRows ?? matched;
-    if (isUpstreamCapped(drawnRows)) {
-      const scope = input.state
-        ? `stations in ${input.state.toUpperCase()} are missing from this result — the state filter left ${matched} of that capped page`
-        : 'stations inside the box are missing from this result';
-      ctx.enrich.truncated({
-        shown: shownStations.length,
-        cap: AWC_MAX_ROWS,
-        // The cap and the limit are separate disclosures sharing one notice, so
-        // the cap states its own case first and the limit appends its own.
-        guidance: [
-          `AWC served ${drawnRows} rows for this query, its per-request maximum, so ${scope}. Re-run over smaller bbox quadrants and union the results — a smaller box is the only narrowing lever the stationinfo endpoint offers, and it replaces a capped state query too.`,
-          limited ? limitNotice(shownStations.length, matched, true) : null,
-        ]
-          .filter(Boolean)
-          .join(' '),
-      });
+    const capped = isUpstreamCapped(drawnRows);
+    const scope = input.state
+      ? `stations in ${input.state.toUpperCase()} are missing from this result — the state filter left ${matched} of that capped page`
+      : 'stations inside the box are missing from this result';
+
+    // The cap, the limit, and the size lever are separate disclosures sharing
+    // one notice, and every notice writer is last-wins — so each states its own
+    // case in turn and the notice is written once. None of them fires on a
+    // station_ids lookup, which is what keeps the reconciliation below free to
+    // own its notice: that mode rejects a limit, cannot reach the cap, and is
+    // excluded from the size sentence.
+    const notice = [
+      capped
+        ? `AWC served ${drawnRows} rows for this query, its per-request maximum, so ${scope}. Re-run over smaller bbox quadrants and union the results — a smaller box is the only narrowing lever the stationinfo endpoint offers, and it replaces a capped state query too.`
+        : null,
+      limited ? limitNotice(shown, matched, capped) : null,
+      !stationIds?.length && input.limit == null && shown > SIZE_NOTICE_THRESHOLD
+        ? sizeNotice(shown)
+        : null,
+    ]
+      .filter(Boolean)
+      .join(' ');
+
+    if (capped) {
+      ctx.enrich.truncated({ shown, cap: AWC_MAX_ROWS, guidance: notice });
       // Restating the drawn count is only informative where a filter moved it.
       if (drawnRows > matched) ctx.enrich({ upstreamRows: drawnRows });
     } else {
-      ctx.enrich({ truncated: false, shown: shownStations.length });
-      // Safe to own the notice outright: a limit is rejected alongside
-      // station_ids, so the reconciliation below cannot also be writing one.
-      if (limited) ctx.enrich.notice(limitNotice(shownStations.length, matched, false));
+      ctx.enrich({ truncated: false, shown });
+      if (notice) ctx.enrich.notice(notice);
     }
 
     // A caller who set no limit already knows none applied, so the affirmative
@@ -526,7 +569,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
       }
     }
 
-    ctx.log.info('Stations found', { count: shownStations.length, matched, drawnRows });
+    ctx.log.info('Stations found', { count: shown, matched, drawnRows });
     return { stations: shownStations };
   },
 

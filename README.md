@@ -38,7 +38,7 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 | `aviation_find_stations` | Resolve airports and weather stations by identifier, bounding box, or US state. Returns ICAO/IATA/FAA IDs, coordinates, elevation, and available data types. |
 | `aviation_get_metar` | Get current weather observations (METARs) for named airports, or survey every reporting station in a bounding box. Returns decoded wind, visibility, ceiling, present weather, temp/dewpoint, altimeter, cloud layers, flight category (VFR/MVFR/IFR/LIFR), and the raw METAR string. |
 | `aviation_get_taf` | Get Terminal Aerodrome Forecasts for one or more airports. Returns each forecast period with valid times, surface wind, low-level wind shear, visibility, decoded weather, cloud layers, and vertical visibility into a forecast obscuration, plus the raw TAF string. |
-| `aviation_get_pireps` | Get recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, and the raw PIREP string. |
+| `aviation_get_pireps` | Get recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, outside air temperature, wind aloft, flight weather, and the raw PIREP string. |
 | `aviation_get_advisories` | Get active domestic SIGMETs for a region. Returns hazard type (CONVECTIVE, TURBULENCE, ICING, IFR), severity, altitude range, valid period, polygon coordinates, and raw text. |
 
 ### Prompts
@@ -56,7 +56,7 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 - Look up one or more stations by identifier (up to 20 per call) — a lookup matches the registry's own ID, which for an airport is its 4-character ICAO ID (e.g., `KSEA`, `K0S9`); a 3-letter IATA code never resolves, though each record includes its IATA/FAA aliases when available
 - Discover stations within a geographic bounding box, or list stations for one of the 50 US states or DC via two-letter USPS code
 - Returns `data_types` (METAR, TAF, etc.) so agents can confirm what's available before querying
-- Every result states whether the upstream 400-row cap cut it; `limit` (1–400) bounds how many stations a `bbox` or `state` search returns, ordered by ICAO identifier ascending with identifier-less stations last — rejected alongside `station_ids`, since that mode already names the set
+- Every result states whether the upstream 400-row cap cut it; `limit` (1–400) bounds how many stations a `bbox` or `state` search returns, ordered by ICAO identifier ascending with identifier-less stations last — rejected alongside `station_ids`, since that mode already names the set. An area search returning more than 130 stations with no `limit` says so and names the lever; omitting `limit` still returns every match
 - An ID lookup names every identifier that resolved to nothing, separating a 3-letter IATA code (never resolves) from an identifier the registry simply does not list
 - Whitespace around an ID is trimmed rather than failing the batch; only an empty or whitespace-only entry is rejected
 
@@ -66,7 +66,8 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 
 - `station_ids` (1–10 per call — 4 uppercase letters or digits, so `K0S9`-style identifiers work) for named airports, or `bbox` to survey every reporting station in an area — mutually exclusive
 - `hours` (1–12) is a lookback window, not a row limit: with `station_ids` every observation inside it is returned, and with `bbox` the result is the latest observation per station
-- A `bbox` survey states whether the upstream 400-row cap cut it and names `hours` as the first lever — a wide window spends the cap on repeat readings rather than on more stations; `limit` (1–400) bounds how many stations come back, ordered by station ID ascending, and is rejected alongside `station_ids`
+- `flight_category` (e.g., `["IFR", "LIFR"]`) narrows a `bbox` survey to the stations in those categories — judged on each station's latest observation, applied before `limit`, and disclosed with the count surveyed before it; a station AWC could not rate never matches, and a survey the filter empties returns an empty result that says so. Rejected alongside `station_ids`
+- A `bbox` survey states whether the upstream 400-row cap cut it and, above `hours: 1`, names `hours` as the first lever — a wide window spends the cap on repeat readings rather than on more stations; `limit` (1–400) bounds how many stations come back, ordered by station ID ascending, and is rejected alongside `station_ids`. A survey returning more than 40 stations with no `limit` says so and names the levers; omitting `limit` still returns every station
 - Flight category (VFR/MVFR/IFR/LIFR) returned directly from the AWC API; decodes wind, visibility, present weather, and cloud layers alongside the raw METAR string
 - Ceiling reports both height and kind (measured, or indefinite for vertical visibility into an obscuration) — `sky_condition` distinguishes a reported clear sky from an unreported one when `clouds` is empty
 - `metar_type` distinguishes routine `METAR` from special `SPECI` observations
@@ -92,7 +93,8 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 - `altitude_min_ft` / `altitude_max_ft` filter to a cruise-altitude band in feet MSL, from 0 to 60000 ft (min must not exceed max); a report with unknown altitude is dropped once either bound is set
 - `min_intensity` (`lgt` / `mod` / `sev`) restricts to reports carrying a turbulence or icing layer at that intensity or above — a matching report still carries its lighter layers
 - Turbulence and icing arrays include up to two layers per report; icing layers the API synthesized for a report that never mentioned ice are dropped
-- Every result states whether the upstream 400-row cap cut it, and `limit` (1–400) bounds how many reports come back, ordered by recency
+- Outside air temperature (`temp_c`), wind aloft (`wind`), and the `/WX` flight weather decoded beside its raw groups (`weather`), for PIREPs and AIREPs alike. The wind direction is published as reported, with no conversion — a PIREP `/WV` direction is magnetic, unlike the true-north METAR and TAF winds
+- Every result states whether the upstream 400-row cap cut it, naming only the narrowing levers the call can still use, and `limit` (1–400) bounds how many reports come back, ordered by recency. A result of more than 50 reports with no `limit` says so and names the lever; omitting `limit` still returns every match
 - PIREPs are sparse by nature — absence of reports does not mean smooth conditions
 
 ---
