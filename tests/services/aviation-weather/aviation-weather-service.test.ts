@@ -1613,6 +1613,17 @@ describe('AviationWeatherService PIREP temperature, wind, and weather', () => {
     expect((await normalize({ wxString })).weather).toBeNull();
   });
 
+  // The migration note sends `remarks` readers to `weather.raw`, so it has to
+  // hold exactly what `remarks` did — the trimmed wxString — for every value
+  // `remarks` carried, including groups the decoder cannot read.
+  it.each([
+    [' -RA ', '-RA'],
+    ['FG  -RA', 'FG  -RA'],
+    ['XX', 'XX'],
+  ])('keeps a %p wxString as %p in weather.raw', async (wxString, raw) => {
+    expect((await normalize({ wxString })).weather?.raw).toBe(raw);
+  });
+
   it('publishes no remarks field — wxString is the /WX group, never /RM', async () => {
     const report = await normalize({
       wxString: 'HZ',
