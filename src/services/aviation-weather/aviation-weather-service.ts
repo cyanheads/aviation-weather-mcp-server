@@ -939,7 +939,7 @@ export class AviationWeatherService {
       hasBbox: !!params.bbox,
       distanceNm: params.distanceNm,
       hours: params.hours,
-      level: params.level,
+      flightLevel: params.level,
       minIntensity: params.minIntensity,
     });
     const raw = await this.fetchJson<RawPirep[]>(url, ctx);
@@ -1044,7 +1044,11 @@ export class AviationWeatherService {
       throw serviceUnavailable('Either stationIds, bbox, or state is required for station lookup');
     }
 
-    ctx.log.debug('Fetching station info', { url });
+    ctx.log.debug('Fetching station info', {
+      stationIds: params.stationIds,
+      hasBbox: !!params.bbox,
+      state: params.state,
+    });
     const raw = await this.fetchJson<RawStationInfo[]>(url, ctx);
     if (!Array.isArray(raw)) return [];
 

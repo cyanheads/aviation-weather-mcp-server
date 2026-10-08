@@ -2477,9 +2477,8 @@ describe('AviationWeatherService upstream error bodies', () => {
     const err = await errorFor(new Response('Bad Request', { status: 400 }));
 
     expect(err.code).toBe(JsonRpcErrorCode.InvalidParams);
-    expect(err.message).toBe(
-      'Fetch failed for https://aviationweather.gov/api/data/pirep?…. Status: 400',
-    );
+    // The framework redacts the URL path and query out of fetch error messages.
+    expect(err.message).toBe('Fetch failed for https://aviationweather.gov/…?…. Status: 400');
     expect(http.calls).toHaveLength(1);
   });
 

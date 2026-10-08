@@ -390,36 +390,24 @@ export const aviationFindStations = tool('aviation_find_stations', {
       throw ctx.fail(
         'missing_search_criteria',
         'At least one of station_ids, bbox, or state is required.',
-        {
-          ...ctx.recoveryFor('missing_search_criteria'),
-        },
       );
     }
 
     const locationModeCount =
       (stationIds?.length ? 1 : 0) + (input.bbox ? 1 : 0) + (input.state ? 1 : 0);
     if (locationModeCount > 1) {
-      throw ctx.fail(
-        'conflicting_location',
-        'Provide exactly one of station_ids, bbox, or state.',
-        {
-          ...ctx.recoveryFor('conflicting_location'),
-        },
-      );
+      throw ctx.fail('conflicting_location', 'Provide exactly one of station_ids, bbox, or state.');
     }
 
     if (input.bbox && !isBboxOrdered(input.bbox)) {
       throw ctx.fail(
         'invalid_bbox',
         'Bounding box is inverted: minLat must be <= maxLat and minLon <= maxLon.',
-        { ...ctx.recoveryFor('invalid_bbox') },
       );
     }
 
     if (input.state && !isSupportedState(input.state)) {
-      throw ctx.fail('invalid_state', `Unsupported state code: ${input.state}.`, {
-        ...ctx.recoveryFor('invalid_state'),
-      });
+      throw ctx.fail('invalid_state', `Unsupported state code: ${input.state}.`);
     }
 
     // A location-mode mistake is reported ahead of this, matching the order the
@@ -428,7 +416,6 @@ export const aviationFindStations = tool('aviation_find_stations', {
       throw ctx.fail(
         'conflicting_limit',
         'limit bounds an area search and has no effect on a named list of identifiers.',
-        { ...ctx.recoveryFor('conflicting_limit') },
       );
     }
 

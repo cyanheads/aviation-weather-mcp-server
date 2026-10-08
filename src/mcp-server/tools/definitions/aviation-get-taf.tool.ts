@@ -242,7 +242,6 @@ export const aviationGetTaf = tool('aviation_get_taf', {
     if (forecasts.length === 0) {
       throw ctx.fail('no_taf_available', `No TAF data found for: ${input.station_ids.join(', ')}`, {
         stationIds: input.station_ids,
-        ...ctx.recoveryFor('no_taf_available'),
       });
     }
 

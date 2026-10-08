@@ -318,17 +318,15 @@ describe('aviationFindStations state validation', () => {
   });
 
   it('names the rejected code and points at the supported set', async () => {
-    const ctx = createMockContext({ errors: aviationFindStations.errors });
-    const input = aviationFindStations.input.parse({ state: 'ZZ' });
+    // Through the contract runner, which fills the declared hint as production does.
+    const result = await runToolContract(aviationFindStations, { state: 'ZZ' });
 
-    let thrown: unknown;
-    try {
-      await aviationFindStations.handler(input, ctx);
-    } catch (e) {
-      thrown = e;
-    }
-    expect(thrown).toBeDefined();
-    const err = thrown as { message: string; data?: { recovery?: { hint?: string } } };
+    expect(result.isError).toBe(true);
+    const err = (
+      result.structuredContent as {
+        error: { message: string; data?: { recovery?: { hint?: string } } };
+      }
+    ).error;
     expect(err.message).toContain('ZZ');
     expect(err.data?.recovery?.hint).toContain('DC');
     expect(err.data?.recovery?.hint).toMatch(/territor/i);
@@ -1415,17 +1413,15 @@ describe('aviationFindStations request limit', () => {
   });
 
   it('points conflicting_limit at both ways out', async () => {
-    const ctx = createMockContext({ errors: aviationFindStations.errors });
-    const input = aviationFindStations.input.parse({ station_ids: ['KSEA'], limit: 5 });
+    // Through the contract runner, which fills the declared hint as production does.
+    const result = await runToolContract(aviationFindStations, {
+      station_ids: ['KSEA'],
+      limit: 5,
+    });
 
-    let thrown: unknown;
-    try {
-      await aviationFindStations.handler(input, ctx);
-    } catch (e) {
-      thrown = e;
-    }
-    const err = thrown as { data?: { recovery?: { hint?: string } } };
-
+    expect(result.isError).toBe(true);
+    const err = (result.structuredContent as { error: { data?: { recovery?: { hint?: string } } } })
+      .error;
     expect(err.data?.recovery?.hint).toContain('limit');
     expect(err.data?.recovery?.hint).toMatch(/bbox or state/);
   });

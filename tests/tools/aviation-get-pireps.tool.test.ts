@@ -382,20 +382,15 @@ describe('aviationGetPireps distance_nm scope', () => {
   });
 
   it('conflicting_distance recovery points at both ways out', async () => {
-    const ctx = createMockContext({ errors: aviationGetPireps.errors });
-    const input = aviationGetPireps.input.parse({
+    // Through the contract runner, which fills the declared hint as production does.
+    const result = await runToolContract(aviationGetPireps, {
       bbox: { minLat: 45.0, minLon: -125.0, maxLat: 49.0, maxLon: -116.0 },
       distance_nm: 250,
     });
 
-    let thrown: unknown;
-    try {
-      await aviationGetPireps.handler(input, ctx);
-    } catch (e) {
-      thrown = e;
-    }
-    expect(thrown).toBeDefined();
-    const err = thrown as { data?: { recovery?: { hint?: string } } };
+    expect(result.isError).toBe(true);
+    const err = (result.structuredContent as { error: { data?: { recovery?: { hint?: string } } } })
+      .error;
     expect(err.data?.recovery?.hint).toContain('distance_nm');
     expect(err.data?.recovery?.hint).toContain('station_id');
   });
@@ -2310,8 +2305,19 @@ describe('aviationGetPireps unrecognized station_id', () => {
   });
 
   it('points the recovery at aviation_find_stations and a bbox search', async () => {
-    const err = await errorFor(upstreamRejection());
-    const hint = String((err.data as { recovery?: { hint?: string } })?.recovery?.hint);
+    // Through the contract runner, which fills the declared hint as production does.
+    mockFetchPireps.mockRejectedValue(upstreamRejection());
+    const result = await runToolContract(aviationGetPireps, {
+      station_id: 'KISN',
+      distance_nm: 60,
+      hours: 12,
+    });
+
+    expect(result.isError).toBe(true);
+    const hint = String(
+      (result.structuredContent as { error: { data?: { recovery?: { hint?: string } } } }).error
+        .data?.recovery?.hint,
+    );
 
     expect(hint).toContain('aviation_find_stations');
     expect(hint).toContain('bbox');

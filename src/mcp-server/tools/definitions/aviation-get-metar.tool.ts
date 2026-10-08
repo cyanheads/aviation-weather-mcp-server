@@ -527,22 +527,17 @@ export const aviationGetMetar = tool('aviation_get_metar', {
     const stationIds = input.station_ids;
 
     if (!stationIds && !input.bbox) {
-      throw ctx.fail('missing_location', 'Either station_ids or bbox is required.', {
-        ...ctx.recoveryFor('missing_location'),
-      });
+      throw ctx.fail('missing_location', 'Either station_ids or bbox is required.');
     }
 
     if (stationIds && input.bbox) {
-      throw ctx.fail('conflicting_location', 'Provide either station_ids or bbox, not both.', {
-        ...ctx.recoveryFor('conflicting_location'),
-      });
+      throw ctx.fail('conflicting_location', 'Provide either station_ids or bbox, not both.');
     }
 
     if (input.bbox && !isBboxOrdered(input.bbox)) {
       throw ctx.fail(
         'invalid_bbox',
         'Bounding box is inverted: minLat must be <= maxLat and minLon <= maxLon.',
-        { ...ctx.recoveryFor('invalid_bbox') },
       );
     }
 
@@ -552,7 +547,6 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       throw ctx.fail(
         'conflicting_limit',
         'limit bounds an area survey and has no effect on a named list of identifiers.',
-        { ...ctx.recoveryFor('conflicting_limit') },
       );
     }
 
@@ -562,7 +556,6 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       throw ctx.fail(
         'conflicting_flight_category',
         'flight_category narrows an area survey and has no effect on a named list of identifiers.',
-        { ...ctx.recoveryFor('conflicting_flight_category') },
       );
     }
 

@@ -516,26 +516,17 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
 
   async handler(input, ctx) {
     if (!input.station_id && !input.bbox) {
-      throw ctx.fail(
-        'missing_location',
-        'Either station_id or bbox is required for PIREP search.',
-        {
-          ...ctx.recoveryFor('missing_location'),
-        },
-      );
+      throw ctx.fail('missing_location', 'Either station_id or bbox is required for PIREP search.');
     }
 
     if (input.station_id && input.bbox) {
-      throw ctx.fail('conflicting_location', 'Provide either station_id or bbox, not both.', {
-        ...ctx.recoveryFor('conflicting_location'),
-      });
+      throw ctx.fail('conflicting_location', 'Provide either station_id or bbox, not both.');
     }
 
     if (input.bbox && !isBboxOrdered(input.bbox)) {
       throw ctx.fail(
         'invalid_bbox',
         'Bounding box is inverted: minLat must be <= maxLat and minLon <= maxLon.',
-        { ...ctx.recoveryFor('invalid_bbox') },
       );
     }
 
@@ -543,7 +534,6 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       throw ctx.fail(
         'conflicting_distance',
         'distance_nm is a radius around station_id and has no effect on a bbox search.',
-        { ...ctx.recoveryFor('conflicting_distance') },
       );
     }
 
@@ -555,7 +545,6 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       throw ctx.fail(
         'invalid_altitude_range',
         `Altitude range is inverted: altitude_min_ft (${altMin.toLocaleString()}) must be <= altitude_max_ft (${altMax.toLocaleString()}).`,
-        { ...ctx.recoveryFor('invalid_altitude_range') },
       );
     }
 
@@ -574,7 +563,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       hasBbox: !!input.bbox,
       ...(input.station_id ? { distanceNm: radiusNm } : {}),
       hours: input.hours,
-      ...(level != null ? { level } : {}),
+      ...(level != null ? { flightLevel: level } : {}),
       ...(input.min_intensity ? { minIntensity: input.min_intensity } : {}),
     });
 
@@ -613,7 +602,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
         throw ctx.fail(
           'station_not_recognized',
           `AWC does not recognize ${input.station_id} as a PIREP search center.`,
-          { ...ctx.recoveryFor('station_not_recognized') },
+          undefined,
           { cause: error },
         );
       }

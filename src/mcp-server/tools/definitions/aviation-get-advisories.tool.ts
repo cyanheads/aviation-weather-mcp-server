@@ -183,7 +183,6 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       throw ctx.fail(
         'invalid_bbox',
         'Bounding box is inverted: minLat must be <= maxLat and minLon <= maxLon.',
-        { ...ctx.recoveryFor('invalid_bbox') },
       );
     }
 
@@ -193,7 +192,6 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       throw ctx.fail(
         'airmet_not_served',
         'advisory_type "airmet" is not served: the upstream feed behind this tool carries domestic SIGMETs only.',
-        { ...ctx.recoveryFor('airmet_not_served') },
       );
     }
 
@@ -206,7 +204,6 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       throw ctx.fail(
         'airmet_not_served',
         `Hazard "${input.hazard}" is not served: it is an AIRMET-family phenomenon, and the upstream feed behind this tool carries domestic SIGMETs only.`,
-        { ...ctx.recoveryFor('airmet_not_served') },
       );
     }
 

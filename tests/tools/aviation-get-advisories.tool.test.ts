@@ -186,20 +186,24 @@ describe('aviationGetAdvisories', () => {
 // ---------------------------------------------------------------------------
 
 describe('aviationGetAdvisories AIRMET rejection', () => {
-  /** Run the handler over live-looking rows and return the error it threw. */
+  /**
+   * Run the tool over live-looking rows and return the error envelope it
+   * answered with — through the contract runner, which fills a declared
+   * reason's recovery hint as production does.
+   */
   async function errorFor(input: Record<string, unknown>) {
     mockFetchAdvisories.mockResolvedValue([sigmet]);
-    const ctx = createMockContext({ errors: aviationGetAdvisories.errors });
-    try {
-      await aviationGetAdvisories.handler(aviationGetAdvisories.input.parse(input), ctx);
-    } catch (e) {
-      return e as {
-        code: number;
-        message: string;
-        data?: { reason?: string; recovery?: { hint?: string } };
-      };
-    }
-    throw new Error('handler resolved where it was expected to throw');
+    const result = await runToolContract(aviationGetAdvisories, input);
+    if (!result.isError) throw new Error('tool resolved where it was expected to fail');
+    return (
+      result.structuredContent as {
+        error: {
+          code: number;
+          message: string;
+          data?: { reason?: string; recovery?: { hint?: string } };
+        };
+      }
+    ).error;
   }
 
   it('rejects advisory_type "airmet" rather than answering it with SIGMETs', async () => {

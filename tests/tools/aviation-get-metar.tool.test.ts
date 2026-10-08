@@ -1323,12 +1323,15 @@ describe('aviationGetMetar bbox survey', () => {
   // -------------------------------------------------------------------------
 
   it('rejects a call naming neither station_ids nor bbox', async () => {
-    const ctx = createMockContext({ errors: aviationGetMetar.errors });
-    const input = aviationGetMetar.input.parse({});
+    // Through the contract runner, which fills the declared hint as production does.
+    const result = await runToolContract(aviationGetMetar, {});
 
-    await expect(aviationGetMetar.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.ValidationError,
-      data: { reason: 'missing_location', recovery: { hint: expect.any(String) } },
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'missing_location', recovery: { hint: expect.any(String) } },
+      },
     });
     expect(mockFetchMetar).not.toHaveBeenCalled();
   });
@@ -1981,14 +1984,20 @@ describe('aviationGetMetar flight_category filter', () => {
   });
 
   it('rejects flight_category alongside station_ids, before any upstream request', async () => {
-    const ctx = createMockContext({ errors: aviationGetMetar.errors });
-    const input = aviationGetMetar.input.parse({ station_ids: ['KSEA'], flight_category: ['IFR'] });
+    // Through the contract runner, which fills the declared hint as production does.
+    const result = await runToolContract(aviationGetMetar, {
+      station_ids: ['KSEA'],
+      flight_category: ['IFR'],
+    });
 
-    await expect(aviationGetMetar.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.ValidationError,
-      data: {
-        reason: 'conflicting_flight_category',
-        recovery: { hint: expect.stringContaining('bbox') },
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason: 'conflicting_flight_category',
+          recovery: { hint: expect.stringContaining('bbox') },
+        },
       },
     });
     expect(mockFetchMetar).not.toHaveBeenCalled();
