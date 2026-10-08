@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.1](changelog/0.5.x/0.5.1.md) — 2026-10-08
+
+Framework update to mcp-ts-core 0.13.14: tool errors carry a request ID, integer and numeric-string arguments are repaired instead of rejected, the Docker image installs dependencies on the build platform, and the server.json registry entries drop the run start:* arguments.
+
 ## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-09-24 · ⚠️ Breaking
 
 aviation_get_pireps publishes outside air temperature and wind aloft and renames remarks to weather (breaking); aviation_get_metar area surveys filter by flight category, and large results that set no limit now name the lever.
