@@ -229,8 +229,13 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       .array(
         z
           .string()
-          .regex(/^[A-Z0-9]{4}$/)
-          .describe('ICAO station ID: 4 uppercase letters or digits (e.g., KSEA, KJFK, K0S9).'),
+          .regex(
+            /^[A-Za-z0-9]{4}$/,
+            'Use a 4-character ICAO ID containing ASCII letters or digits (e.g., KSEA, K0S9), in either case. For an IATA/FAA code, use aviation_find_stations with state or bbox to find the ICAO ID; do not infer a mapping.',
+          )
+          .describe(
+            'ICAO station ID: 4 ASCII letters or digits, case-insensitive and normalized to uppercase (e.g., KSEA, KJFK, K0S9).',
+          ),
       )
       .min(1)
       .max(10)
@@ -524,7 +529,7 @@ export const aviationGetMetar = tool('aviation_get_metar', {
   },
 
   async handler(input, ctx) {
-    const stationIds = input.station_ids;
+    const stationIds = input.station_ids?.map((id) => id.toUpperCase());
 
     if (!stationIds && !input.bbox) {
       throw ctx.fail('missing_location', 'Either station_ids or bbox is required.');

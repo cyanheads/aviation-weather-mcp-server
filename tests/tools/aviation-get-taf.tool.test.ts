@@ -785,16 +785,10 @@ describe('aviationGetTaf partial-batch disclosure', () => {
     expect(text).toContain('## KSEA — Seattle-Tacoma International Airport');
   });
 
-  it.each([['ksea'], ['SEA'], ['KSEATTLE'], ['']])(
-    'rejects %p before reconciliation can run',
-    (id) => {
-      // Comparing the requested IDs against upstream `icaoId` is only a sound
-      // set operation because the input contract fixes them at four uppercase
-      // letters or digits — a relaxed input would surface a casing mismatch as
-      // a missing station rather than as the input error it is.
-      expect(aviationGetTaf.input.safeParse({ station_ids: [id] }).success).toBe(false);
-    },
-  );
+  it.each([['SEA'], ['KSEATTLE'], ['']])('rejects %p before reconciliation can run', (id) => {
+    // Malformed IDs are rejected before the handler canonicalizes case.
+    expect(aviationGetTaf.input.safeParse({ station_ids: [id] }).success).toBe(false);
+  });
 
   it('sends a digit-bearing identifier upstream and reconciles it (issue #37)', async () => {
     // K36U issues TAFs and carries a digit in its K + FAA-ID form.

@@ -2,10 +2,10 @@
 
 **Server:** `@cyanheads/aviation-weather-mcp-server`
 **Version:** 0.5.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.14`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.2.0
-**Zod:** ^4.6.5
+**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
+**Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 
@@ -56,7 +56,7 @@ export const aviationGetMetar = tool('aviation_get_metar', {
   annotations: { readOnlyHint: true, idempotentHint: true },
   input: z.object({
     station_ids: z
-      .array(z.string().regex(/^[A-Z0-9]{4}$/).describe('4-character ICAO station ID.'))
+      .array(z.string().regex(/^[A-Za-z0-9]{4}$/).describe('4-character ASCII ICAO station ID, case-insensitive.'))
       .min(1).max(10)
       .describe('ICAO station IDs to query. 1–10 stations per call.'),
     hours: z.number().int().min(1).max(12).default(1)
@@ -79,7 +79,8 @@ export const aviationGetMetar = tool('aviation_get_metar', {
   ],
   async handler(input, ctx) {
     const svc = getAviationWeatherService();
-    const raw = await svc.fetchMetar(input.station_ids, input.hours);
+    const stationIds = input.station_ids.map((id) => id.toUpperCase());
+    const raw = await svc.fetchMetar({ stationIds, hours: input.hours }, ctx);
     if (!raw.length) throw ctx.fail('no_stations_found', `No METARs found for ${input.station_ids.join(', ')}`);
     ctx.log.info('METARs fetched', { count: raw.length });
     return { observations: raw };
@@ -155,6 +156,7 @@ await createApp({
   name: 'aviation-weather-mcp-server',
   title: 'aviation-weather-mcp-server',        // human-readable display name
   websiteUrl: 'https://github.com/cyanheads/aviation-weather-mcp-server',
+  description: 'Aviation weather from the NWS Aviation Weather Center.', // wins over MCP_SERVER_DESCRIPTION
   icons: [{ src: 'https://example.com/icon.png', sizes: ['48x48'], mimeType: 'image/png' }],
   instructions: 'Use shortcut alpha for the most common case.', // session-level context
 });
@@ -174,7 +176,7 @@ await createApp({
 });
 ```
 
-`sessionMode` declares the HTTP session posture in `src/` instead of leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). Add `require: 'stateful'` when a tool asks the caller for input mid-handler via `ctx.requestInput`: startup then fails with a `ConfigurationError` rather than serving a mode in which a 2025-era client can never answer the prompt. Stdio is never refused. This server declares `sessionMode: 'stateless'` — every tool answers from one upstream read and none gates on `ctx.requestInput`.
+`sessionMode` declares the HTTP session posture in `src/` instead of leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). Add `require: 'stateful'` when a tool asks the caller for input mid-handler via `ctx.requestInput`: startup then fails with a `ConfigurationError` rather than serving a mode in which a 2025-era client can never answer the prompt. Stdio is never refused. This server declares `sessionMode: 'stateless'` — tools use per-request upstream reads, advisories fan out to three independent products under one deadline, and none gates on `ctx.requestInput`.
 
 `teardown(core)` is the `setup()` counterpart — release a watcher, socket, or non-`unref()`'d timer there. It runs after the transport stops and before the logger closes, on every shutdown path, and a signal-triggered shutdown then exits the process explicitly (0, or 1 if a step never settles within the framework's 10 s ceiling). `AviationWeatherService` allocates none of those — it holds two config scalars and issues per-request fetches — so this server declares no `teardown`.
 

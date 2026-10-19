@@ -395,18 +395,50 @@ export interface NormalizedPirep {
 }
 
 export interface NormalizedAdvisory {
-  advisory_type: string; // 'SIGMET' — the only type the upstream feed emits
+  advisory_type: string;
   altitude_high_ft: number | null;
   altitude_low_ft: number | null;
-  hazard: string;
-  issued_by: string;
-  movement: { direction_deg: number | null; speed_kt: number | null } | null;
-  polygon: { lat: number; lon: number }[];
-  raw_text: string;
-  series_id: string;
+  fir_id: string | null;
+  fir_name: string | null;
+  geometry: { kind: string | null; parts: AdvisoryPoint[][] } | null;
+  hazard: string | null;
+  issued_by: string | null;
+  movement: {
+    direction_deg: number | null;
+    speed_kt: number | null;
+    direction_text?: string | null;
+  } | null;
+  polygon: AdvisoryPoint[] | null;
+  qualifier: string | null;
+  raw_text: string | null;
+  series_id: string | null;
   severity: number | null;
-  valid_from: string; // ISO 8601
-  valid_to: string; // ISO 8601
+  source: AdvisorySource;
+  valid_from: string | null; // ISO 8601
+  valid_to: string | null; // ISO 8601
+}
+
+/** Independent AWC advisory product feeds. */
+export type AdvisorySource = 'sigmet' | 'isigmet' | 'cwa';
+/** Decoded finite geographic coordinates. */
+export interface AdvisoryPoint {
+  lat: number;
+  lon: number;
+}
+/** Coverage counts exclude unreadable rows and precede bbox filtering. */
+export interface AdvisoryCoverage {
+  drawn: number | null;
+  message?: string;
+  source: AdvisorySource;
+  status: 'ok' | 'failed' | 'not_applicable';
+}
+/** Request-level advisory disclosures. */
+export interface AdvisorySummary {
+  coverage: AdvisoryCoverage[];
+  drawn: number;
+  matched: number;
+  partial: boolean;
+  unlocated: number;
 }
 
 export interface NormalizedStation {

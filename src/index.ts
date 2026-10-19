@@ -25,11 +25,11 @@ await createApp({
   ],
   resources: [],
   prompts: [aviationPreflightBrief],
-  instructions: `Aviation weather from the NWS Aviation Weather Center (aviationweather.gov). Keyless, no API key required. Covers METARs, TAFs, PIREPs, and domestic SIGMETs. AIRMETs are not served — aviation_get_advisories rejects a request for one rather than answering it with SIGMETs.
+  instructions: `Aviation weather from the NWS Aviation Weather Center (aviationweather.gov). Keyless, no API key required. Covers METARs, TAFs, PIREPs, domestic/international SIGMETs and Center Weather Advisories. aviation_get_advisories defaults to all three independent products; inspect coverage and partial before interpreting an empty result. AIRMETs are not served — requests for them are rejected. Optional limit has no default; omit it to retrieve every available match.
 IMPORTANT: This data is for informational purposes only. Flight operations in IMC or controlled airspace require an official preflight briefing from an authorized source (e.g., 1800wxbrief.com).
-Station IDs are ICAO format (4 uppercase letters or digits, e.g. KSEA, KJFK, K0S9). Use aviation_find_stations to resolve unknown IDs or discover stations in a region.`,
+Weather tool and preflight station IDs are 4 ASCII letters or digits, case-insensitive and normalized to uppercase (e.g. KSEA, KJFK, K0S9). For an IATA/FAA code, use aviation_find_stations with state or bbox to find the ICAO ID; do not infer a mapping. Station finder also accepts other registry ID shapes.`,
   /**
-   * Every tool answers from one upstream read and none gates on
+   * Tools answer from per-request reads (advisories fan out to three independent products) and none gates on
    * `ctx.requestInput`, so nothing here needs a session to carry state between
    * calls. Declared in code rather than only in the environment;
    * `MCP_SESSION_MODE` still wins when it is set.

@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/aviation-weather-mcp-server</h1>
-  <p><b>Fetch METARs, TAFs, PIREPs, and domestic SIGMETs from the NWS Aviation Weather Center via MCP. STDIO or Streamable HTTP.</b>
+  <p><b>Fetch METARs, TAFs, PIREPs, domestic/international SIGMETs and CWAs from NWS AWC via MCP. AIRMETs not served. STDIO or Streamable HTTP.</b>
   <div>5 Tools • 1 Prompt</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.5.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/aviation-weather-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/aviation-weather-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/aviation-weather-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, and domestic SIGMETs. Look up stations, fetch current and forecast conditions, and pull pilot reports and hazard advisories from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, domestic/international SIGMETs, and Center Weather Advisories. Look up stations, fetch current and forecast conditions, and pull pilot reports and hazard advisories. AIRMETs are not served.
 
 ### Tools
 
@@ -39,7 +39,7 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 | `aviation_get_metar` | Get current weather observations (METARs) for named airports, or survey every reporting station in a bounding box. Returns decoded wind, visibility, ceiling, present weather, temp/dewpoint, altimeter, cloud layers, flight category (VFR/MVFR/IFR/LIFR), and the raw METAR string. |
 | `aviation_get_taf` | Get Terminal Aerodrome Forecasts for one or more airports. Returns each forecast period with valid times, surface wind, low-level wind shear, visibility, decoded weather, cloud layers, and vertical visibility into a forecast obscuration, plus the raw TAF string. |
 | `aviation_get_pireps` | Get recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, outside air temperature, wind aloft, flight weather, and the raw PIREP string. |
-| `aviation_get_advisories` | Get active domestic SIGMETs for a region. Returns hazard type (CONVECTIVE, TURBULENCE, ICING, IFR), severity, altitude range, valid period, polygon coordinates, and raw text. |
+| `aviation_get_advisories` | Get domestic/international SIGMETs and Center Weather Advisories. Returns source coverage, hazard, severity, altitude, validity, movement, multipart geometry and original bulletins; omitted facts stay null. |
 
 ### Prompts
 
@@ -64,7 +64,7 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 
 ### `aviation_get_metar` <sub>tool</sub>
 
-- `station_ids` (1–10 per call — 4 uppercase letters or digits, so `K0S9`-style identifiers work) for named airports, or `bbox` to survey every reporting station in an area — mutually exclusive
+- `station_ids` (1–10 per call — 4 ASCII letters or digits, case-insensitive and normalized to uppercase, so `ksea` and `K0S9` work) for named airports, or `bbox` to survey every reporting station in an area — mutually exclusive
 - `hours` (1–12) is a lookback window, not a row limit: with `station_ids` every observation inside it is returned, and with `bbox` the result is the latest observation per station
 - `flight_category` (e.g., `["IFR", "LIFR"]`) narrows a `bbox` survey to the stations in those categories — judged on each station's latest observation, applied before `limit`, and disclosed with the count surveyed before it; a station AWC could not rate never matches, and a survey the filter empties returns an empty result that says so. Rejected alongside `station_ids`
 - A `bbox` survey states whether the upstream 400-row cap cut it and, above `hours: 1`, names `hours` as the first lever — a wide window spends the cap on repeat readings rather than on more stations; `limit` (1–400) bounds how many stations come back, ordered by station ID ascending, and is rejected alongside `station_ids`. A survey returning more than 40 stations with no `limit` says so and names the levers; omitting `limit` still returns every station
@@ -77,7 +77,7 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 
 ### `aviation_get_taf` <sub>tool</sub>
 
-- Accepts 1–4 ICAO station IDs per call
+- Accepts 1–4 ICAO station IDs per call: 4 ASCII letters or digits in either case, normalized to uppercase
 - Structured forecast periods with change types (`FM`, `TEMPO`, `BECMG`) and probabilities; weather decoded group by group beside the raw groups
 - Forecast obscurations keep their layer and carry the vertical visibility into them, rather than reading as clear sky; `sky_condition` distinguishes an unamended period from a stated clear sky
 - Text the upstream decoder left undecoded — often a fourth cloud layer — is surfaced per period in `not_decoded` rather than dropped
@@ -89,7 +89,7 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 
 ### `aviation_get_pireps` <sub>tool</sub>
 
-- `station_id` + `distance_nm` (10–500 nm, 100 when omitted) for radial search, or `bbox` for area search — mutually exclusive; a `station_id` AWC does not recognize as a search center returns a typed error pointing to `aviation_find_stations` or `bbox`
+- `station_id` (4 ASCII letters or digits in either case, normalized to uppercase) + `distance_nm` (10–500 nm, 100 when omitted) for radial search, or `bbox` for area search — mutually exclusive; a `station_id` AWC does not recognize as a search center returns a typed error pointing to `aviation_find_stations` or `bbox`
 - `altitude_min_ft` / `altitude_max_ft` filter to a cruise-altitude band in feet MSL, from 0 to 60000 ft (min must not exceed max); a report with unknown altitude is dropped once either bound is set
 - `min_intensity` (`lgt` / `mod` / `sev`) restricts to reports carrying a turbulence or icing layer at that intensity or above — a matching report still carries its lighter layers
 - Turbulence and icing arrays include up to two layers per report; icing layers the API synthesized for a report that never mentioned ice are dropped
@@ -101,16 +101,21 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 
 ### `aviation_get_advisories` <sub>tool</sub>
 
-- `advisory_type`: `sigmet` or `all` (default) — both return the active SIGMET set
-- `hazard` filter (`CONVECTIVE`, `TURBULENCE`, `ICING`, `IFR`) applied upstream by AWC; `bbox` filtered client-side by polygon overlap
-- AIRMETs are not served — the upstream feed carries domestic SIGMETs only, and a request for one (or its `MTN OBSCN` / `SURFACE WIND` / `LLWS` hazards) is rejected with guidance rather than answered with SIGMETs
-- An empty result is a valid fair-weather state, and names what emptied it — nothing active, no advisory carrying the hazard, or none intersecting the `bbox` — so a filter that needs broadening isn't mistaken for quiet weather
+- `advisory_type`: `sigmet` (domestic), `isigmet` (international, including oceanic), `cwa` (Center Weather Advisories), or `all` (default: all three independent products)
+- `hazard` is applied upstream: domestic supports `CONVECTIVE`, `TURBULENCE`, `ICING`, `IFR`; international supports `TS`, `TURBULENCE`, `ICING`, `MTW`, `DS`, `SS`, `TC`, `VA`; CWA supports `TS`, `TURBULENCE`, `ICING`, `IFR`, `PCPN`, `UNK`. Incompatible sources are `not_applicable`; a selection with no compatible source is rejected
+- `coverage` reports each selected source as `ok`, `failed` or `not_applicable`, with decoded drawn counts only for readable sources. `partial` marks failed sources or skipped unreadable rows. Independent healthy products survive a failure; all applicable products failing is an error. One 45-second deadline bounds the concurrent advisory reads and retries; caller cancellation aborts all legs
+- `bbox` uses each geometry part's bounding envelope, including date-line crossings, rather than exact polygon intersection. Input remains ordered (`minLat <= maxLat`, `minLon <= maxLon`). With bbox, `drawn` counts rows after product/hazard selection, `matched` counts geographic matches, `returned` counts rows after any limit, and `unlocated` separately counts rows without decoded geometry
+- `limit` is optional with no default: omitted means every available match. An explicit limit orders by source, issuer, series and validity, reports `total`/`returned`/`truncated`, and explains how to retrieve withheld matches by omitting or raising it
+- Missing issuer, series, hazard, validity and raw text stay null. `geometry.parts` preserves separate rings/lines and source-native `kind` (including null); compatibility `polygon` is null for multipart, line or missing geometry. Domestic numeric severity/movement stay unchanged; international movement preserves `direction_text` and decoded knots. CWA severity/movement remain null, and altitudes are never inferred from bulletin text
+- Original bulletins render in safe code fences preserving blank lines and embedded backticks. An empty result names readable sources and filtering stage; unavailable sources never establish fair weather
+- AIRMETs are not served. Requests for one (or `MTN OBSCN` / `SURFACE WIND` / `LLWS`) are rejected with guidance to separate AIRMET products
 
 ---
 
 ### `aviation_preflight_brief` <sub>prompt</sub>
 
 - Arguments: `departure_icao` and `destination_icao` required; `alternates` (comma-separated ICAOs), `departure_time` (ISO 8601 UTC), `cruise_altitude` (feet MSL), and `route_waypoints` (semicolon-separated `lat,lon` pairs) optional
+- Every ICAO argument accepts 4 ASCII letters or digits in either case and generates uppercase IDs. For an IATA/FAA code, use `aviation_find_stations` with `state` or `bbox` to find the ICAO ID; no mapping is inferred. Direct IDs reject surrounding whitespace; comma-separated alternates allow it
 - Calls `aviation_get_metar`, `aviation_get_taf`, `aviation_get_pireps`, and `aviation_get_advisories` in sequence, chunked to each tool's station-per-call limit
 - `departure_time` selects the TAF forecast period the briefing is read against; `cruise_altitude` bounds the PIREP search to a ±3,000 ft band; `route_waypoints` become the advisories `bbox`, widened by 1° on each side
 - Omitting any of the three still generates the briefing, naming the assessment it could not make

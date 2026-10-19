@@ -113,8 +113,10 @@ const ROUTE_CORRIDOR_MARGIN_DEG = 1;
  * enforce on a station ID — letters or digits, since a US airport whose FAA
  * identifier carries a digit takes a K + FAA-ID form (K0S9, KS52).
  */
-const ICAO = '[A-Z0-9]{4}';
+const ICAO = '[A-Za-z0-9]{4}';
 const ICAO_PATTERN = new RegExp(`^${ICAO}$`);
+const ICAO_GUIDANCE =
+  'Use a 4-character ICAO ID containing ASCII letters or digits (e.g., KSEA, K0S9), in either case. For an IATA/FAA code, use aviation_find_stations with state or bbox to find the ICAO ID; do not infer a mapping.';
 const DECIMAL_DEGREES = String.raw`-?\d{1,3}(?:\.\d+)?`;
 const WAYPOINT = String.raw`\s*${DECIMAL_DEGREES}\s*,\s*${DECIMAL_DEGREES}\s*`;
 
@@ -189,24 +191,24 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
   args: z.object({
     departure_icao: z
       .string()
-      .regex(ICAO_PATTERN)
+      .regex(ICAO_PATTERN, ICAO_GUIDANCE)
       .describe(
-        'Departure airport ICAO identifier, 4 uppercase letters or digits (e.g., KSEA, K0S9).',
+        'Departure airport ICAO identifier, 4 ASCII letters or digits, case-insensitive and normalized to uppercase (e.g., KSEA, K0S9).',
       ),
     destination_icao: z
       .string()
-      .regex(ICAO_PATTERN)
+      .regex(ICAO_PATTERN, ICAO_GUIDANCE)
       .describe(
-        'Destination airport ICAO identifier, 4 uppercase letters or digits (e.g., KJFK, KS52).',
+        'Destination airport ICAO identifier, 4 ASCII letters or digits, case-insensitive and normalized to uppercase (e.g., KJFK, KS52).',
       ),
     alternates: z
       .union([
         z.literal(''),
         z
           .string()
-          .regex(ALTERNATES_PATTERN)
+          .regex(ALTERNATES_PATTERN, `Separate alternate ICAO IDs with commas. ${ICAO_GUIDANCE}`)
           .describe(
-            'Comma-separated 4-character ICAO identifiers, uppercase letters or digits (e.g., "KBFI,K0S9").',
+            'Comma-separated 4-character ICAO identifiers, ASCII letters or digits, case-insensitive and normalized to uppercase (e.g., "KBFI,K0S9").',
           ),
       ])
       .optional()
@@ -252,13 +254,15 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
       ),
   }),
   generate: (args) => {
+    const departure = args.departure_icao.toUpperCase();
+    const destination = args.destination_icao.toUpperCase();
     const alternates = args.alternates
       ? args.alternates
           .split(',')
-          .map((s) => s.trim())
+          .map((s) => s.trim().toUpperCase())
           .filter(Boolean)
       : [];
-    const allIcaos = [args.departure_icao, args.destination_icao, ...alternates];
+    const allIcaos = [departure, destination, ...alternates];
 
     const cruiseAltitudeFt = args.cruise_altitude
       ? Number.parseInt(args.cruise_altitude, 10)
@@ -336,8 +340,8 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
       .join('\n');
 
     const header = [
-      `**Departure:** ${args.departure_icao}`,
-      `**Destination:** ${args.destination_icao}`,
+      `**Departure:** ${departure}`,
+      `**Destination:** ${destination}`,
       ...(alternates.length ? [`**Alternates:** ${alternates.join(', ')}`] : []),
       ...(args.departure_time ? [`**Departure time:** ${args.departure_time}`] : []),
       ...(cruiseAltitudeFt === undefined
@@ -368,14 +372,15 @@ Follow this sequence:
    - Identify any forecast deterioration or improvement during the planned flight window
    - Flag TEMPO/BECMG/PROB groups that could affect operations
 
-3. **PIREPs** — Call \`aviation_get_pireps\` centered on ${args.departure_icao} and ${args.destination_icao}
+3. **PIREPs** — Call \`aviation_get_pireps\` centered on ${departure} and ${destination}
    - ${pirepAltitudeLine}
    - Report any significant turbulence (MOD or greater) or icing (LGT or greater)
    - Note altitude ranges where hazards were reported
    - Absence of PIREPs does not guarantee smooth conditions
 
 4. **Advisories** — ${advisoriesCall}
-   - List any active domestic SIGMETs (turbulence, icing, IFR, convective)
+   - List active domestic SIGMETs, international SIGMETs (including oceanic products), and Center Weather Advisories; the default advisory_type "all" reads all three
+   - Read coverage and partial before interpreting any empty result. Failed sources, unreadable rows and unlocated geometry are assessment gaps; bbox counts apply after product/hazard selection. If limit withheld matches, omit or raise it before completing the assessment
    - Include valid times and affected altitudes
    - AIRMETs are not available from this server; do not request one. Say so plainly rather than implying the route was cleared of AIRMET-class hazards
 

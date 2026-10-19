@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: aviation-weather-mcp-server
-abstract: "Fetch METARs, TAFs, PIREPs, and SIGMETs/AIRMETs from the NWS Aviation Weather Center via MCP. STDIO or Streamable HTTP."
+abstract: "Fetch METARs, TAFs, PIREPs, domestic/international SIGMETs and CWAs from NWS AWC via MCP. AIRMETs not served. STDIO or Streamable HTTP."
 type: software
 authors:
   - family-names: Hand

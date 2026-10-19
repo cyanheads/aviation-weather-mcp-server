@@ -39,6 +39,11 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 const sigmet: NormalizedAdvisory = {
+  source: 'sigmet',
+  fir_id: null,
+  fir_name: null,
+  qualifier: null,
+  geometry: null,
   advisory_type: 'SIGMET',
   series_id: 'BOSW0',
   hazard: 'CONVECTIVE',
@@ -64,6 +69,11 @@ const sigmet: NormalizedAdvisory = {
  * `SIGMET`, so an AIRMET fixture would encode a row the source cannot emit.
  */
 const sparseSigmet: NormalizedAdvisory = {
+  source: 'sigmet',
+  fir_id: null,
+  fir_name: null,
+  qualifier: null,
+  geometry: null,
   advisory_type: 'SIGMET',
   series_id: 'SFOT0',
   hazard: 'IFR',
@@ -307,7 +317,7 @@ describe('aviationGetAdvisories AIRMET rejection', () => {
     const advisoryType = aviationGetAdvisories.input.shape.advisory_type;
     const hazard = aviationGetAdvisories.input.shape.hazard;
 
-    expect(aviationGetAdvisories.description).not.toMatch(/AIRMETs\b(?!.*not)/);
+    expect(aviationGetAdvisories.description).toContain('does not retrieve AIRMETs');
     expect(String(advisoryType.description)).not.toMatch(/"all" returns both/);
     expect(String(hazard.description)).toMatch(/not served|no upstream counterpart|rejected/i);
   });
@@ -330,6 +340,13 @@ describe('aviationGetAdvisories zero-draw disclosure', () => {
   function mockDraw(advisories: NormalizedAdvisory[], drawnRows = advisories.length) {
     mockFetchAdvisories.mockImplementation(async (params) => {
       params.onPreFilterRows?.(drawnRows);
+      params.onSummary?.({
+        coverage: [{ source: 'sigmet', status: 'ok', drawn: drawnRows }],
+        partial: false,
+        drawn: drawnRows,
+        matched: advisories.length,
+        unlocated: 0,
+      });
       return advisories;
     });
   }
@@ -345,8 +362,8 @@ describe('aviationGetAdvisories zero-draw disclosure', () => {
     mockDraw([], 0);
     const notice = String((await enrichmentFor({})).notice);
 
-    expect(notice).toMatch(/no domestic sigmets are active/i);
-    expect(notice).toMatch(/fair.weather/i);
+    expect(notice).toMatch(/no decoded active advisories/i);
+    expect(notice).toContain('sigmet');
   });
 
   it('names the hazard filter when the draw it scoped came back empty', async () => {
@@ -427,11 +444,11 @@ describe('aviationGetAdvisories zero-draw disclosure', () => {
     expect(enrichment).not.toHaveProperty('notice');
   });
 
-  it('carries no notice on a bbox that kept something', async () => {
+  it('discloses bbox removals even when a match survives', async () => {
     mockDraw([sparseSigmet], 2);
     const enrichment = await enrichmentFor({ bbox: quietBbox });
 
-    expect(enrichment).not.toHaveProperty('notice');
+    expect(enrichment.notice).toMatch(/bbox matched 1, excluded 1/i);
   });
 
   it('leaves the empty result a valid state rather than an error', async () => {

@@ -10,6 +10,7 @@ import { McpError, serviceUnavailable, validationError } from '@cyanheads/mcp-ts
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { type AdvisoryParams, fetchAdvisoryProducts } from './advisory-products.js';
 import { STATE_BBOXES } from './state-bboxes.js';
 import type {
   MetarCeilingType,
@@ -26,7 +27,6 @@ import type {
   NormalizedTafPeriod,
   NormalizedTafWindShear,
   NormalizedTurbulenceLayer,
-  RawAirSigmet,
   RawCloudLayer,
   RawMetar,
   RawPirep,
@@ -618,28 +618,6 @@ function normalizePirep(raw: RawPirep): NormalizedPirep {
   };
 }
 
-function normalizeAdvisory(raw: RawAirSigmet): NormalizedAdvisory {
-  const movement =
-    raw.movementDir != null || raw.movementSpd != null
-      ? { direction_deg: raw.movementDir ?? null, speed_kt: raw.movementSpd ?? null }
-      : null;
-
-  return {
-    advisory_type: raw.airSigmetType ?? 'SIGMET',
-    series_id: raw.seriesId,
-    hazard: raw.hazard ?? 'UNKNOWN',
-    severity: raw.severity ?? null,
-    issued_by: raw.icaoId,
-    valid_from: new Date(raw.validTimeFrom * 1000).toISOString(),
-    valid_to: new Date(raw.validTimeTo * 1000).toISOString(),
-    altitude_low_ft: raw.altitudeLow1 ?? null,
-    altitude_high_ft: raw.altitudeHi1 ?? null,
-    movement,
-    polygon: raw.coords ?? [],
-    raw_text: raw.rawAirSigmet,
-  };
-}
-
 function normalizeStation(raw: RawStationInfo): NormalizedStation {
   return {
     id: raw.id,
@@ -654,72 +632,6 @@ function normalizeStation(raw: RawStationInfo): NormalizedStation {
     country: raw.country ?? '',
     data_types: raw.siteType ?? [],
   };
-}
-
-// ---------------------------------------------------------------------------
-// Advisory hazard vocabulary
-// ---------------------------------------------------------------------------
-
-/**
- * The hazard classes `/airsigmet` serves, mapped to the token its own `hazard`
- * parameter accepts. AWC matches that token against its stored spelling, so
- * nothing here has to know what that spelling is. The schema does not settle
- * it: `AirSigmetJSON.hazard` is a bare string with no enum, and no
- * non-convective domestic SIGMET has been active to read a value off.
- *
- * The mapping is a correctness requirement rather than a tidiness one, because
- * sending the caller's own spelling fails in two directions.
- * `hazard=CONVECTIVE` and `hazard=TURBULENCE` answer HTTP 400 `Invalid value
- * for hazard`, but `ICING` and `IFR` answer 204 — matched case-insensitively
- * against the documented `ifr` and the undocumented `icing`. So a wrong token
- * on the first two rows fails loudly, while a wrong token on the latter two
- * would read as fair weather forever. The URL assertions in the service test
- * are the only gate on those two; the endpoint will not catch a typo there.
- */
-const UPSTREAM_HAZARD = {
-  CONVECTIVE: 'conv',
-  TURBULENCE: 'turb',
-  ICING: 'ice',
-  IFR: 'ifr',
-} as const;
-
-/** A hazard class the domestic SIGMET feed carries. */
-export type SigmetHazard = keyof typeof UPSTREAM_HAZARD;
-
-/**
- * Whether a hazard names one of the four classes `/airsigmet` serves. The
- * `aviation_get_advisories` hazard enum also includes AIRMET-family phenomena
- * the feed cannot carry, and this predicate is what turns them away before
- * `fetchAdvisories`: only a `SigmetHazard` satisfies that signature, so the
- * rejection is a compile-time requirement rather than a convention and no
- * reachable path leaves AWC answering 400.
- */
-export function isSigmetHazard(hazard: string): hazard is SigmetHazard {
-  return Object.hasOwn(UPSTREAM_HAZARD, hazard);
-}
-
-// ---------------------------------------------------------------------------
-// bbox overlap check for advisory filtering
-// ---------------------------------------------------------------------------
-
-function bboxOverlapsPolygon(
-  bbox: { minLat: number; minLon: number; maxLat: number; maxLon: number },
-  polygon: { lat: number; lon: number }[],
-): boolean {
-  if (!polygon || polygon.length === 0) return false;
-  // Simple bounding-box overlap: check if any polygon point is in the bbox,
-  // or if the polygon bounding box overlaps the query bbox.
-  const polyMinLat = Math.min(...polygon.map((p) => p.lat));
-  const polyMaxLat = Math.max(...polygon.map((p) => p.lat));
-  const polyMinLon = Math.min(...polygon.map((p) => p.lon));
-  const polyMaxLon = Math.max(...polygon.map((p) => p.lon));
-
-  return !(
-    polyMaxLat < bbox.minLat ||
-    polyMinLat > bbox.maxLat ||
-    polyMaxLon < bbox.minLon ||
-    polyMinLon > bbox.maxLon
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -798,7 +710,7 @@ export class AviationWeatherService {
    * A 4xx carrying AWC's error envelope is re-raised with AWC's text as its
    * message (`withAwcErrorText`), for every endpoint this service calls.
    */
-  private fetchJson<T>(url: string, ctx: Context): Promise<T> {
+  private fetchJson<T>(url: string, ctx: Context, strictBody = false): Promise<T> {
     return withRetry(
       async (attempt) => {
         let response: Response;
@@ -820,7 +732,11 @@ export class AviationWeatherService {
           );
         }
         // Empty body on non-204 responses — also treat as empty result
-        if (!text.trim()) return [] as T;
+        if (!text.trim()) {
+          if (strictBody)
+            throw serviceUnavailable('AWC advisory response was empty without HTTP 204.');
+          return [] as T;
+        }
         let parsed: unknown;
         try {
           parsed = JSON.parse(text);
@@ -844,6 +760,7 @@ export class AviationWeatherService {
         context: ctx,
         baseDelayMs: 1000,
         signal: ctx.signal,
+        ...(strictBody ? { deadlineMs: 45_000 } : {}),
       },
     );
   }
@@ -948,54 +865,18 @@ export class AviationWeatherService {
   }
 
   /**
-   * Fetch the active domestic SIGMET set, narrowed by hazard upstream and by
-   * bbox in here.
-   *
-   * The hazard goes to the endpoint's own `hazard` parameter through
-   * `UPSTREAM_HAZARD`, so AWC matches it against whatever spelling it stores
-   * and nothing in here compares the two. That spelling is not knowable from
-   * the schema — `AirSigmetJSON.hazard` is a bare string with no enum — and a
-   * stored token shorter than the caller's (`TURB` under a requested
-   * `TURBULENCE`) would empty a result on a surface where an empty array reads
-   * as "this hazard is not active".
-   *
-   * The bbox stays client-side because the endpoint defines no bbox parameter
-   * (design decision 6). It defines no type parameter either — its schema pins
-   * `airSigmetType` to `SIGMET` — and answers HTTP 200 while dropping query
-   * keys it does not recognize, so a `type=` (or the deprecated `types=`) key
-   * would read as a filter that ran while changing nothing. `advisoryType`
-   * shapes nothing here and is kept for its type: AIRMET requests are rejected
-   * in the handler, and the `'sigmet' | 'all'` union is what makes that guard a
-   * compile-time requirement — as `SigmetHazard` does for the hazard values.
-   *
-   * `onPreFilterRows` reports the drawn row count before the bbox filter cuts
-   * it. The caller cannot recover it otherwise, and it is what separates a draw
-   * that came back empty from one the box emptied.
+   * Fetch independent domestic/international SIGMET and CWA products.
+   * Source-specific hazard filters precede geographic envelope checks;
+   * summary callbacks preserve coverage and the counts before/after bbox.
+   * A shared deadline bounds all legs and retry/body-read work.
    */
-  async fetchAdvisories(
-    params: {
-      advisoryType: 'sigmet' | 'all';
-      hazard?: SigmetHazard;
-      bbox?: { minLat: number; minLon: number; maxLat: number; maxLon: number };
-      onPreFilterRows?: (rows: number) => void;
-    },
-    ctx: Context,
-  ): Promise<NormalizedAdvisory[]> {
-    let url = `${this.baseUrl}/airsigmet?format=json`;
-    if (params.hazard) url += `&hazard=${UPSTREAM_HAZARD[params.hazard]}`;
-    ctx.log.debug('Fetching advisories', {
-      advisoryType: params.advisoryType,
-      hazard: params.hazard,
-    });
-    const raw = await this.fetchJson<RawAirSigmet[]>(url, ctx);
-    if (!Array.isArray(raw)) return [];
-
-    const advisories = raw.map(normalizeAdvisory);
-    params.onPreFilterRows?.(advisories.length);
-
-    // Client-side bbox overlap filter
-    const { bbox } = params;
-    return bbox ? advisories.filter((a) => bboxOverlapsPolygon(bbox, a.polygon)) : advisories;
+  fetchAdvisories(params: AdvisoryParams, ctx: Context): Promise<NormalizedAdvisory[]> {
+    return fetchAdvisoryProducts(
+      params,
+      this.baseUrl,
+      (url, context) => this.fetchJson(url, context, true),
+      ctx,
+    );
   }
 
   /**

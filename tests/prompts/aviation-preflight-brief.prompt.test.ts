@@ -133,6 +133,11 @@ describe('aviationPreflightBrief', () => {
      * SIGMETs would read as a route cleared of AIRMET-class hazards.
      */
     expect(text).toMatch(/domestic SIGMETs/);
+    expect(text).toContain('international SIGMETs');
+    expect(text).toContain('Center Weather Advisories');
+    expect(text).toContain('Read coverage and partial');
+    expect(text).toContain('unlocated geometry');
+    expect(text).toContain('omit or raise it');
     expect(text).toMatch(/AIRMETs are not available/);
     expect(text).toMatch(/do not request one/);
   });
@@ -200,13 +205,13 @@ describe('aviationPreflightBrief', () => {
       );
     });
 
-    it('rejects a departure identifier that is not four uppercase letters or digits', () => {
+    it('accepts a lowercase departure identifier', () => {
       expect(() =>
         aviationPreflightBrief.args!.parse({
           departure_icao: 'ksea',
           destination_icao: 'KJFK',
         }),
-      ).toThrow();
+      ).not.toThrow();
     });
 
     it('rejects a three-letter IATA destination identifier', () => {
@@ -229,10 +234,8 @@ describe('aviationPreflightBrief', () => {
     });
 
     it.each([
-      ['a lowercase departure', { departure_icao: 'k0s9' }],
       ['a three-character departure', { departure_icao: 'K0S' }],
       ['a five-character destination', { destination_icao: 'K0S9X' }],
-      ['an alternate carrying a lowercase entry', { alternates: 'KBFI,k0s9' }],
       ['an alternate carrying a five-character entry', { alternates: 'KBFI,KS52X' }],
     ])('rejects %s', (_label, override) => {
       expect(() =>

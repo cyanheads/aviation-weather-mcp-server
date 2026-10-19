@@ -263,10 +263,13 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
   input: z.object({
     station_id: z
       .string()
-      .regex(/^[A-Z0-9]{4}$/)
+      .regex(
+        /^[A-Za-z0-9]{4}$/,
+        'Use a 4-character ICAO ID containing ASCII letters or digits (e.g., KSEA, K0S9), in either case. For an IATA/FAA code, use aviation_find_stations with state or bbox to find the ICAO ID; do not infer a mapping.',
+      )
       .optional()
       .describe(
-        'ICAO station ID as center point for radial search — 4 uppercase letters or digits (e.g., KSEA, K0S9). Use with distance_nm.',
+        'ICAO station ID as center point for radial search — 4 ASCII letters or digits, case-insensitive and normalized to uppercase (e.g., KSEA, K0S9). Use with distance_nm.',
       ),
     bbox: BboxSchema.optional(),
     distance_nm: z
@@ -515,6 +518,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
   },
 
   async handler(input, ctx) {
+    const stationId = input.station_id?.toUpperCase();
     if (!input.station_id && !input.bbox) {
       throw ctx.fail('missing_location', 'Either station_id or bbox is required for PIREP search.');
     }
@@ -559,7 +563,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     const levers = narrowingLevers(mode, input.hours, radiusNm, level, input.min_intensity);
 
     ctx.log.info('Fetching PIREPs', {
-      stationId: input.station_id,
+      stationId,
       hasBbox: !!input.bbox,
       ...(input.station_id ? { distanceNm: radiusNm } : {}),
       hours: input.hours,
@@ -572,7 +576,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     try {
       pireps = await svc.fetchPireps(
         {
-          ...(input.station_id ? { stationId: input.station_id, distanceNm: radiusNm } : {}),
+          ...(stationId ? { stationId, distanceNm: radiusNm } : {}),
           ...(input.bbox ? { bbox: input.bbox } : {}),
           hours: input.hours,
           ...(level != null ? { level } : {}),
@@ -601,7 +605,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       ) {
         throw ctx.fail(
           'station_not_recognized',
-          `AWC does not recognize ${input.station_id} as a PIREP search center.`,
+          `AWC does not recognize ${stationId} as a PIREP search center.`,
           undefined,
           { cause: error },
         );

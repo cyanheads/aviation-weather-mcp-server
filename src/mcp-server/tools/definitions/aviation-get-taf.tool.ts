@@ -154,8 +154,13 @@ export const aviationGetTaf = tool('aviation_get_taf', {
       .array(
         z
           .string()
-          .regex(/^[A-Z0-9]{4}$/)
-          .describe('ICAO station ID: 4 uppercase letters or digits (e.g., KSEA, KJFK, K36U).'),
+          .regex(
+            /^[A-Za-z0-9]{4}$/,
+            'Use a 4-character ICAO ID containing ASCII letters or digits (e.g., KSEA, K0S9), in either case. For an IATA/FAA code, use aviation_find_stations with state or bbox to find the ICAO ID; do not infer a mapping.',
+          )
+          .describe(
+            'ICAO station ID: 4 ASCII letters or digits, case-insensitive and normalized to uppercase (e.g., KSEA, KJFK, K36U).',
+          ),
       )
       .min(1)
       .max(4)
@@ -235,13 +240,14 @@ export const aviationGetTaf = tool('aviation_get_taf', {
   },
 
   async handler(input, ctx) {
-    ctx.log.info('Fetching TAFs', { stationIds: input.station_ids });
+    const stationIds = input.station_ids.map((id) => id.toUpperCase());
+    ctx.log.info('Fetching TAFs', { stationIds });
     const svc = getAviationWeatherService();
-    const forecasts = await svc.fetchTaf(input.station_ids, ctx);
+    const forecasts = await svc.fetchTaf(stationIds, ctx);
 
     if (forecasts.length === 0) {
-      throw ctx.fail('no_taf_available', `No TAF data found for: ${input.station_ids.join(', ')}`, {
-        stationIds: input.station_ids,
+      throw ctx.fail('no_taf_available', `No TAF data found for: ${stationIds.join(', ')}`, {
+        stationIds,
       });
     }
 
@@ -249,8 +255,8 @@ export const aviationGetTaf = tool('aviation_get_taf', {
     // a route check asking for departure, destination, and alternate cannot see
     // which leg came back empty — or that anything is missing at all.
     const returned = [...new Set(forecasts.map((f) => f.station_id))];
-    const missing = input.station_ids.filter((id) => !returned.includes(id));
-    ctx.enrich({ requested: input.station_ids, returned, partial: missing.length > 0 });
+    const missing = stationIds.filter((id) => !returned.includes(id));
+    ctx.enrich({ requested: stationIds, returned, partial: missing.length > 0 });
     if (missing.length > 0) {
       ctx.enrich({ missing });
       ctx.enrich.notice(

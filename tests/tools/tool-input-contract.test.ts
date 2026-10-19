@@ -86,8 +86,8 @@ const tools = [
   {
     name: 'aviation_get_advisories',
     def: aviationGetAdvisories,
-    keys: ['advisory_type', 'bbox', 'hazard'],
-    full: { advisory_type: 'sigmet', hazard: 'ICING', bbox },
+    keys: ['advisory_type', 'bbox', 'hazard', 'limit'],
+    full: { advisory_type: 'sigmet', hazard: 'ICING', bbox, limit: 25 },
   },
 ] as const;
 
@@ -195,6 +195,12 @@ describe('tool input contract', () => {
     ] as const;
 
     describe.each(stationFields)('%s', (_field, accepts) => {
+      it.each(['kßa', 'ＫSEA', 'KSEA\n', ' KSEA'])(
+        'preserves ASCII and whitespace boundaries for %j',
+        (id) => {
+          expect(accepts(id)).toBe(false);
+        },
+      );
       it('accepts a four-letter identifier', () => {
         expect(accepts('KSEA')).toBe(true);
       });
@@ -208,7 +214,6 @@ describe('tool input contract', () => {
       });
 
       it.each([
-        ['a lowercase identifier', 'k0s9'],
         ['a three-character identifier', 'K0S'],
         ['a five-character identifier', 'K0S9X'],
         ['a three-letter IATA code', 'SEA'],
@@ -217,6 +222,10 @@ describe('tool input contract', () => {
         ['an empty identifier', ''],
       ])('rejects %s', (_label, id) => {
         expect(accepts(id)).toBe(false);
+      });
+
+      it.each(['ksea', 'k0s9', 'Ks52'])('accepts case variant %s', (id) => {
+        expect(accepts(id)).toBe(true);
       });
     });
 
@@ -229,13 +238,13 @@ describe('tool input contract', () => {
       }
 
       expect(advertisedPattern(aviationGetMetar.input, 'properties', 'station_ids', 'items')).toBe(
-        '^[A-Z0-9]{4}$',
+        '^[A-Za-z0-9]{4}$',
       );
       expect(advertisedPattern(aviationGetTaf.input, 'properties', 'station_ids', 'items')).toBe(
-        '^[A-Z0-9]{4}$',
+        '^[A-Za-z0-9]{4}$',
       );
       expect(advertisedPattern(aviationGetPireps.input, 'properties', 'station_id')).toBe(
-        '^[A-Z0-9]{4}$',
+        '^[A-Za-z0-9]{4}$',
       );
     });
 

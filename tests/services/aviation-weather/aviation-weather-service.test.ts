@@ -1873,7 +1873,7 @@ describe('AviationWeatherService state station lookup', () => {
 // ---------------------------------------------------------------------------
 
 describe('AviationWeatherService advisory request construction', () => {
-  it.each(['sigmet', 'all'] as const)('sends no type filter for %s', async (advisoryType) => {
+  it.each(['sigmet'] as const)('sends no type filter for %s', async (advisoryType) => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([]));
     await svc.fetchAdvisories({ advisoryType }, createMockContext());
 
@@ -1903,14 +1903,14 @@ describe('AviationWeatherService advisory hazard narrowing', () => {
     // what keeps every value the tool can send one the endpoint's own enum
     // takes.
     vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([]));
-    await svc.fetchAdvisories({ advisoryType: 'all', hazard }, createMockContext());
+    await svc.fetchAdvisories({ advisoryType: 'sigmet', hazard }, createMockContext());
 
     expect(lastRequestUrl()).toMatch(queryParam('hazard', upstream));
   });
 
   it('sends no hazard key when no hazard was requested', async () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([]));
-    await svc.fetchAdvisories({ advisoryType: 'all' }, createMockContext());
+    await svc.fetchAdvisories({ advisoryType: 'sigmet' }, createMockContext());
 
     expect(lastRequestUrl()).not.toContain('hazard=');
   });
@@ -1926,7 +1926,7 @@ describe('AviationWeatherService advisory hazard narrowing', () => {
       jsonResponse([{ ...rawAirSigmetBOSW0, hazard: 'TURB' }]),
     );
     const advisories = await svc.fetchAdvisories(
-      { advisoryType: 'all', hazard: 'TURBULENCE' },
+      { advisoryType: 'sigmet', hazard: 'TURBULENCE' },
       createMockContext(),
     );
 
@@ -1939,7 +1939,7 @@ describe('AviationWeatherService advisory hazard narrowing', () => {
     // rows in every draw taken during this work carried it.
     vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawAirSigmetBOSW0]));
     const advisories = await svc.fetchAdvisories(
-      { advisoryType: 'all', hazard: 'CONVECTIVE' },
+      { advisoryType: 'sigmet', hazard: 'CONVECTIVE' },
       createMockContext(),
     );
 
@@ -1950,7 +1950,7 @@ describe('AviationWeatherService advisory hazard narrowing', () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(
       jsonResponse([rawAirSigmetBOSW0, { ...rawAirSigmetBOSW0, hazard: 'IFR', seriesId: 'SFOT0' }]),
     );
-    const advisories = await svc.fetchAdvisories({ advisoryType: 'all' }, createMockContext());
+    const advisories = await svc.fetchAdvisories({ advisoryType: 'sigmet' }, createMockContext());
 
     expect(advisories.map((a) => a.hazard)).toEqual(['CONVECTIVE', 'IFR']);
   });
@@ -1963,7 +1963,7 @@ describe('AviationWeatherService advisory hazard narrowing', () => {
       text: async () => '',
     } as unknown as Response);
     const advisories = await svc.fetchAdvisories(
-      { advisoryType: 'all', hazard: 'ICING' },
+      { advisoryType: 'sigmet', hazard: 'ICING' },
       createMockContext(),
     );
 
@@ -1977,7 +1977,7 @@ describe('AviationWeatherService advisory hazard narrowing', () => {
       jsonResponse([rawAirSigmetBOSW0, rawAirSigmetSFOT0]),
     );
     const advisories = await svc.fetchAdvisories(
-      { advisoryType: 'all', bbox: { minLat: 36, minLon: -123, maxLat: 39, maxLon: -119 } },
+      { advisoryType: 'sigmet', bbox: { minLat: 36, minLon: -123, maxLat: 39, maxLon: -119 } },
       createMockContext(),
     );
 
@@ -1991,7 +1991,7 @@ describe('AviationWeatherService advisory hazard narrowing', () => {
     );
     const advisories = await svc.fetchAdvisories(
       {
-        advisoryType: 'all',
+        advisoryType: 'sigmet',
         hazard: 'IFR',
         bbox: { minLat: 36, minLon: -123, maxLat: 39, maxLon: -119 },
       },
@@ -2019,7 +2019,7 @@ describe('AviationWeatherService advisory pre-filter row count', () => {
     const onPreFilterRows = vi.fn();
     const advisories = await svc.fetchAdvisories(
       {
-        advisoryType: 'all',
+        advisoryType: 'sigmet',
         bbox: { minLat: 36, minLon: -123, maxLat: 39, maxLon: -119 },
         onPreFilterRows,
       },
@@ -2035,7 +2035,7 @@ describe('AviationWeatherService advisory pre-filter row count', () => {
     const onPreFilterRows = vi.fn();
     const advisories = await svc.fetchAdvisories(
       {
-        advisoryType: 'all',
+        advisoryType: 'sigmet',
         bbox: { minLat: 36, minLon: -123, maxLat: 39, maxLon: -119 },
         onPreFilterRows,
       },
@@ -2052,7 +2052,7 @@ describe('AviationWeatherService advisory pre-filter row count', () => {
     // the draw either way keeps the caller's attribution a single branch.
     vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawAirSigmetBOSW0]));
     const onPreFilterRows = vi.fn();
-    await svc.fetchAdvisories({ advisoryType: 'all', onPreFilterRows }, createMockContext());
+    await svc.fetchAdvisories({ advisoryType: 'sigmet', onPreFilterRows }, createMockContext());
 
     expect(onPreFilterRows).toHaveBeenCalledWith(1);
   });
@@ -2064,7 +2064,7 @@ describe('AviationWeatherService advisory pre-filter row count', () => {
     const onPreFilterRows = vi.fn();
     await svc.fetchAdvisories(
       {
-        advisoryType: 'all',
+        advisoryType: 'sigmet',
         hazard: 'TURBULENCE',
         bbox: { minLat: 36, minLon: -123, maxLat: 39, maxLon: -119 },
         onPreFilterRows,
@@ -2551,7 +2551,6 @@ describe('AviationWeatherService upstream error bodies', () => {
       'fetchPireps',
       () => svc.fetchPireps({ stationId: 'KISN', distanceNm: 60, hours: 12 }, createMockContext()),
     ],
-    ['fetchAdvisories', () => svc.fetchAdvisories({ advisoryType: 'all' }, createMockContext())],
     ['fetchStations', () => svc.fetchStations({ stationIds: ['KSEA'] }, createMockContext())],
   ])('surfaces the AWC text through %s, whichever tool made the call', async (_method, call) => {
     // Live: `stationinfo` with neither IDs nor a box answers this 400.

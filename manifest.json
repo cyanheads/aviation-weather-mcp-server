@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "aviation-weather-mcp-server",
   "version": "0.5.1",
-  "description": "Fetch METARs, TAFs, PIREPs, and domestic SIGMETs from the NWS Aviation Weather Center.",
+  "description": "METARs, TAFs, PIREPs, domestic/international SIGMETs and CWAs via NWS AWC. AIRMETs not served.",
   "author": { "name": "cyanheads" },
   "repository": {
     "type": "git",

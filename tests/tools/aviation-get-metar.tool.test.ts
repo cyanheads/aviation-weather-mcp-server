@@ -892,16 +892,10 @@ describe('aviationGetMetar partial-batch disclosure', () => {
     expect(text).toContain('aviation_find_stations');
   });
 
-  it.each([['ksea'], ['SEA'], ['KSEATTLE'], ['']])(
-    'rejects %p before reconciliation can run',
-    (id) => {
-      // Comparing the requested IDs against upstream `icaoId` is only a sound
-      // set operation because the input contract fixes them at four uppercase
-      // letters or digits — a relaxed input would surface a casing mismatch as
-      // a missing station rather than as the input error it is.
-      expect(aviationGetMetar.input.safeParse({ station_ids: [id], hours: 1 }).success).toBe(false);
-    },
-  );
+  it.each([['SEA'], ['KSEATTLE'], ['']])('rejects %p before reconciliation can run', (id) => {
+    // Malformed IDs are rejected before the handler canonicalizes case.
+    expect(aviationGetMetar.input.safeParse({ station_ids: [id], hours: 1 }).success).toBe(false);
+  });
 
   it('rejects an empty batch rather than reconciling nothing', () => {
     expect(aviationGetMetar.input.safeParse({ station_ids: [], hours: 1 }).success).toBe(false);
