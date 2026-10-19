@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-10-18 · ⚠️ Breaking
+
+International SIGMETs and Center Weather Advisories join advisory coverage, with nullable source facts and case-insensitive station IDs.
+
 ## [0.5.1](changelog/0.5.x/0.5.1.md) — 2026-10-08
 
 Framework update to mcp-ts-core 0.13.14: tool errors carry a request ID, integer and numeric-string arguments are repaired instead of rejected, the Docker image installs dependencies on the build platform, and the server.json registry entries drop the run start:* arguments.

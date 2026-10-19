@@ -1,6 +1,6 @@
 # aviation-weather-mcp-server - Directory Structure
 
-Generated on: 2026-10-08 11:22:09
+Generated on: 2026-10-19 01:49:40
 
 ```text
 aviation-weather-mcp-server/
@@ -29,6 +29,7 @@ aviation-weather-mcp-server/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
 │   ├── 0.5.x/
+│   ├── 0.6.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -158,6 +159,7 @@ aviation-weather-mcp-server/
 │   │       └── format-sky-condition.ts
 │   ├── services/
 │   │   └── aviation-weather/
+│   │       ├── advisory-products.ts
 │   │       ├── aviation-weather-service.ts
 │   │       ├── awc-limits.ts
 │   │       ├── bbox.ts
@@ -170,10 +172,12 @@ aviation-weather-mcp-server/
 │   ├── resources/
 │   ├── services/
 │   │   └── aviation-weather/
+│   │       ├── advisory-products.test.ts
 │   │       ├── aviation-weather-service.test.ts
 │   │       ├── bbox.test.ts
 │   │       └── state-bboxes.test.ts
 │   └── tools/
+│       ├── advisory-scaling.test.ts
 │       ├── aviation-find-stations.tool.test.ts
 │       ├── aviation-get-advisories.tool.test.ts
 │       ├── aviation-get-metar.tool.test.ts
@@ -181,6 +185,7 @@ aviation-weather-mcp-server/
 │       ├── aviation-get-taf.tool.test.ts
 │       ├── format-degrees.test.ts
 │       ├── format-sky-condition.test.ts
+│       ├── station-case.test.ts
 │       └── tool-input-contract.test.ts
 ├── .dockerignore
 ├── .env.example
