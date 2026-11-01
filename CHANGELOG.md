@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-10-31
+
+Altitude-aware advisory selection and weather-assessment guidance, with corrected SIGMET geometry and CWA cancellation counts.
+
 ## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-10-18 · ⚠️ Breaking
 
 International SIGMETs and Center Weather Advisories join advisory coverage, with nullable source facts and case-insensitive station IDs.
