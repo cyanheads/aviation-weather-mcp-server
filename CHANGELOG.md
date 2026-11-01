@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.1](changelog/0.7.x/0.7.1.md) — 2026-10-31
+
+Correct station discovery and PIREP radius filtering
+
 ## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-10-31
 
 Altitude-aware advisory selection and weather-assessment guidance, with corrected SIGMET geometry and CWA cancellation counts.
