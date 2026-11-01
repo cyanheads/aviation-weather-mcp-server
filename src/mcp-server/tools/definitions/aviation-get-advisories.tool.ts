@@ -55,7 +55,7 @@ function bulletinBlock(raw: string): string {
 export const aviationGetAdvisories = tool('aviation_get_advisories', {
   title: 'Get Active Aviation Advisories',
   description:
-    'Get active domestic SIGMETs, international SIGMETs (including oceanic products), and Center Weather Advisories from the NWS Aviation Weather Center. Filter by advisory_type, hazard, or ordered bbox. Returns source coverage, decoded hazards/altitudes/movement, multipart geometry, and original bulletins; missing facts stay null. Independent source failures retain healthy results with partial coverage. AIRMET requests are rejected; this tool does not retrieve AIRMETs. Omit limit to return every available match; an explicit limit sorts results and discloses withheld matches.',
+    'Get active domestic SIGMETs, international SIGMETs (including oceanic products), and Center Weather Advisories from the NWS Aviation Weather Center. Filter by advisory_type, hazard, optional altitude_ft, or ordered bbox. Returns source coverage, decoded hazards/altitudes/movement, multipart geometry, and original bulletins; missing facts stay null. CWA cancellations are excluded and counted. Independent source failures retain healthy results with partial coverage. AIRMET requests are rejected; this tool does not retrieve AIRMETs. Omit limit to return every available match; an explicit limit sorts results and discloses withheld matches.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     advisory_type: z
@@ -84,9 +84,16 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       ])
       .optional()
       .describe(
-        'Upstream hazard filter. Domestic: CONVECTIVE, TURBULENCE, ICING, IFR. International: TS, TURBULENCE, ICING, MTW (mountain wave), DS (duststorm), SS (sandstorm), TC (tropical cyclone), VA (volcanic ash). CWA: TS, TURBULENCE, ICING, IFR, PCPN (precipitation), UNK (unknown). Incompatible sources are not_applicable; wholly incompatible selections are rejected. MTN OBSCN, SURFACE WIND and LLWS are not served and are rejected. A hazard-scoped zero says nothing about other hazards.',
+        'Upstream hazard filter. TS and CONVECTIVE are thunderstorm aliases across every product, retaining source-native output hazards. Domestic also supports TURBULENCE, ICING, IFR. International also supports TURBULENCE, ICING, MTW (mountain wave), DS (duststorm), SS (sandstorm), TC (tropical cyclone), VA (volcanic ash). CWA also supports TURBULENCE, ICING, IFR, PCPN (precipitation), UNK (unknown). Incompatible sources are not_applicable; wholly incompatible selections are rejected. MTN OBSCN, SURFACE WIND and LLWS are not served and are rejected. A hazard-scoped zero says nothing about other hazards.',
       ),
     bbox: BboxSchema.optional(),
+    altitude_ft: z
+      .number()
+      .min(0)
+      .optional()
+      .describe(
+        'Optional finite altitude in feet MSL, rounded to the nearest 100 ft (half steps round upward). SIGMET sources use documented level filtering within ±3000 ft; CWA uses inclusive overlap with that band, lower edge clamped to zero. Unknown CWA bounds are retained and disclosed.',
+      ),
     limit: z
       .number()
       .int()
@@ -115,12 +122,22 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
               .number()
               .nullable()
               .describe(
-                'Severity integer for convective SIGMETs (higher = more intense). Null when the advisory stated none.',
+                'Source-native domestic severity value, without an inferred intensity scale; null when omitted.',
               ),
             issued_by: z
               .string()
               .nullable()
               .describe('Issuing office ICAO ID or CWSU code; null when omitted.'),
+            issued_by_name: z
+              .string()
+              .nullable()
+              .describe('Source-native CWA issuing-office name, or null when unavailable.'),
+            tendency: z
+              .string()
+              .nullable()
+              .describe(
+                'International source-native tendency token (such as INTSF, WKN, NC), or null when unavailable; future tokens are preserved.',
+              ),
             fir_id: z
               .string()
               .nullable()
@@ -172,6 +189,13 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
                   .number()
                   .nullable()
                   .describe('Decoded movement speed in knots, or null when omitted.'),
+                stationary: z
+                  .boolean()
+                  .nullable()
+                  .optional()
+                  .describe(
+                    'International stationarity: true for an explicit unquoted standalone STNR bulletin token, false for non-sentinel decoded direction with positive speed, null otherwise. Sentinel or zero alone is not stationarity; absent for domestic movement.',
+                  ),
               })
               .nullable()
               .describe('System movement vector, or null if not available.'),
@@ -211,6 +235,17 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       ),
   }),
   enrichment: {
+    altitude_selection: z
+      .object({
+        requested_ft: z.number().describe('Requested altitude in feet MSL.'),
+        level: z.number().describe('Effective integer flight level after nearest-100-ft rounding.'),
+        band_low_ft: z
+          .number()
+          .describe('Inclusive search-band lower bound in feet MSL, clamped to zero.'),
+        band_high_ft: z.number().describe('Inclusive search-band upper bound in feet MSL.'),
+      })
+      .optional()
+      .describe('Applied altitude selection; absent when altitude_ft was omitted.'),
     coverage: z
       .array(
         z
@@ -225,7 +260,25 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
               .number()
               .nullable()
               .describe(
-                'Decoded rows after product/hazard selection, before bbox; null for failed or not_applicable sources.',
+                'Decoded active rows after cancellation removal and product/hazard/altitude selection, before bbox; null for failed or not_applicable sources.',
+              ),
+            cancelled: z
+              .number()
+              .nullable()
+              .describe(
+                'Excluded CWA cancellation notices; zero for readable feeds with none, null when coverage is unavailable.',
+              ),
+            altitude_filter: z
+              .enum(['upstream', 'client'])
+              .nullable()
+              .describe(
+                'Altitude selection mechanism, or null when omitted or coverage unavailable.',
+              ),
+            altitude_unknown: z
+              .number()
+              .nullable()
+              .describe(
+                'Retained rows with either decoded altitude bound unknown, before bbox; not a proven altitude match. Null without altitude selection or available coverage; describes only upstream-returned data.',
               ),
             message: z
               .string()
@@ -244,7 +297,7 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       .number()
       .optional()
       .describe(
-        'With bbox: decoded rows after product/hazard, before geographic filtering; successful sources only.',
+        'With bbox: decoded active rows after cancellation removal and product/hazard/altitude selection, before geographic filtering; successful sources only.',
       ),
     matched: z
       .number()
@@ -277,12 +330,18 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
   },
 
   enrichmentTrailer: {
+    altitude_selection: {
+      render: (selection) =>
+        selection === undefined
+          ? ''
+          : `Altitude selection: requested ${selection.requested_ft} ft MSL; FL${selection.level}; ${selection.band_low_ft}–${selection.band_high_ft} ft MSL.`,
+    },
     coverage: {
       render: (rows) =>
         rows
           .map(
             (row) =>
-              `${row.source}: ${row.status}; drawn ${row.drawn ?? 'not established'}${row.message ? ` — ${row.message}` : ''}`,
+              `${row.source}: ${row.status}; drawn ${row.drawn ?? 'not established'}; cancelled ${row.cancelled ?? 'not established'}; altitude_filter ${row.altitude_filter ?? 'not applied or unavailable'}; altitude_unknown ${row.altitude_unknown ?? 'not established'}${row.altitude_unknown ? ' (retained unknown bounds, not proven altitude matches)' : ''}${row.message ? ` — ${row.message}` : ''}`,
           )
           .join('\n'),
     },
@@ -369,6 +428,7 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
         advisoryType: input.advisory_type,
         ...(input.hazard ? { hazard: input.hazard } : {}),
         ...(input.bbox ? { bbox: input.bbox } : {}),
+        ...(input.altitude_ft !== undefined ? { altitudeFt: input.altitude_ft } : {}),
         onSummary: (value) => {
           summary = value;
         },
@@ -382,6 +442,7 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
     // fair-weather sky the tool never saw.
     if (summary) {
       ctx.enrich({ coverage: summary.coverage, partial: summary.partial });
+      if (summary.altitudeSelection) ctx.enrich({ altitude_selection: summary.altitudeSelection });
       const notices: string[] = [];
       const scope = summary.coverage
         .filter((row) => row.status === 'ok')
@@ -392,6 +453,10 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
           'Coverage is partial; counts describe readable sources only. See coverage for unavailable products or skipped rows.',
         );
       if (!summary.drawn) {
+        if (summary.altitudeSelection)
+          notices.push(
+            'No decoded active advisories after altitude selection; omit altitude_ft to broaden the draw. Unknown CWA bounds were retained; upstream-filtered counts describe only returned data.',
+          );
         notices.push(
           `No decoded active advisories in readable sources (${scope})${input.hazard ? ` with hazard ${input.hazard}; this says nothing about other hazards. Drop the hazard filter to broaden the draw.` : '.'}${input.bbox ? ' The bbox is not the cause: the draw was already empty and the bbox never applied.' : ''}`,
         );
@@ -406,7 +471,7 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
         const outside = summary.drawn - summary.matched - summary.unlocated;
         if (outside || summary.unlocated)
           notices.push(
-            `Readable sources (${scope}) drew ${summary.drawn} after product/hazard selection; bbox matched ${summary.matched}, excluded ${outside} located advisory(ies), and left ${summary.unlocated} unlocated (unknown intersection). Widen the bbox or drop it to see the full draw.`,
+            `Readable sources (${scope}) drew ${summary.drawn} after cancellation removal and product/hazard/altitude selection; bbox matched ${summary.matched}, excluded ${outside} located advisory(ies), and left ${summary.unlocated} unlocated (unknown intersection). Widen the bbox or drop it to see the full draw.`,
           );
       }
       if (input.limit !== undefined) {
@@ -449,12 +514,12 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       lines.push(
         `**Source:** ${a.source} | **FIR:** ${a.fir_id ?? 'not reported'} — ${a.fir_name ?? 'not reported'} | **Qualifier:** ${a.qualifier ?? 'not reported'}`,
       );
-      // Severity is populated on convective SIGMETs and null where the advisory
-      // stated none, so a dropped line reads as a severity the renderer skipped.
+      // An omitted source value stays explicitly unknown on both surfaces.
       lines.push(`**Severity:** ${a.severity != null ? a.severity : 'not reported'}`);
       lines.push(
-        `**Issued by:** ${a.issued_by ?? 'not reported'} | **Valid:** ${a.valid_from ?? 'not reported'} → ${a.valid_to ?? 'not reported'}`,
+        `**Issued by:** ${a.issued_by ?? 'not reported'} | **Office name:** ${a.issued_by_name ?? 'not reported'} | **Valid:** ${a.valid_from ?? 'not reported'} → ${a.valid_to ?? 'not reported'}`,
       );
+      lines.push(`**Tendency:** ${a.tendency ?? 'not reported'}`);
 
       // A bound the advisory never stated is not SFC or UNL. Those name real
       // conditions — the hazard reaching the ground, or having no top — and
@@ -469,9 +534,14 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
         a.movement?.direction_deg != null ? `${a.movement.direction_deg}°` : 'unreported direction';
       const movSpd =
         a.movement?.speed_kt != null ? `${a.movement.speed_kt} kt` : 'unreported speed';
-      lines.push(`**Movement:** ${a.movement ? `${movDir} at ${movSpd}` : 'not reported'}`);
-      if (a.movement?.direction_text !== undefined)
-        lines.push(`**Source direction text:** ${a.movement.direction_text ?? 'not reported'}`);
+      if (
+        a.movement &&
+        (a.movement.direction_text !== undefined || a.movement.stationary !== undefined)
+      ) {
+        lines.push(
+          `**Movement:** source direction ${a.movement.direction_text ?? 'not reported'}; degrees ${a.movement.direction_deg ?? 'not reported'}; ${movSpd}; ${a.movement.stationary === true ? 'stationary' : `stationary: ${a.movement.stationary === false ? 'false' : 'not reported'}`}`,
+        );
+      } else lines.push(`**Movement:** ${a.movement ? `${movDir} at ${movSpd}` : 'not reported'}`);
 
       if (a.polygon && a.polygon.length > 0) {
         const pts = a.polygon

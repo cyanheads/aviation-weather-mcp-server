@@ -9,6 +9,8 @@ import { fetchAdvisoryProducts } from '@/services/aviation-weather/advisory-prod
 import type { NormalizedAdvisory } from '@/services/aviation-weather/types.js';
 
 const advisory: NormalizedAdvisory = {
+  tendency: null,
+  issued_by_name: null,
   advisory_type: 'SIGMET',
   source: 'sigmet',
   series_id: null,
@@ -29,6 +31,39 @@ const advisory: NormalizedAdvisory = {
 };
 
 describe('advisory linear work bounds', () => {
+  it.each(['openers', 'nested', 'line', 'breaks'] as const)(
+    'bounds bulletin classification for %s over a 64x span',
+    async (shape) => {
+      const readings: { size: number; cpuUs: number }[] = [];
+      for (let size = 5_000; size <= 320_000; size *= 2) {
+        const raw =
+          shape === 'openers'
+            ? '"'.repeat(size)
+            : shape === 'nested'
+              ? '("('.repeat(Math.ceil(size / 3))
+              : shape === 'line'
+                ? `ZAN CWA ${'1'.repeat(size)}\n`
+                : 'ZAN CWA\nSTNRX\n'.repeat(Math.ceil(size / 14));
+        const before = process.threadCpuUsage();
+        for (let repeat = 0; repeat < 20; repeat++) {
+          const rows = await fetchAdvisoryProducts(
+            { advisoryType: 'all' },
+            'https://example.test',
+            async () => [{ rawText: raw, rawSigmet: raw, rawAirSigmet: raw }],
+            createMockContext(),
+          );
+          expect(rows).toHaveLength(3);
+          expect(rows[1]!.movement).toBeNull();
+        }
+        const usage = process.threadCpuUsage(before);
+        const cpuUs = usage.user + usage.system;
+        readings.push({ size, cpuUs });
+        expect(cpuUs).toBeLessThan(2_000_000);
+        expect(cpuUs / readings[0]!.cpuUs).toBeLessThan(256);
+      }
+      console.info('advisory-classification-scaling', shape, JSON.stringify(readings));
+    },
+  );
   it.each(['digits', 'ticks', 'lines'] as const)(
     'renders %s at each doubling from 5k through 320k with bounded thread CPU',
     (shape) => {

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "aviation-weather-mcp-server",
+  "version": "0.6.0",
+  "description": "Fetch METARs, TAFs, PIREPs, domestic/international SIGMETs and CWAs from NWS AWC via MCP. AIRMETs not served. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/aviation-weather-mcp-server#readme",
+  "repository": "git+https://github.com/cyanheads/aviation-weather-mcp-server.git",
+  "license": "Apache-2.0",
+  "keywords": [
+    "aviation",
+    "aviation-weather",
+    "metar",
+    "taf",
+    "pirep",
+    "sigmet",
+    "aviation-weather-center",
+    "awc",
+    "flight-weather",
+    "preflight",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "ai-agent"
+  ]
+}

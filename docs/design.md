@@ -318,6 +318,7 @@ When a capped page is then emptied by the altitude filter, `no_pireps_found` say
 advisory_type: z.enum(['sigmet', 'isigmet', 'cwa', 'airmet', 'all']).default('all')
 hazard: z.enum(['CONVECTIVE', 'TURBULENCE', 'ICING', 'IFR', 'TS', 'MTW', 'DS', 'SS', 'TC', 'VA', 'PCPN', 'UNK', 'MTN OBSCN', 'SURFACE WIND', 'LLWS']).optional()
 bbox: z.object({ minLat, minLon, maxLat, maxLon }).optional() // ordered input; bounding-envelope overlap on every source geometry part
+altitude_ft: z.number().min(0).optional() // finite feet MSL, nearest-100-ft rounding
 limit: z.number().int().min(1).optional() // no default or automatic cap
 ```
 
@@ -327,9 +328,10 @@ advisory_type: string // SIGMET, ISIGMET or CWA
 source: 'sigmet' | 'isigmet' | 'cwa'
 series_id / hazard / issued_by / valid_from / valid_to / raw_text: string | null
 fir_id / fir_name / qualifier: string | null
+tendency / issued_by_name: string | null // international chng / CWA office name, otherwise null
 severity: number | null // domestic numeric value; null for international/CWA
 altitude_low_ft / altitude_high_ft: number | null // decoded feet MSL, never inferred from raw text
-movement: { direction_deg: number | null, speed_kt: number | null, direction_text?: string | null } | null
+movement: { direction_deg: number | null, speed_kt: number | null, direction_text?: string | null, stationary?: boolean | null } | null
 polygon: Point[] | null // compatibility field for a single area; null for multipart, LINE or missing geometry
 geometry: { kind: string | null, parts: Point[][] } | null // source-native kind, intact rings/lines
 ```
@@ -348,7 +350,8 @@ Independent applicable products run concurrently under one 45-second deadline sp
 
 **Enrichment contract** (see decision 23):
 ```
-coverage: { source, status: 'ok' | 'failed' | 'not_applicable', drawn: number | null, message?: string }[]
+coverage: { source, status: 'ok' | 'failed' | 'not_applicable', drawn: number | null, cancelled: number | null, altitude_filter: 'upstream' | 'client' | null, altitude_unknown: number | null, message?: string }[]
+altitude_selection?: { requested_ft, level, band_low_ft, band_high_ft } // rounded integer level and effective feet-MSL band
 partial: boolean // failed source or skipped unreadable rows
 drawn / matched / returned / unlocated: number // bbox only; returned also present with explicit limit
 total: number // explicit limit only, matches before limit
@@ -356,7 +359,15 @@ truncated: boolean // explicit limit only, true if matches withheld
 notice?: string // readable coverage, empty/filter stage, partial coverage and limit recovery
 ```
 
-Source `drawn` and bbox `drawn` count decoded rows after product/hazard selection and before bbox; `matched` precedes limit and `returned` follows it. `unlocated` is separate from proven-outside rows. No bbox means no bbox-specific counts/notices. An explicit limit sorts by source/issuer/series/validity (raw text breaks remaining ties), discloses totals and offers omission/raising as recovery. It has no default and no upstream cap claim. Empty hazard-scoped notices never assert other hazards are active.
+Source `drawn` and bbox `drawn` count decoded active rows after product/hazard/altitude selection and before bbox; `matched` precedes limit and `returned` follows it. `unlocated` is separate from proven-outside rows. No bbox means no bbox-specific counts/notices. An explicit limit sorts by source/issuer/series/validity (raw text breaks remaining ties), discloses totals and offers omission/raising as recovery. It has no default and no upstream cap claim. Empty hazard-scoped notices never assert other hazards are active; altitude-scoped empty notices name altitude selection before bbox.
+
+`TS` and `CONVECTIVE` are aliases at the query boundary: domestic sends `conv`, international and CWA send `ts`. Output hazards remain source-native; matching stays upstream. Finite primary domestic altitude bounds take precedence, falling back to alternate bounds only when unavailable. This preserves existing finite values and zero rather than asserting an unsupported alternate precedence. Finite source longitudes outside [-180,180] wrap modulo 360 before storage and shortest-arc envelope matching; already canonical coordinates, including 180, stay unchanged. Malformed vertices still invalidate all parts.
+
+A CWA cancellation is a `CNL CWA <number>` action at the start of the body following its validity header, not a substring elsewhere in an active bulletin. Remove it before all active counts; readable feeds disclose `cancelled` (including zero), unavailable feeds null. Cancellation is successful decoding and does not set `partial`.
+
+When `altitude_ft` is supplied, `level=Math.round(altitude_ft/100)` selects AWC's documented ±3,000 ft band for domestic/international SIGMETs. Echo requested feet, effective integer level and band with lower edge clamped to zero. CWA filtering uses inclusive local interval overlap because its upstream schema does not document `level`. Retain CWA rows with either bound unknown; unknown is neither SFC nor UNL. Preserve upstream-selected SIGMET rows without guessing a second filter. `altitude_filter` names each readable source's mechanism; `altitude_unknown` counts retained decoded unknown bounds before bbox, never records withheld upstream. Both are null without altitude selection or available coverage. Unknown altitude alone is not partial coverage. The preflight prompt forwards explicitly supplied cruise feet, including zero, without dropping its route bbox.
+
+International `tendency` preserves `chng` as an open nullable token; CWA `issued_by_name` preserves the office name. International movement keeps all existing values, including the `-` sentinel, and renders direction text and speed together. Add nullable `stationary`: true only for an unquoted standalone bulletin `STNR` token, false for non-sentinel decoded direction plus positive speed, otherwise null. Missing/sentinel direction or zero speed alone proves no stationarity. Domestic numeric movement remains unchanged and CWA movement stays null.
 
 ### `aviation_find_stations`
 
@@ -796,7 +807,7 @@ Per-source `ok`/`failed`/`not_applicable` coverage prevents an unreadable produc
 - **A `limit` bounds the response, never the search:** `limit` on those same three tools caps how many rows come back without changing what was searched, and says so separately from the cap — a limited result examined every row it counted, while a capped one never drew the rest (decision 24). The order is defined so the selection is reproducible: `icao_id` ascending with identifier-less rows last on `aviation_find_stations`, so an area sample leads with airports (decision 26); observation time descending on `aviation_get_pireps`; `station_id` ascending on a METAR survey (decision 34). It is not pagination: there is no offset or cursor, because the endpoints expose none, so the rows a limit withholds are reachable only by raising or dropping it. What a limit omits is not summarized; on `aviation_get_pireps`, `min_intensity` is the lever that makes a bounded result the severe reports rather than merely the most recent (decision 25), and on a METAR survey `flight_category` is the lever that selects by condition (decision 37). A limit is never applied by default: a result past 50 reports, 40 METAR stations, or 130 registry stations that set none gets a notice naming the lever instead (decision 36).
 - **Not an official briefing:** This data does not constitute a regulatory-compliant preflight weather briefing. Pilots flying IFR or in controlled airspace must use an authorized source.
 - **Advisory scope:** `/airsigmet` domestic SIGMETs, `/isigmet` international SIGMETs and `/cwa` Center Weather Advisories are independent products. SIGMET feeds are deprecated but active; unified `/sigmet` lacks a documented domestic classifier. AIRMETs remain unavailable (#29). Readable empty arrays/204 are valid, while failed sources never establish quiet weather; coverage and filtering stages are explicit (decisions 23 and 38).
-- **The record's hazard vocabulary for a non-convective domestic SIGMET is unobserved:** `hazard=turb`, `=ice`, and `=ifr` have answered HTTP 204 on every check, so no such row has been available to read, and AWC's schema declares the field a bare string with no enum. Nothing depends on it — the hazard filter is applied by AWC (decision 23) — so this is a documentation gap rather than a limit on what the tool can answer.
+- **Source-native hazard vocabulary:** Domestic turbulence SIGMETs use `TURB`, while convective products use `CONVECTIVE`. Hazard matching stays upstream rather than comparing those record tokens with caller spellings. Domestic finite primary altitude bounds take precedence, with alternate bounds used only when the primary is unavailable; severity remains an uninterpreted domestic source value.
 - **Decoded cloud layers are capped upstream:** AWC decodes at most three layers per TAF period and four per METAR. A TAF period's leftover text surfaces in `not_decoded`, possibly on the period after the one it came from; a METAR's fifth layer is dropped with no marker, so `raw_metar` is the complete source (decision 32).
 - **An empty cloud array carries no sky condition on its own:** AWC encodes no layer for a group with no height, so a `CLR` report, a `VV///` obscuration, and a report that stated no sky condition all arrive as `clouds: []`. `sky_condition` separates them on both response surfaces, and an empty array beside a null reads as unreported rather than clear (decision 21). What stays unavailable is the sky above a station that reported none — no field recovers it, and neither response surface claims otherwise.
 

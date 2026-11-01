@@ -38,6 +38,20 @@ function icaos(count: number): string[] {
 }
 
 describe('aviationPreflightBrief', () => {
+  it.each(['0', '35050'])(
+    'forwards explicit cruise altitude %s while retaining the advisory route bbox',
+    async (cruise_altitude) => {
+      const text = await render({
+        departure_icao: 'KSEA',
+        destination_icao: 'KJFK',
+        cruise_altitude,
+        route_waypoints: '47,-123;48,-122',
+      });
+      const line = callLines(text, 'aviation_get_advisories')[0]!;
+      expect(line).toContain(`altitude_ft: ${cruise_altitude}`);
+      expect(line).toContain('bbox: { minLat: 46, minLon: -124, maxLat: 49, maxLon: -121 }');
+    },
+  );
   it('generates a single user message for a simple departure/destination pair', async () => {
     const parsed = aviationPreflightBrief.args!.parse({
       departure_icao: 'KSEA',

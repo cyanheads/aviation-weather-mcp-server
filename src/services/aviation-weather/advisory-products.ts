@@ -15,12 +15,13 @@ import type {
 const PRODUCTS = {
   sigmet: {
     endpoint: 'airsigmet',
-    hazards: { CONVECTIVE: 'conv', TURBULENCE: 'turb', ICING: 'ice', IFR: 'ifr' },
+    hazards: { TS: 'conv', CONVECTIVE: 'conv', TURBULENCE: 'turb', ICING: 'ice', IFR: 'ifr' },
   },
   isigmet: {
     endpoint: 'isigmet',
     hazards: {
       TS: 'ts',
+      CONVECTIVE: 'ts',
       TURBULENCE: 'turb',
       ICING: 'ice',
       MTW: 'mtw',
@@ -32,7 +33,15 @@ const PRODUCTS = {
   },
   cwa: {
     endpoint: 'cwa',
-    hazards: { TS: 'ts', TURBULENCE: 'turb', ICING: 'ice', IFR: 'ifr', PCPN: 'pcpn', UNK: 'unk' },
+    hazards: {
+      TS: 'ts',
+      CONVECTIVE: 'ts',
+      TURBULENCE: 'turb',
+      ICING: 'ice',
+      IFR: 'ifr',
+      PCPN: 'pcpn',
+      UNK: 'unk',
+    },
   },
 } as const;
 
@@ -91,10 +100,44 @@ function part(value: unknown): AdvisoryPoint[] | null {
     if (!isRecord(vertex)) return null;
     const lat = number(vertex.lat);
     const lon = number(vertex.lon);
-    if (lat === null || lon === null || Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
-    points.push({ lat, lon });
+    if (lat === null || lon === null || Math.abs(lat) > 90) return null;
+    points.push({ lat, lon: Math.abs(lon) <= 180 ? lon : (((lon % 360) + 540) % 360) - 180 });
   }
   return points;
+}
+
+/** A cancellation is the first body action after a CWA validity header, never a mention. */
+function cancelledCwa(raw: Record<string, unknown>): boolean {
+  const bulletin = text(raw.rawText);
+  if (bulletin === null) return false;
+  let body = false;
+  for (const line of bulletin.split('\n')) {
+    const trimmed = line.trim();
+    if (body && trimmed) return /^CNL[ \t]+CWA[ \t]+\d+\b/.test(trimmed);
+    if (/^[A-Z]{3}[ \t]+CWA[ \t]+\d+[ \t]+VALID[ \t]+UNTIL[ \t]+\d{6}$/.test(trimmed)) body = true;
+  }
+  return false;
+}
+
+/** Recognize an unquoted standalone motion token without matching substrings or quoted text. */
+function explicitlyStationary(bulletin: string | null): boolean {
+  if (bulletin === null) return false;
+  let quote: string | null = null;
+  for (let index = 0; index < bulletin.length; index++) {
+    const character = bulletin[index];
+    if (character === '"' || character === "'") {
+      if (quote === character) quote = null;
+      else if (quote === null) quote = character;
+    }
+    if (
+      quote === null &&
+      bulletin.startsWith('STNR', index) &&
+      (index === 0 || /\s/.test(bulletin.charAt(index - 1))) &&
+      (index + 4 === bulletin.length || /[\s.=]/.test(bulletin.charAt(index + 4)))
+    )
+      return true;
+  }
+  return false;
 }
 
 function normalize(source: AdvisorySource, raw: Record<string, unknown>): NormalizedAdvisory {
@@ -111,27 +154,44 @@ function normalize(source: AdvisorySource, raw: Record<string, unknown>): Normal
   const direction = domestic ? number(raw.movementDir) : null;
   const speed = source === 'cwa' ? null : number(domestic ? raw.movementSpd : raw.spd);
   const directionText = source === 'isigmet' ? text(raw.dir) : null;
+  const rawText = text(
+    domestic ? raw.rawAirSigmet : source === 'cwa' ? raw.rawText : raw.rawSigmet,
+  );
+  const stationary =
+    source !== 'isigmet'
+      ? null
+      : explicitlyStationary(rawText)
+        ? true
+        : directionText !== null && directionText !== '-' && speed !== null && speed > 0
+          ? false
+          : null;
   return {
     advisory_type:
       source === 'cwa' ? 'CWA' : domestic ? (text(raw.airSigmetType) ?? 'SIGMET') : 'ISIGMET',
     source,
     series_id: text(raw.seriesId),
     issued_by: text(source === 'cwa' ? raw.cwsu : raw.icaoId),
+    issued_by_name: source === 'cwa' ? text(raw.name) : null,
+    tendency: source === 'isigmet' ? text(raw.chng) : null,
     hazard: text(raw.hazard),
     severity: domestic ? number(raw.severity) : null,
     valid_from: timestamp(raw.validTimeFrom),
     valid_to: timestamp(raw.validTimeTo),
-    altitude_low_ft: number(domestic ? raw.altitudeLow1 : raw.base),
-    altitude_high_ft: number(domestic ? raw.altitudeHi1 : raw.top),
+    altitude_low_ft: domestic
+      ? (number(raw.altitudeLow1) ?? number(raw.altitudeLow2))
+      : number(raw.base),
+    altitude_high_ft: domestic
+      ? (number(raw.altitudeHi1) ?? number(raw.altitudeHi2))
+      : number(raw.top),
     fir_id: text(raw.firId),
     fir_name: text(raw.firName),
     qualifier: text(raw.qualifier),
     movement:
-      direction !== null || speed !== null || directionText !== null
+      direction !== null || speed !== null || directionText !== null || stationary === true
         ? {
             direction_deg: direction,
             speed_kt: speed,
-            ...(source === 'isigmet' ? { direction_text: directionText } : {}),
+            ...(source === 'isigmet' ? { direction_text: directionText, stationary } : {}),
           }
         : null,
     geometry: parts.length ? { kind, parts } : null,
@@ -139,7 +199,7 @@ function normalize(source: AdvisorySource, raw: Record<string, unknown>): Normal
       parts.length === 1 && (domestic || kind === null || kind === 'AREA')
         ? (parts[0] ?? null)
         : null,
-    raw_text: text(domestic ? raw.rawAirSigmet : source === 'cwa' ? raw.rawText : raw.rawSigmet),
+    raw_text: rawText,
   };
 }
 
@@ -173,6 +233,7 @@ function intersects(bbox: NonNullable<AdvisoryParams['bbox']>, points: AdvisoryP
 /** Advisory source selection and callback disclosures before caller-side output limiting. */
 export interface AdvisoryParams {
   advisoryType: AdvisorySource | 'all';
+  altitudeFt?: number;
   bbox?: { minLat: number; minLon: number; maxLat: number; maxLon: number };
   hazard?: AdvisoryHazard;
   onPreFilterRows?: (rows: number) => void;
@@ -186,6 +247,16 @@ export async function fetchAdvisoryProducts(
   fetchJson: (url: string, context: Context) => Promise<unknown>,
   ctx: Context,
 ): Promise<NormalizedAdvisory[]> {
+  const level = params.altitudeFt === undefined ? undefined : Math.round(params.altitudeFt / 100);
+  const altitudeSelection =
+    level === undefined || params.altitudeFt === undefined
+      ? undefined
+      : {
+          requested_ft: params.altitudeFt,
+          level,
+          band_low_ft: Math.max(0, level * 100 - 3000),
+          band_high_ft: level * 100 + 3000,
+        };
   const sources: AdvisorySource[] =
     params.advisoryType === 'all' ? ['sigmet', 'isigmet', 'cwa'] : [params.advisoryType];
   const applicable = sources.filter(
@@ -207,19 +278,36 @@ export async function fetchAdvisoryProducts(
         ? (product.hazards as Partial<Record<AdvisoryHazard, string>>)[params.hazard]
         : undefined;
       const raw = await fetchJson(
-        `${baseUrl}/${product.endpoint}?format=json${token ? `&hazard=${token}` : ''}`,
+        `${baseUrl}/${product.endpoint}?format=json${token ? `&hazard=${token}` : ''}${level !== undefined && source !== 'cwa' ? `&level=${level}` : ''}`,
         context,
       );
       if (!Array.isArray(raw)) throw new Error('unreadable advisory array');
-      const advisories = raw
-        .filter(isRecord)
+      const records = raw.filter(isRecord);
+      const active = source === 'cwa' ? records.filter((row) => !cancelledCwa(row)) : records;
+      const cancelled = records.length - active.length;
+      const advisories = active
         .map((row) => normalize(source, row))
         .filter((row) =>
           Object.entries(row).some(
             ([key, value]) => key !== 'source' && key !== 'advisory_type' && value !== null,
           ),
         );
-      return { source, advisories, skipped: raw.length - advisories.length };
+      const selected =
+        source === 'cwa' && altitudeSelection
+          ? advisories.filter(
+              (row) =>
+                row.altitude_low_ft === null ||
+                row.altitude_high_ft === null ||
+                (row.altitude_low_ft <= altitudeSelection.band_high_ft &&
+                  row.altitude_high_ft >= altitudeSelection.band_low_ft),
+            )
+          : advisories;
+      return {
+        source,
+        advisories: selected,
+        cancelled,
+        skipped: raw.length - cancelled - advisories.length,
+      };
     }),
   );
   ctx.signal.throwIfAborted();
@@ -233,7 +321,10 @@ export async function fetchAdvisoryProducts(
       coverage.push({
         source,
         status: 'not_applicable',
+        altitude_filter: null,
+        altitude_unknown: null,
         drawn: null,
+        cancelled: null,
         message: `${source} has no documented counterpart for ${params.hazard}.`,
       });
       continue;
@@ -243,17 +334,27 @@ export async function fetchAdvisoryProducts(
       coverage.push({
         source,
         status: 'failed',
+        altitude_filter: null,
+        altitude_unknown: null,
         drawn: null,
+        cancelled: null,
         message: `${source} could not be read; coverage is unavailable. Retry this product separately.`,
       });
     } else {
-      const { advisories, skipped } = result.value;
+      const { advisories, skipped, cancelled } = result.value;
       drawn.push(...advisories);
       partial ||= skipped > 0;
       coverage.push({
         source,
         status: 'ok',
+        altitude_filter: altitudeSelection ? (source === 'cwa' ? 'client' : 'upstream') : null,
+        altitude_unknown: altitudeSelection
+          ? advisories.filter(
+              (row) => row.altitude_low_ft === null || row.altitude_high_ft === null,
+            ).length
+          : null,
         drawn: advisories.length,
+        cancelled,
         ...(skipped
           ? {
               message: `${source} skipped ${skipped} empty or unreadable row(s); coverage is partial.`,
@@ -275,6 +376,7 @@ export async function fetchAdvisoryProducts(
     : drawn;
   params.onPreFilterRows?.(drawn.length);
   params.onSummary?.({
+    ...(altitudeSelection ? { altitudeSelection } : {}),
     coverage,
     partial,
     drawn: drawn.length,

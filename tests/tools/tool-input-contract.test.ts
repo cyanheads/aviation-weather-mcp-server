@@ -86,8 +86,8 @@ const tools = [
   {
     name: 'aviation_get_advisories',
     def: aviationGetAdvisories,
-    keys: ['advisory_type', 'bbox', 'hazard', 'limit'],
-    full: { advisory_type: 'sigmet', hazard: 'ICING', bbox, limit: 25 },
+    keys: ['advisory_type', 'altitude_ft', 'bbox', 'hazard', 'limit'],
+    full: { advisory_type: 'sigmet', altitude_ft: 35000, hazard: 'ICING', bbox, limit: 25 },
   },
 ] as const;
 

@@ -403,10 +403,12 @@ export interface NormalizedAdvisory {
   geometry: { kind: string | null; parts: AdvisoryPoint[][] } | null;
   hazard: string | null;
   issued_by: string | null;
+  issued_by_name: string | null;
   movement: {
     direction_deg: number | null;
     speed_kt: number | null;
     direction_text?: string | null;
+    stationary?: boolean | null;
   } | null;
   polygon: AdvisoryPoint[] | null;
   qualifier: string | null;
@@ -414,6 +416,7 @@ export interface NormalizedAdvisory {
   series_id: string | null;
   severity: number | null;
   source: AdvisorySource;
+  tendency: string | null;
   valid_from: string | null; // ISO 8601
   valid_to: string | null; // ISO 8601
 }
@@ -427,6 +430,9 @@ export interface AdvisoryPoint {
 }
 /** Coverage counts exclude unreadable rows and precede bbox filtering. */
 export interface AdvisoryCoverage {
+  altitude_filter: 'upstream' | 'client' | null;
+  altitude_unknown: number | null;
+  cancelled: number | null;
   drawn: number | null;
   message?: string;
   source: AdvisorySource;
@@ -434,6 +440,12 @@ export interface AdvisoryCoverage {
 }
 /** Request-level advisory disclosures. */
 export interface AdvisorySummary {
+  altitudeSelection?: {
+    requested_ft: number;
+    level: number;
+    band_low_ft: number;
+    band_high_ft: number;
+  };
   coverage: AdvisoryCoverage[];
   drawn: number;
   matched: number;

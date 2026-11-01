@@ -39,6 +39,8 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 const sigmet: NormalizedAdvisory = {
+  tendency: null,
+  issued_by_name: null,
   source: 'sigmet',
   fir_id: null,
   fir_name: null,
@@ -69,6 +71,8 @@ const sigmet: NormalizedAdvisory = {
  * `SIGMET`, so an AIRMET fixture would encode a row the source cannot emit.
  */
 const sparseSigmet: NormalizedAdvisory = {
+  tendency: null,
+  issued_by_name: null,
   source: 'sigmet',
   fir_id: null,
   fir_name: null,
@@ -341,7 +345,16 @@ describe('aviationGetAdvisories zero-draw disclosure', () => {
     mockFetchAdvisories.mockImplementation(async (params) => {
       params.onPreFilterRows?.(drawnRows);
       params.onSummary?.({
-        coverage: [{ source: 'sigmet', status: 'ok', drawn: drawnRows }],
+        coverage: [
+          {
+            source: 'sigmet',
+            status: 'ok',
+            drawn: drawnRows,
+            cancelled: 0,
+            altitude_filter: null,
+            altitude_unknown: null,
+          },
+        ],
         partial: false,
         drawn: drawnRows,
         matched: advisories.length,
@@ -604,8 +617,7 @@ describe('aviationGetAdvisories.format null states', () => {
   });
 
   it('renders a null severity as an explicit unreported state', () => {
-    // Severity is populated on convective SIGMETs and null where the advisory
-    // stated none, so a dropped line reads as a severity the renderer skipped.
+    // The source-native domestic value is unknown when the advisory stated none.
     const text = render(sparseSigmet);
 
     expect(text).toContain('**Severity:** not reported');

@@ -25,7 +25,8 @@ await createApp({
   ],
   resources: [],
   prompts: [aviationPreflightBrief],
-  instructions: `Aviation weather from the NWS Aviation Weather Center (aviationweather.gov). Keyless, no API key required. Covers METARs, TAFs, PIREPs, domestic/international SIGMETs and Center Weather Advisories. aviation_get_advisories defaults to all three independent products; inspect coverage and partial before interpreting an empty result. AIRMETs are not served — requests for them are rejected. Optional limit has no default; omit it to retrieve every available match.
+  skills: 'skills',
+  instructions: `Aviation weather from the NWS Aviation Weather Center (aviationweather.gov). Keyless, no API key required. Covers METARs, TAFs, PIREPs, domestic/international SIGMETs and Center Weather Advisories. aviation_get_advisories defaults to all three independent products; inspect coverage and partial before interpreting an empty result. TS and CONVECTIVE select thunderstorms across products. Optional altitude_ft rounds to the nearest 100 ft and selects a ±3000 ft band; inspect altitude_selection and per-source altitude_unknown because retained unknown CWA bounds do not prove an altitude match. Cancellation notices are excluded and counted separately. AIRMETs are not served — requests for them are rejected. Optional limit has no default; omit it to retrieve every available match.
 IMPORTANT: This data is for informational purposes only. Flight operations in IMC or controlled airspace require an official preflight briefing from an authorized source (e.g., 1800wxbrief.com).
 Weather tool and preflight station IDs are 4 ASCII letters or digits, case-insensitive and normalized to uppercase (e.g. KSEA, KJFK, K0S9). For an IATA/FAA code, use aviation_find_stations with state or bbox to find the ICAO ID; do not infer a mapping. Station finder also accepts other registry ID shapes.`,
   /**

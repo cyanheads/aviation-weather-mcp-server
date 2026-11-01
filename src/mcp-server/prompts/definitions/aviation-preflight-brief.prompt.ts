@@ -187,7 +187,7 @@ function stationCallBlock(toolName: string, stations: string[], perCall: number)
 
 export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
   description:
-    "Build a preflight weather briefing for a flight. Calls aviation_get_metar, aviation_get_taf, aviation_get_pireps, and aviation_get_advisories in sequence — chunked to each tool's station limit — and synthesizes a weather-risk summary with flight categories, active hazards, and the assessments that could not be made. Provide departure and destination ICAO IDs (e.g., KSEA, KJFK); alternates, planned departure time, cruise altitude, and route waypoints are optional and each narrows one step of the briefing.",
+    "Build a preflight weather briefing for a flight. Calls aviation_get_metar, aviation_get_taf, aviation_get_pireps, and aviation_get_advisories in sequence — chunked to each tool's station limit — and synthesizes a weather-risk summary with flight categories, active hazards, and the assessments that could not be made. Provide departure and destination ICAO IDs (e.g., KSEA, KJFK); optional alternates, planned departure time, cruise altitude, and route waypoints scope the relevant briefing steps.",
   args: z.object({
     departure_icao: z
       .string()
@@ -235,7 +235,7 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
       ])
       .optional()
       .describe(
-        'Optional planned cruise altitude in feet MSL, digits only (e.g., "9500"; "35000" for FL350). Bounds the PIREP search to a ±3,000 ft band around it. Omit it and the briefing still generates, stating that no cruise-level hazard assessment could be made.',
+        'Optional planned cruise altitude in feet MSL, digits only (e.g., "9500"; "35000" for FL350). Bounds the PIREP search to a ±3,000 ft band and supplies advisory altitude_ft, including zero. Omit it and the briefing still generates, stating that no cruise-level hazard assessment could be made.',
       ),
     route_waypoints: z
       .union([
@@ -320,9 +320,13 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
       ? `Pass \`altitude_min_ft: ${cruiseBand.min}\` and \`altitude_max_ft: ${cruiseBand.max}\` — ${bandPhrase(cruiseBand)}`
       : 'No cruise altitude was supplied, so the search cannot be bounded to a cruise level — report the altitudes as flown and state that the cruise-level hazard assessment could not be made';
 
-    const advisoriesCall = routeBbox
+    const advisoryAreaCall = routeBbox
       ? `Call \`aviation_get_advisories\` with \`bbox: { minLat: ${routeBbox.minLat}, minLon: ${routeBbox.minLon}, maxLat: ${routeBbox.maxLat}, maxLon: ${routeBbox.maxLon} }\` — the envelope of the supplied route waypoints widened by ${ROUTE_CORRIDOR_MARGIN_DEG}° on each side. Widen it further if the filed route leaves that box`
       : 'Call `aviation_get_advisories` unfiltered — no route waypoints were supplied, so advisories cannot be bounded to a route corridor; state that the corridor-scoped assessment could not be made';
+    const advisoriesCall =
+      cruiseAltitudeFt === undefined
+        ? advisoryAreaCall
+        : `${advisoryAreaCall.replace(' unfiltered', ' without a geographic filter')}; include \`altitude_ft: ${cruiseAltitudeFt}\` for the planned cruise altitude. Inspect altitude_selection and per-source altitude_unknown; retained unknown bounds do not prove an altitude match`;
 
     const gaps = [
       ...(args.departure_time
@@ -380,7 +384,7 @@ Follow this sequence:
 
 4. **Advisories** — ${advisoriesCall}
    - List active domestic SIGMETs, international SIGMETs (including oceanic products), and Center Weather Advisories; the default advisory_type "all" reads all three
-   - Read coverage and partial before interpreting any empty result. Failed sources, unreadable rows and unlocated geometry are assessment gaps; bbox counts apply after product/hazard selection. If limit withheld matches, omit or raise it before completing the assessment
+   - Read coverage and partial before interpreting any empty result. Failed sources, unreadable rows and unlocated geometry are assessment gaps; bbox counts apply after cancellation removal and product/hazard/altitude selection. If limit withheld matches, omit or raise it before completing the assessment
    - Include valid times and affected altitudes
    - AIRMETs are not available from this server; do not request one. Say so plainly rather than implying the route was cleared of AIRMET-class hazards
 

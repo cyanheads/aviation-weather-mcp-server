@@ -1,6 +1,6 @@
 # aviation-weather-mcp-server - Directory Structure
 
-Generated on: 2026-10-19 01:49:40
+Generated on: 2026-11-01 04:43:53
 
 ```text
 aviation-weather-mcp-server/
@@ -42,6 +42,8 @@ aviation-weather-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -139,6 +141,9 @@ aviation-weather-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── aviation-weather-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -170,6 +175,8 @@ aviation-weather-mcp-server/
 │   ├── prompts/
 │   │   └── aviation-preflight-brief.prompt.test.ts
 │   ├── resources/
+│   ├── scripts/
+│   │   └── clean-mcpb.test.ts
 │   ├── services/
 │   │   └── aviation-weather/
 │   │       ├── advisory-products.test.ts
@@ -203,7 +210,9 @@ aviation-weather-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
