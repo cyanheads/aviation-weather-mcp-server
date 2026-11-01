@@ -1,7 +1,7 @@
 <div align="center">
   <h1>@cyanheads/aviation-weather-mcp-server</h1>
   <p><b>Fetch METARs, TAFs, PIREPs, domestic/international SIGMETs and CWAs from NWS AWC via MCP. AIRMETs not served. STDIO or Streamable HTTP.</b>
-  <div>5 Tools • 1 Prompt</div>
+  <div>5 Tools • 1 Resource • 1 Prompt</div>
   </p>
 </div>
 
@@ -46,6 +46,12 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 | Prompt | Description |
 |:-----|:------------|
 | `aviation_preflight_brief` | Structure a preflight weather briefing for a flight, calling the tools above in sequence and synthesizing a weather-risk summary. |
+
+### Resources
+
+| Resource | Description |
+|:---------|:------------|
+| `skill://aviation-weather-guide/SKILL.md` | [Aviation weather guide](./skills/aviation-weather-guide/SKILL.md) for regional surveys, airport comparisons, and route assessments, with station identity, forecast timing, and incomplete coverage reconciled before drawing conclusions. |
 
 ---
 
@@ -318,6 +324,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/services/aviation-weather` | AWC Data API client — HTTP fetch, retry with exponential backoff, response normalization. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). |
 | `src/mcp-server/prompts` | Prompt definitions (`*.prompt.ts`). |
+| `skills/aviation-weather-guide` | Published assessment guide, available through MCP as `skill://aviation-weather-guide/SKILL.md` and discovered by plugin hosts. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 
 ---
