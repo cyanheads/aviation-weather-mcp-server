@@ -30,7 +30,7 @@ Resolve the airport and available products with aviation_find_stations when need
 
 ### Regional survey
 
-Use aviation_get_metar for current conditions across an area. If the task needs broader station coverage, repeat the survey with smaller boxes and combine stations across the results; this can recover stations a dense parent box omitted, but does not prove completeness. For overlapping results, compare observation timestamps before selecting a station's current reading. Station registry discovery can identify candidates for named-station follow-up, but neither a registry draw nor agreement between draws establishes that every station was found.
+Use aviation_get_metar for current conditions across an area. If the task needs broader station coverage, repeat the survey with smaller boxes and combine stations across the results; this can recover stations a dense parent box omitted, but does not prove completeness. For overlapping results, compare observation timestamps before selecting a station's current reading. Station registry discovery can identify candidates for named-station follow-up. aviation_find_stations state searches select every US registry member assigned to that state or DC from a complete snapshot fresh for up to 24 hours; a supplied limit can withhold matches. Membership follows source assignments, including offshore sites and questionable coordinates, and does not establish weather-report coverage. Bbox registry draws remain subject to the upstream row cap.
 
 When a draw reaches the upstream cap, narrow the search rather than treating a larger response limit as recovery. Distinguish results withheld by a caller-selected limit from records the upstream never returned. A condition filter selects from the available draw and cannot recover omitted stations.
 
@@ -39,6 +39,8 @@ When a draw reaches the upstream cap, narrow the search rather than treating a l
 With direct tool calls, separate current conditions from trends: aviation_get_metar can return several observations per named station. Use their timestamps to select the current reading and retain earlier readings only when evaluating change.
 
 Read aviation_get_taf against the relevant flight times, using the returned period boundaries and change groups. Do not substitute current METAR conditions for a future forecast or imply a forecast covers a time outside its validity. Retain missing forecasts as gaps.
+
+Named aviation_find_stations lookups supply source-published airport magnetic_declination when available, with east-positive signed degrees and exact source text. A null value is unknown; a supplementary lookup failure adds a notice without invalidating station identity. The source supplies no epoch, so do not describe this as a current geomagnetic model or apply an airport value to every PIREP report location.
 
 For route weather, use route coordinates already known to the task when choosing an area search. The server does not geocode named waypoints. PIREPs near departure and destination alone do not establish conditions between them; sparse or absent reports do not establish smooth or ice-free conditions.
 

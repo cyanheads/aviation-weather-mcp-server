@@ -34,6 +34,7 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 const ksea: NormalizedStation = {
+  magnetic_declination: null,
   id: 'KSEA',
   icao_id: 'KSEA',
   iata_id: 'SEA',
@@ -48,6 +49,7 @@ const ksea: NormalizedStation = {
 };
 
 const kbfi: NormalizedStation = {
+  magnetic_declination: null,
   id: 'KBFI',
   icao_id: 'KBFI',
   iata_id: null,
@@ -67,6 +69,7 @@ const kbfi: NormalizedStation = {
  * own; KDCA/KIAD/KBWI all carry VA or MD.
  */
 const wasd2: NormalizedStation = {
+  magnetic_declination: null,
   id: 'WASD2',
   icao_id: null,
   iata_id: null,
@@ -102,6 +105,7 @@ const k2s8: NormalizedStation = {
 
 /** Akutan, AK — AWC carries no elevation for it, so the height is unknown. */
 const kkqa: NormalizedStation = {
+  magnetic_declination: null,
   id: 'KKQA',
   icao_id: 'KKQA',
   iata_id: null,
@@ -485,7 +489,7 @@ describe('aviationFindStations.format', () => {
     const text = (blocks[0] as { type: string; text: string }).text;
 
     expect(text).toContain('**Elevation:** 0 ft');
-    expect(text).not.toContain('unknown');
+    expect(text).not.toContain('**Elevation:** unknown');
   });
 });
 
@@ -507,16 +511,9 @@ describe('aviationFindStations truncation disclosure', () => {
     }));
   }
 
-  /**
-   * Resolve the service mock with `stations`, reporting `preFilterRows` through
-   * the pre-filter channel the way the state mode does. Omit it to model the
-   * modes that run no client-side filter and therefore report nothing.
-   */
-  function mockDraw(stations: NormalizedStation[], preFilterRows?: number) {
-    mockFetchStations.mockImplementation(async (params) => {
-      if (preFilterRows != null) params.onPreFilterRows?.(preFilterRows);
-      return stations;
-    });
+  /** Resolve the service mock with the selected stations. */
+  function mockDraw(stations: NormalizedStation[]) {
+    mockFetchStations.mockResolvedValue(stations);
   }
 
   /** Run the handler and return the enrichment it accumulated. */
@@ -534,29 +531,25 @@ describe('aviationFindStations truncation disclosure', () => {
     ).toMatchObject({ truncated: true, shown: AWC_MAX_ROWS, cap: AWC_MAX_ROWS });
   });
 
-  it('discloses a capped state query whose post-filter count sits below the cap', async () => {
-    // The Texas case from the issue: 400 rows drawn, 279 of them in-state. The
-    // count alone reads as headroom, so the pre-filter draw has to be stated.
-    mockDraw(page(279), AWC_MAX_ROWS);
+  it('does not apply the stationinfo cap to a state snapshot', async () => {
+    mockDraw(page(279));
 
     expect(await enrichmentFor({ state: 'TX' })).toMatchObject({
-      truncated: true,
+      truncated: false,
       shown: 279,
-      cap: AWC_MAX_ROWS,
-      upstreamRows: AWC_MAX_ROWS,
     });
   });
 
-  it('names a smaller bbox as the lever on a capped state query', async () => {
-    mockDraw(page(279), AWC_MAX_ROWS);
+  it('names limit as the response size lever on a complete state query', async () => {
+    mockDraw(page(279));
     const notice = String((await enrichmentFor({ state: 'TX' })).notice);
 
-    expect(notice).toContain('bbox');
-    expect(notice).toContain('TX');
+    expect(notice).toContain('limit');
+    expect(notice).not.toContain('capped');
   });
 
   it('states completeness affirmatively on an uncapped draw', async () => {
-    mockDraw([ksea, kbfi], 2);
+    mockDraw([ksea, kbfi]);
     const enrichment = await enrichmentFor({ state: 'WA' });
 
     expect(enrichment).toMatchObject({ truncated: false, shown: 2 });
@@ -576,18 +569,16 @@ describe('aviationFindStations truncation disclosure', () => {
     expect(enrichment).not.toHaveProperty('upstreamRows');
   });
 
-  it('omits the pre-filter count when the state filter dropped nothing', async () => {
-    // A capped draw entirely inside the requested state: the truncation still
-    // stands, but the drawn count equals `shown` and restates it.
-    mockDraw(page(AWC_MAX_ROWS), AWC_MAX_ROWS);
+  it('omits the upstream count on a complete state snapshot at the API cap', async () => {
+    mockDraw(page(AWC_MAX_ROWS));
     const enrichment = await enrichmentFor({ state: 'TX' });
 
-    expect(enrichment).toMatchObject({ truncated: true, shown: AWC_MAX_ROWS });
+    expect(enrichment).toMatchObject({ truncated: false, shown: AWC_MAX_ROWS });
     expect(enrichment).not.toHaveProperty('upstreamRows');
   });
 
   it('leaves an empty result an error rather than a truncation disclosure', async () => {
-    mockDraw([], AWC_MAX_ROWS);
+    mockDraw([]);
     const ctx = createMockContext({ errors: aviationFindStations.errors });
     const input = aviationFindStations.input.parse({ state: 'TX' });
 
@@ -598,25 +589,22 @@ describe('aviationFindStations truncation disclosure', () => {
   });
 
   it('reaches structuredContent and content[] through the real tool pipeline', async () => {
-    mockDraw(page(279), AWC_MAX_ROWS);
+    mockDraw(page(279));
     const result = await runToolContract(aviationFindStations, { state: 'TX' });
 
     expect(result.structuredContent).toMatchObject({
-      truncated: true,
+      truncated: false,
       shown: 279,
-      cap: AWC_MAX_ROWS,
-      upstreamRows: AWC_MAX_ROWS,
     });
 
-    // A client reading only content[] must learn the same two facts: the result
-    // was cut, and a smaller bbox is what recovers the rest.
+    // Both surfaces affirm completeness and name the response-size lever.
     const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
-    expect(text).toContain(String(AWC_MAX_ROWS));
-    expect(text).toContain('bbox');
+    expect(text).toContain('**Truncated at the upstream row cap:** false');
+    expect(text).toContain('limit');
   });
 
   it('leaves the stations payload and its rendering untouched', async () => {
-    mockDraw([ksea], AWC_MAX_ROWS);
+    mockDraw([ksea]);
     const result = await runToolContract(aviationFindStations, { state: 'WA' });
 
     expect(result.structuredContent).toMatchObject({
@@ -1184,11 +1172,8 @@ describe('aviationFindStations request limit', () => {
     }));
   }
 
-  function mockDraw(stations: NormalizedStation[], preFilterRows?: number) {
-    mockFetchStations.mockImplementation(async (params) => {
-      if (preFilterRows != null) params.onPreFilterRows?.(preFilterRows);
-      return stations;
-    });
+  function mockDraw(stations: NormalizedStation[]) {
+    mockFetchStations.mockResolvedValue(stations);
   }
 
   /** Run the handler and return both the payload and the enrichment. */
@@ -1199,7 +1184,7 @@ describe('aviationFindStations request limit', () => {
   }
 
   it('bounds a state search below the match count', async () => {
-    mockDraw(page(270), 349);
+    mockDraw(page(270));
     const { result, enrichment } = await runFor({ state: 'CA', limit: 25 });
 
     expect(result.stations).toHaveLength(25);
@@ -1326,7 +1311,7 @@ describe('aviationFindStations request limit', () => {
   });
 
   it('names the limit in the notice without calling it the upstream cap', async () => {
-    mockDraw(page(270), 349);
+    mockDraw(page(270));
     const { enrichment } = await runFor({ state: 'CA', limit: 25 });
     const notice = String(enrichment.notice);
 
@@ -1336,17 +1321,13 @@ describe('aviationFindStations request limit', () => {
     expect(notice).toMatch(/ordered by ICAO identifier ascending/);
   });
 
-  it('discloses a capped draw and a request limit as two separate facts', async () => {
-    // Texas: 400 rows drawn, 279 in-state, the caller asked for 20. All three
-    // numbers are different and none of them implies another.
-    mockDraw(page(279, 'TX'), AWC_MAX_ROWS);
+  it('discloses a state snapshot limit without inventing a capped draw', async () => {
+    mockDraw(page(279, 'TX'));
     const { result, enrichment } = await runFor({ state: 'TX', limit: 20 });
 
     expect(result.stations).toHaveLength(20);
     expect(enrichment).toMatchObject({
-      truncated: true,
-      cap: AWC_MAX_ROWS,
-      upstreamRows: AWC_MAX_ROWS,
+      truncated: false,
       shown: 20,
       limited: true,
       matched: 279,
@@ -1354,27 +1335,24 @@ describe('aviationFindStations request limit', () => {
   });
 
   it('keeps the two statements distinguishable in the shared notice', async () => {
-    mockDraw(page(279, 'TX'), AWC_MAX_ROWS);
+    mockDraw(page(279, 'TX'));
     const notice = String((await runFor({ state: 'TX', limit: 20 })).enrichment.notice);
 
-    // The cap: rows were never drawn, and a smaller box is the lever.
-    expect(notice).toContain('per-request maximum');
-    expect(notice).toContain('bbox');
+    // A complete state snapshot needs no cap-recovery guidance.
+    expect(notice).not.toContain('per-request maximum');
+    expect(notice).not.toContain('bbox');
     // The limit: rows were drawn and examined, and raising it returns them.
     expect(notice).toMatch(/not the upstream cap/i);
     expect(notice).toMatch(/every station counted here was examined/i);
-    // And the count the limit selected from is scoped to the capped draw.
-    expect(notice).toMatch(/279 station\(s\) that matched inside the capped draw/);
+    // The limit count covers every matching station.
+    expect(notice).toContain('279 matching station(s)');
   });
 
-  it('keeps upstreamRows keyed on the state filter, not on the limit', async () => {
-    // A capped draw entirely inside the state: the limit cut the result, but
-    // no client-side filter moved the drawn count, so restating it would only
-    // repeat what the cap already said.
-    mockDraw(page(AWC_MAX_ROWS, 'TX'), AWC_MAX_ROWS);
+  it('omits upstreamRows when a limit cuts a complete state snapshot', async () => {
+    mockDraw(page(AWC_MAX_ROWS, 'TX'));
     const { enrichment } = await runFor({ state: 'TX', limit: 20 });
 
-    expect(enrichment).toMatchObject({ truncated: true, limited: true, matched: AWC_MAX_ROWS });
+    expect(enrichment).toMatchObject({ truncated: false, limited: true, matched: AWC_MAX_ROWS });
     expect(enrichment).not.toHaveProperty('upstreamRows');
   });
 
@@ -1464,12 +1442,11 @@ describe('aviationFindStations request limit', () => {
   });
 
   it('reaches structuredContent and content[] through the real tool pipeline', async () => {
-    mockDraw(page(279, 'TX'), AWC_MAX_ROWS);
+    mockDraw(page(279, 'TX'));
     const result = await runToolContract(aviationFindStations, { state: 'TX', limit: 20 });
 
     expect(result.structuredContent).toMatchObject({
-      truncated: true,
-      cap: AWC_MAX_ROWS,
+      truncated: false,
       shown: 20,
       limited: true,
       matched: 279,
@@ -1481,7 +1458,7 @@ describe('aviationFindStations request limit', () => {
     const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
     expect(text).toContain('**Limited by the request:** true');
     expect(text).toContain('**Stations matched before the limit:** 279');
-    expect(text).toContain('**Truncated at the upstream row cap:** true');
+    expect(text).toContain('**Truncated at the upstream row cap:** false');
     expect(text).toMatch(/not the upstream cap/i);
   });
 
@@ -1507,7 +1484,7 @@ describe('aviationFindStations request limit', () => {
 describe('aviationFindStations size notice', () => {
   const box = { minLat: 32, minLon: -124, maxLat: 42, maxLon: -114 };
   /** The station count above which a call that set no limit is told about it. */
-  const THRESHOLD = 130;
+  const THRESHOLD = 110;
 
   /** Distinct stations in reverse identifier order, so any reordering shows. */
   function page(count: number, state = 'CA'): NormalizedStation[] {
@@ -1517,11 +1494,8 @@ describe('aviationFindStations size notice', () => {
     });
   }
 
-  function mockDraw(stations: NormalizedStation[], preFilterRows?: number) {
-    mockFetchStations.mockImplementation(async (params) => {
-      if (preFilterRows != null) params.onPreFilterRows?.(preFilterRows);
-      return stations;
-    });
+  function mockDraw(stations: NormalizedStation[]) {
+    mockFetchStations.mockResolvedValue(stations);
   }
 
   /** Run the handler and return both the payload and the enrichment. */
@@ -1534,7 +1508,7 @@ describe('aviationFindStations size notice', () => {
   it('keeps the rows, their upstream order, and every non-notice field of a large unbounded result', async () => {
     // Characterization — the size sentence may only add to `notice`.
     const stations = page(THRESHOLD + 1);
-    mockDraw(stations, THRESHOLD + 40);
+    mockDraw(stations);
     const { result, enrichment } = await runFor({ state: 'CA' });
     const { notice, ...rest } = enrichment;
 
@@ -1577,22 +1551,21 @@ describe('aviationFindStations size notice', () => {
     expect(notice).not.toContain('no limit was set');
   });
 
-  it('compares the threshold against the stations the state filter left', async () => {
-    // 300 rows drawn (under the cap), 130 in-state: the filter is what the caller sees.
-    mockDraw(page(THRESHOLD), 300);
+  it('compares the threshold against the selected state stations', async () => {
+    mockDraw(page(THRESHOLD));
 
     expect((await runFor({ state: 'CA' })).enrichment).not.toHaveProperty('notice');
   });
 
-  it('follows the cap guidance on a capped result, in one notice', async () => {
-    mockDraw(page(279, 'TX'), AWC_MAX_ROWS);
+  it('gives only size guidance on a complete state snapshot', async () => {
+    mockDraw(page(279, 'TX'));
     const { enrichment } = await runFor({ state: 'TX' });
     const notice = String(enrichment.notice);
 
-    expect(enrichment).toMatchObject({ truncated: true, shown: 279, upstreamRows: AWC_MAX_ROWS });
-    expect(notice).toContain('per-request maximum');
+    expect(enrichment).toMatchObject({ truncated: false, shown: 279 });
+    expect(enrichment).not.toHaveProperty('upstreamRows');
+    expect(notice).not.toContain('per-request maximum');
     expect(notice).toContain('279 stations because no limit was set');
-    expect(notice.indexOf('per-request maximum')).toBeLessThan(notice.indexOf('no limit was set'));
   });
 
   it('never carries the size sentence on an identifier lookup', async () => {

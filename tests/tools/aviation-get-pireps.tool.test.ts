@@ -35,6 +35,7 @@ beforeEach(() => {
 
 /** PIREP at FL270 with both turbulence and icing layers. */
 const pirep: NormalizedPirep = {
+  braking_action: null,
   observed_at: '2026-01-15T18:30:00.000Z',
   lat: 47.5,
   lon: -122.3,
@@ -64,6 +65,7 @@ const pirep: NormalizedPirep = {
  * report whose weather the tool used to publish as `remarks`.
  */
 const aloftPirep: NormalizedPirep = {
+  braking_action: null,
   observed_at: '2026-01-15T15:12:00.000Z',
   lat: 35.1,
   lon: -113.8,
@@ -82,6 +84,7 @@ const aloftPirep: NormalizedPirep = {
 
 /** Minimal PIREP — most optional fields null/empty. */
 const minimalPirep: NormalizedPirep = {
+  braking_action: null,
   observed_at: '2026-01-15T17:00:00.000Z',
   lat: 45.0,
   lon: -120.0,
@@ -103,6 +106,7 @@ const minimalPirep: NormalizedPirep = {
  * is unknown rather than ground level. The OVC024 layer has a base and no top.
  */
 const unknownAltitudePirep: NormalizedPirep = {
+  braking_action: null,
   observed_at: '2026-01-15T16:00:00.000Z',
   lat: 41.0,
   lon: -81.4,
@@ -121,6 +125,7 @@ const unknownAltitudePirep: NormalizedPirep = {
 
 /** A `SK CLR` report — the cover is the whole message; there is no layer to bound. */
 const clearSkyPirep: NormalizedPirep = {
+  braking_action: null,
   observed_at: '2026-01-15T15:00:00.000Z',
   lat: 41.9,
   lon: -87.9,
@@ -139,6 +144,7 @@ const clearSkyPirep: NormalizedPirep = {
 
 /** A reported `/FL000/` — a flight level of zero, not a missing altitude. */
 const groundLevelPirep: NormalizedPirep = {
+  braking_action: null,
   observed_at: '2026-01-15T14:00:00.000Z',
   lat: 38.0,
   lon: -87.5,
@@ -1225,6 +1231,42 @@ describe('aviationGetPireps temperature, wind, and weather', () => {
     return { structured: result.structuredContent as { pireps: unknown[] }, text };
   }
 
+  it.each(['PIREP', 'Urgent PIREP', 'AIREP', 'AMDAR', 'Future report'])(
+    'preserves %s heading, calm wind reference and braking independently',
+    async (pirep_type) => {
+      const { structured, text } = await surfaces([
+        {
+          ...minimalPirep,
+          pirep_type,
+          wind: { direction_deg: 0, speed_kt: 0 },
+          braking_action: 'FUTURE',
+        },
+      ]);
+      expect(structured.pireps).toEqual([
+        expect.objectContaining({
+          pirep_type,
+          braking_action: 'FUTURE',
+          wind: { direction_deg: 0, speed_kt: 0 },
+        }),
+      ]);
+      expect(text).toContain(`## ${pirep_type} —`);
+      expect(text).toContain('**Braking action:** FUTURE');
+      expect(text).toContain(
+        pirep_type === 'PIREP' || pirep_type === 'Urgent PIREP'
+          ? '**Wind:** 0° magnetic at 0 kt'
+          : '**Wind:** 0° at 0 kt',
+      );
+      expect(text).toContain(minimalPirep.raw_pirep);
+    },
+  );
+
+  it('renders braking without wind and omits absent braking', async () => {
+    const { text } = await surfaces([{ ...minimalPirep, braking_action: 'MED' }]);
+    expect(text).toContain('**Braking action:** MED');
+    expect(text).not.toContain('**Wind:**');
+    expect((await surfaces([minimalPirep])).text).not.toContain('**Braking action:**');
+  });
+
   it('publishes temperature, wind, and weather on both surfaces', async () => {
     const { structured, text } = await surfaces([aloftPirep]);
 
@@ -1841,7 +1883,13 @@ describe('aviationGetPireps request limit', () => {
     mockFetchPireps.mockClear();
     await runFor({ bbox: conus, hours: 12 }, page(50));
 
-    expect(withLimit).toEqual(mockFetchPireps.mock.calls[0]![0]);
+    const { onCandidateRows: _count, onRadiusUnavailable: _radius, ...limitedQuery } = withLimit;
+    const {
+      onCandidateRows: _nextCount,
+      onRadiusUnavailable: _nextRadius,
+      ...unlimitedQuery
+    } = mockFetchPireps.mock.calls[0]![0];
+    expect(limitedQuery).toEqual(unlimitedQuery);
     expect(withLimit).not.toHaveProperty('limit');
   });
 

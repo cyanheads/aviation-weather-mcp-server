@@ -6,12 +6,20 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { McpError, serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
+import {
+  JsonRpcErrorCode,
+  McpError,
+  serviceUnavailable,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { type AdvisoryParams, fetchAdvisoryProducts } from './advisory-products.js';
-import { STATE_BBOXES } from './state-bboxes.js';
+import { isUpstreamCapped } from './awc-limits.js';
+import { enrichStationMagneticDeclination } from './station-magnetic-declination.js';
+import { StationSnapshot } from './station-snapshot.js';
+import { isSupportedState } from './supported-states.js';
 import type {
   MetarCeilingType,
   NormalizedAdvisory,
@@ -35,6 +43,9 @@ import type {
   RawTafCloudLayer,
   RawTafForecastPeriod,
 } from './types.js';
+
+/** Mean spherical Earth radius in nautical miles for PIREP search geometry. */
+const EARTH_RADIUS_NM = 3440.065;
 
 // ---------------------------------------------------------------------------
 // Weather code decoder
@@ -604,6 +615,7 @@ function normalizePirep(raw: RawPirep): NormalizedPirep {
     lon: raw.lon,
     altitude_ft: pirepAltitudeFeet(raw),
     aircraft_type: raw.acType ?? null,
+    braking_action: raw.brkAction?.trim() ? raw.brkAction : null,
     pirep_type: raw.pirepType ?? 'PIREP',
     turbulence,
     icing,
@@ -630,7 +642,8 @@ function normalizeStation(raw: RawStationInfo): NormalizedStation {
     elevation_ft: raw.elev != null ? metersToFeet(raw.elev) : null,
     state: raw.state ?? '',
     country: raw.country ?? '',
-    data_types: raw.siteType ?? [],
+    data_types: [...(raw.siteType ?? [])],
+    magnetic_declination: null,
   };
 }
 
@@ -692,6 +705,7 @@ function withAwcErrorText(error: unknown): unknown {
 export class AviationWeatherService {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
+  private readonly stationSnapshot = new StationSnapshot();
 
   constructor(_config: AppConfig, _storage: StorageService) {
     const serverConfig = getServerConfig();
@@ -710,7 +724,13 @@ export class AviationWeatherService {
    * A 4xx carrying AWC's error envelope is re-raised with AWC's text as its
    * message (`withAwcErrorText`), for every endpoint this service calls.
    */
-  private fetchJson<T>(url: string, ctx: Context, strictBody = false): Promise<T> {
+  private fetchJson<T>(
+    url: string,
+    ctx: Context,
+    strictBody = false,
+    deadlineMs?: number,
+    retry = true,
+  ): Promise<T> {
     return withRetry(
       async (attempt) => {
         let response: Response;
@@ -724,7 +744,31 @@ export class AviationWeatherService {
         // AWC returns HTTP 204 with empty body when no data matches the query.
         // Treat this as an empty result — callers guard with `if (!Array.isArray(raw)) return []`.
         if (response.status === 204) return [] as T;
-        const text = await response.text();
+        let text: string;
+        try {
+          text = await response.text();
+        } catch (cause) {
+          attempt.signal.throwIfAborted();
+          const transportError =
+            cause instanceof Error && 'code' in cause
+              ? cause
+              : cause instanceof Error
+                ? cause.cause
+                : undefined;
+          const transportCode =
+            transportError instanceof Error && 'code' in transportError
+              ? transportError.code
+              : undefined;
+          if (
+            typeof transportCode !== 'string' ||
+            !['UND_ERR_SOCKET', 'ECONNRESET', 'ECONNABORTED', 'EPIPE', 'ETIMEDOUT'].includes(
+              transportCode,
+            )
+          )
+            throw cause;
+          throw serviceUnavailable('AWC API response could not be read.', undefined, { cause });
+        }
+        attempt.signal.throwIfAborted();
         // Detect HTML error pages from upstream
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
           throw serviceUnavailable(
@@ -760,7 +804,8 @@ export class AviationWeatherService {
         context: ctx,
         baseDelayMs: 1000,
         signal: ctx.signal,
-        ...(strictBody ? { deadlineMs: 45_000 } : {}),
+        ...(!retry ? { isTransient: () => false } : {}),
+        ...(strictBody || deadlineMs != null ? { deadlineMs: deadlineMs ?? 45_000 } : {}),
       },
     );
   }
@@ -815,9 +860,9 @@ export class AviationWeatherService {
   }
 
   /**
-   * Fetch PIREPs for a station + distance, or bbox. `distanceNm` is a radius
-   * around `stationId` and is not sent in bbox mode — the upstream `distance`
-   * parameter is only meaningful relative to the `id` center point.
+   * Fetch PIREPs inside a nautical-mile station circle or an explicit bbox.
+   * Resolve the primary stationinfo position without magnetic enrichment.
+   * Missing positions retain the legacy center search with a radius warning.
    *
    * The pirep endpoint names its lookback `age` ("Hours Back"), unlike the
    * metar/taf endpoints' `hours`, and silently drops query keys it does not
@@ -836,21 +881,115 @@ export class AviationWeatherService {
       hours: number;
       level?: number;
       minIntensity?: 'lgt' | 'mod' | 'sev';
+      onCandidateRows?: (rows: number, capped: boolean, draws: number) => void;
+      onRadiusUnavailable?: () => void;
     },
     ctx: Context,
   ): Promise<NormalizedPirep[]> {
-    let url: string;
+    const deadlineMs = Math.max(45_000, this.timeoutMs);
+    const requestAbort = new AbortController();
+    const signal = AbortSignal.any([
+      ctx.signal,
+      AbortSignal.timeout(deadlineMs),
+      requestAbort.signal,
+    ]);
+    const context = { ...ctx, signal };
+    let center: NormalizedStation | undefined;
+    let boxes = !params.stationId && params.bbox ? [params.bbox] : [];
+    const urls: string[] = [];
     if (params.stationId) {
-      url = `${this.baseUrl}/pirep?id=${encodeURIComponent(params.stationId)}&format=json&distance=${params.distanceNm}&age=${params.hours}`;
-    } else if (params.bbox) {
-      const { minLat, minLon, maxLat, maxLon } = params.bbox;
-      url = `${this.baseUrl}/pirep?bbox=${minLat},${minLon},${maxLat},${maxLon}&format=json&age=${params.hours}`;
-    } else {
+      const stationId = params.stationId.toUpperCase();
+      const lookupSignal = AbortSignal.any([signal, AbortSignal.timeout(3_000)]);
+      let stations: RawStationInfo[] = [];
+      try {
+        stations = await this.fetchJson<RawStationInfo[]>(
+          `${this.baseUrl}/stationinfo?ids=${encodeURIComponent(stationId)}&format=json`,
+          { ...ctx, signal: lookupSignal },
+          false,
+          3_000,
+          false,
+        );
+        lookupSignal.throwIfAborted();
+      } catch (error) {
+        signal.throwIfAborted();
+        const operational =
+          (lookupSignal.aborted &&
+            (error === lookupSignal.reason ||
+              (error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name)))) ||
+          (error instanceof McpError &&
+            [
+              JsonRpcErrorCode.InvalidParams,
+              JsonRpcErrorCode.ServiceUnavailable,
+              JsonRpcErrorCode.Timeout,
+              JsonRpcErrorCode.RateLimited,
+              JsonRpcErrorCode.NotFound,
+              JsonRpcErrorCode.Unauthorized,
+              JsonRpcErrorCode.Forbidden,
+            ].includes(error.code));
+        if (!operational) throw error;
+      }
+      const station = Array.isArray(stations)
+        ? stations.find(
+            (row) => row.id?.toUpperCase() === stationId || row.icaoId?.toUpperCase() === stationId,
+          )
+        : undefined;
+      if (
+        station &&
+        Number.isFinite(station.lat) &&
+        Math.abs(station.lat) <= 90 &&
+        Number.isFinite(station.lon) &&
+        Math.abs(station.lon) <= 180
+      ) {
+        center = normalizeStation(station);
+        const radius = (params.distanceNm ?? 100) / EARTH_RADIUS_NM;
+        const lat = (center.lat * Math.PI) / 180;
+        const minLat = Math.max(-90, ((lat - radius) * 180) / Math.PI);
+        const maxLat = Math.min(90, ((lat + radius) * 180) / Math.PI);
+        const longitudeSpan =
+          minLat === -90 || maxLat === 90
+            ? 180
+            : (Math.asin(Math.min(1, Math.sin(radius) / Math.cos(lat))) * 180) / Math.PI;
+        const minLon = center.lon - longitudeSpan;
+        const maxLon = center.lon + longitudeSpan;
+        // A wrapped envelope is two ordinary queries; each draw has its own cap.
+        boxes =
+          longitudeSpan === 180
+            ? [{ minLat, minLon: -180, maxLat, maxLon: 180 }]
+            : minLon < -180
+              ? [
+                  { minLat, minLon: minLon + 360, maxLat, maxLon: 180 },
+                  { minLat, minLon: -180, maxLat, maxLon },
+                ]
+              : maxLon > 180
+                ? [
+                    { minLat, minLon, maxLat, maxLon: 180 },
+                    { minLat, minLon: -180, maxLat, maxLon: maxLon - 360 },
+                  ]
+                : [{ minLat, minLon, maxLat, maxLon }];
+        /** Full double precision is rejected by AWC; accepted outward rounding preserves enclosure. */
+        boxes = boxes.map((box) => ({
+          minLat: Math.floor(box.minLat * 10_000) / 10_000,
+          minLon: Math.floor(box.minLon * 10_000) / 10_000,
+          maxLat: Math.ceil(box.maxLat * 10_000) / 10_000,
+          maxLon: Math.ceil(box.maxLon * 10_000) / 10_000,
+        }));
+      } else {
+        params.onRadiusUnavailable?.();
+        urls.push(
+          `${this.baseUrl}/pirep?id=${encodeURIComponent(stationId)}&format=json&distance=${params.distanceNm ?? 100}&age=${params.hours}`,
+        );
+      }
+    } else if (!params.bbox) {
       throw serviceUnavailable('Either stationId or bbox is required for PIREPs');
     }
+    urls.push(
+      ...boxes.map(
+        ({ minLat, minLon, maxLat, maxLon }) =>
+          `${this.baseUrl}/pirep?bbox=${minLat},${minLon},${maxLat},${maxLon}&format=json&age=${params.hours}`,
+      ),
+    );
     // FL000 is a real centre, so the level check is against null, not falsiness.
-    if (params.level != null) url += `&level=${params.level}`;
-    if (params.minIntensity) url += `&inten=${params.minIntensity}`;
+    const filters = `${params.level != null ? `&level=${params.level}` : ''}${params.minIntensity ? `&inten=${params.minIntensity}` : ''}`;
     ctx.log.debug('Fetching PIREPs', {
       stationId: params.stationId,
       hasBbox: !!params.bbox,
@@ -859,9 +998,60 @@ export class AviationWeatherService {
       flightLevel: params.level,
       minIntensity: params.minIntensity,
     });
-    const raw = await this.fetchJson<RawPirep[]>(url, ctx);
-    if (!Array.isArray(raw)) return [];
-    return raw.map(normalizePirep);
+    const draws = await Promise.all(
+      urls.map(async (url) => {
+        try {
+          return await this.fetchJson<RawPirep[]>(url + filters, context, false, deadlineMs);
+        } catch (error) {
+          requestAbort.abort(error);
+          throw error;
+        }
+      }),
+    );
+    signal.throwIfAborted();
+    const pages = draws.map((draw) => (Array.isArray(draw) ? draw : []));
+    params.onCandidateRows?.(
+      pages.reduce((sum, page) => sum + page.length, 0),
+      pages.some((page) => isUpstreamCapped(page.length)),
+      pages.length,
+    );
+    const reports = pages.flat();
+    const unique =
+      pages.length > 1
+        ? [
+            ...new Map(
+              reports.map((report) => [
+                JSON.stringify([
+                  report.rawOb,
+                  report.obsTime,
+                  report.lat,
+                  report.lon,
+                  report.icaoId,
+                ]),
+                report,
+              ]),
+            ).values(),
+          ]
+        : reports;
+    const origin = center;
+    return unique
+      .filter((report) => {
+        if (!origin) return true;
+        const dLat = ((report.lat - origin.lat) * Math.PI) / 180;
+        const dLon = ((report.lon - origin.lon) * Math.PI) / 180;
+        const a =
+          Math.sin(dLat / 2) ** 2 +
+          Math.cos((origin.lat * Math.PI) / 180) *
+            Math.cos((report.lat * Math.PI) / 180) *
+            Math.sin(dLon / 2) ** 2;
+        const radiusNm = params.distanceNm ?? 100;
+        // Roundoff at an exact boundary must not turn inclusion into exclusion.
+        return (
+          2 * EARTH_RADIUS_NM * Math.asin(Math.min(1, Math.sqrt(a))) <=
+          radiusNm + 4 * Number.EPSILON * radiusNm
+        );
+      })
+      .map(normalizePirep);
   }
 
   /**
@@ -882,25 +1072,20 @@ export class AviationWeatherService {
   /**
    * Fetch station info by ICAO IDs, bbox, or US state.
    *
-   * The state mode is a bbox draw filtered on each station's `state` field in
-   * here, so its return value is smaller than the page the upstream row cap
-   * applied to. `onPreFilterRows` hands that drawn size back — without it a
-   * capped state query is indistinguishable from a complete one, since the
-   * count the caller receives sits well below the cap either way. The other two
-   * modes return their draw unfiltered and so report nothing; there the rows
-   * returned are the rows drawn.
+   * State mode selects US registry membership from one complete, validated
+   * snapshot fresh for 24 hours. Bbox/identifier modes retain stationinfo;
+   * identifiers also request supplementary source-published airport variation.
    */
   async fetchStations(
     params: {
       stationIds?: string[];
       bbox?: { minLat: number; minLon: number; maxLat: number; maxLon: number };
       state?: string;
-      onPreFilterRows?: (rows: number) => void;
+      onMagneticDeclinationUnavailable?: () => void;
     },
     ctx: Context,
   ): Promise<NormalizedStation[]> {
     let url: string;
-    let stateFilter: string | undefined;
 
     if (params.stationIds && params.stationIds.length > 0) {
       const ids = params.stationIds.join(',');
@@ -909,18 +1094,21 @@ export class AviationWeatherService {
       const { minLat, minLon, maxLat, maxLon } = params.bbox;
       url = `${this.baseUrl}/stationinfo?bbox=${minLat},${minLon},${maxLat},${maxLon}&format=json`;
     } else if (params.state) {
-      // State→bbox workaround: API does not support state parameter directly
       const stateUpper = params.state.toUpperCase();
-      const bbox = STATE_BBOXES[stateUpper];
-      if (!bbox) {
+      if (!isSupportedState(stateUpper)) {
         // Bad client input, not an upstream outage — callers should reach the
         // tool's invalid_state guard first, which carries the recovery hint.
-        throw validationError(`No bounding box available for state: ${params.state}`, {
+        throw validationError(`Unsupported state: ${params.state}`, {
           state: params.state,
         });
       }
-      url = `${this.baseUrl}/stationinfo?bbox=${bbox.minLat},${bbox.minLon},${bbox.maxLat},${bbox.maxLon}&format=json`;
-      stateFilter = stateUpper;
+      const cacheUrl = new URL('/data/cache/stations.cache.json.gz', this.baseUrl).href;
+      const rows = await this.stationSnapshot.get(cacheUrl, this.timeoutMs, ctx);
+      return rows
+        .filter(
+          (row) => row.country?.toUpperCase() === 'US' && row.state?.toUpperCase() === stateUpper,
+        )
+        .map(normalizeStation);
     } else {
       throw serviceUnavailable('Either stationIds, bbox, or state is required for station lookup');
     }
@@ -930,18 +1118,24 @@ export class AviationWeatherService {
       hasBbox: !!params.bbox,
       state: params.state,
     });
-    const raw = await this.fetchJson<RawStationInfo[]>(url, ctx);
+    const raw = await this.fetchJson<RawStationInfo[]>(
+      url,
+      ctx,
+      false,
+      Math.max(45_000, this.timeoutMs),
+    );
     if (!Array.isArray(raw)) return [];
 
-    let stations = raw.map(normalizeStation);
-
-    // Client-side state filter when using the bbox workaround
-    if (stateFilter) {
-      params.onPreFilterRows?.(stations.length);
-      stations = stations.filter((s) => s.state && s.state.toUpperCase() === stateFilter);
-    }
-
-    return stations;
+    const stations = raw.map(normalizeStation);
+    return params.stationIds?.length
+      ? enrichStationMagneticDeclination(
+          stations,
+          this.baseUrl,
+          this.timeoutMs,
+          ctx,
+          params.onMagneticDeclinationUnavailable,
+        )
+      : stations;
   }
 }
 

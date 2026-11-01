@@ -124,7 +124,7 @@ export interface RawPirep {
   lat: number;
   lon: number;
   obsTime: number; // Unix epoch seconds
-  pirepType: string | null; // 'PIREP' | 'AIREP'
+  pirepType: string | null; // PIREP, Urgent PIREP, AIREP, AMDAR; open source vocabulary.
   qcField?: number | null;
   rawOb: string;
   receiptTime: string;
@@ -374,12 +374,14 @@ export interface NormalizedPirep {
   aircraft_type: string | null;
   /** Null when the report gave no flight level (`/FLUNKN/`, `/FLDURC/`, `/FLDURD/`). */
   altitude_ft: number | null;
+  /** Decoded source braking action; null when absent, never inferred from remarks. */
+  braking_action: string | null;
   clouds: NormalizedPirepCloudLayer[] | null;
   icing: NormalizedIcingLayer[];
   lat: number;
   lon: number;
   observed_at: string; // ISO 8601
-  pirep_type: string; // 'PIREP' | 'AIREP'
+  pirep_type: string; // PIREP, Urgent PIREP, AIREP, AMDAR; open source vocabulary.
   raw_pirep: string;
   /** Outside air temperature in °C. Null when absent or reported unknown; 0 is a reading. */
   temp_c: number | null;
@@ -475,6 +477,8 @@ export interface NormalizedStation {
   id: string;
   lat: number;
   lon: number;
+  /** Source-published variation, east positive; unknown syntax retains source text. */
+  magnetic_declination?: { degrees: number | null; source: string } | null;
   name: string;
   state: string;
 }

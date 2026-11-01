@@ -56,7 +56,7 @@ describe('station case at the framework boundary', () => {
       vi.mocked(fetchWithTimeout).mockResolvedValue(new Response(null, { status: 204 }));
       const result = await runToolContract(tool, input);
       expect(
-        new URL(String(vi.mocked(fetchWithTimeout).mock.calls[0]?.[0])).searchParams.get(key),
+        new URL(String(vi.mocked(fetchWithTimeout).mock.calls.at(-1)?.[0])).searchParams.get(key),
       ).toBe(value);
       expect(result.structuredContent).toMatchObject({
         error: { data: { reason, recovery: { hint: expect.any(String) } } },

@@ -9,7 +9,7 @@ import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 import { AWC_MAX_ROWS, isUpstreamCapped } from '@/services/aviation-weather/awc-limits.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
-import { isSupportedState } from '@/services/aviation-weather/state-bboxes.js';
+import { isSupportedState } from '@/services/aviation-weather/supported-states.js';
 import type { NormalizedStation } from '@/services/aviation-weather/types.js';
 
 /** Bounding box schema shared across tools. */
@@ -120,7 +120,7 @@ function limitNotice(shown: number, matched: number, capped: boolean): string {
  * framework's 24,000-byte overflow budget at the heaviest measured per-station
  * cost — see decision 36 in docs/design.md.
  */
-const SIZE_NOTICE_THRESHOLD = 130;
+const SIZE_NOTICE_THRESHOLD = 110;
 
 /**
  * The size lever, for an area result that is large only because the call set
@@ -139,12 +139,12 @@ function sizeNotice(shown: number): string {
  */
 function upstreamRejectionHint(mode: 'station_ids' | 'bbox' | 'state'): string {
   if (mode === 'station_ids') {
-    return 'Each station_ids entry must be one identifier on its own, with no embedded space, comma, or other separator — split a combined value into separate entries. To search by location use bbox or state instead.';
+    return 'Each station_ids token must be one identifier with no embedded space or separator other than commas between tokens. To search by location use bbox or state instead.';
   }
   if (mode === 'bbox') {
     return 'The bounding box this call sent was refused rather than answered. Retry with a smaller box, or name the stations directly with station_ids.';
   }
-  return 'The state search builds its own bounding box, so the state code is not what needs changing. Search the same area with an explicit bbox, or name the stations directly with station_ids.';
+  return 'The complete state registry could not be read. Retry the state search, use an explicit bbox, or name the stations directly with station_ids.';
 }
 
 /**
@@ -178,13 +178,13 @@ export const aviationFindStations = tool('aviation_find_stations', {
           // identifier at all, so a shape constraint would reject a working
           // search. Empty and whitespace-only are the only rejectable entries.
           .regex(/\S/, 'Each station_ids entry must not be empty or whitespace-only.')
-          .describe('One station identifier (e.g., KSEA).'),
+          .describe('One station identifier or comma-separated identifiers (e.g., KSEA,KJFK).'),
       )
       .min(1)
       .max(20)
       .optional()
       .describe(
-        "One or more station identifiers (e.g., KSEA, KJFK). A lookup matches the registry's own identifier: a 4-character ICAO ID for an airport (e.g., KSEA, K0S9), and other shapes for the buoys and mesonet sites the registry also carries, which resolve by those. A 3-letter IATA code (e.g., SEA) never resolves, even for a station whose entry carries one. Whitespace around an entry is trimmed, so a padded identifier resolves the same as the bare one; an empty or whitespace-only entry is rejected. Use bbox or state to discover identifiers by location.",
+        "One or more station identifiers (e.g., KSEA, KJFK), with 1–20 identifiers after splitting commas and trimming each token. Empty tokens are rejected. A lookup matches the registry's own identifier: a 4-character ICAO ID for an airport (e.g., KSEA, K0S9), and other shapes for buoys and mesonet sites. A 3-letter IATA code (e.g., SEA) never resolves. Use bbox or state to discover identifiers by location.",
       ),
     bbox: BboxSchema.optional(),
     state: z
@@ -233,12 +233,38 @@ export const aviationFindStations = tool('aviation_find_stations', {
             data_types: z
               .array(z.string().describe('An available data type (e.g., "METAR", "TAF", "SYNOP").'))
               .describe('List of data products available at this station.'),
+            magnetic_declination: z
+              .object({
+                degrees: z
+                  .number()
+                  .nullable()
+                  .describe(
+                    'Source-published magnetic variation in degrees, east positive and west negative; null for unrecognized source syntax.',
+                  ),
+                source: z
+                  .string()
+                  .describe(
+                    'Exact magdec string from the AWC airport record; no epoch is supplied.',
+                  ),
+              })
+              .nullable()
+              .optional()
+              .describe(
+                'Published airport magnetic variation for named lookups; null when absent, unavailable, or an area search. Not a current geomagnetic model.',
+              ),
           })
           .describe('An aviation weather reporting station.'),
       )
       .describe('Matching stations.'),
   }),
   errors: [
+    {
+      reason: 'invalid_station_ids',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Comma-separated station_ids contain an empty token or expand beyond twenty identifiers.',
+      recovery:
+        'Provide 1–20 station identifiers after splitting commas; remove empty tokens and trim surrounding whitespace.',
+    },
     {
       reason: 'station_not_found',
       code: JsonRpcErrorCode.NotFound,
@@ -294,7 +320,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
       // see `upstreamRejectionHint`. This entry states the mode-agnostic form,
       // which is what a client reading the catalog ahead of a call can act on.
       recovery:
-        'Check the search inputs this call sent: one identifier per station_ids entry with no embedded separator, or a bounding box covering the area you meant.',
+        'Check station_ids tokens for embedded spaces or unsupported separators, or retry with a bounding box covering the area you meant.',
     },
   ],
 
@@ -361,7 +387,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
       .string()
       .optional()
       .describe(
-        'Guidance for whichever disclosures fired: the lever that narrows a truncated draw, what a requested limit withheld, that limit bounds the response without changing the area searched (on a bbox or state result of more than 130 stations from a call that set no limit), or the cause and fix for identifiers that resolved to nothing. The cap and either limit statement can fire on one result, and the text keeps them apart; the reconciliation cannot join them, since only bbox and state reach the row cap or take a limit, and only station_ids reconciles a request.',
+        'Guidance for bbox row caps, requested limits, area results above 110 stations with no limit, unresolved identifiers, or unavailable supplementary magnetic variation. State snapshots are complete and never reach the stationinfo row cap. A failed airport lookup does not invalidate station identity.',
       ),
   },
 
@@ -384,7 +410,9 @@ export const aviationFindStations = tool('aviation_find_stations', {
     // HTTP 400 and loses both stations. Trimmed once here, so the outgoing
     // query, the reconciliation, and the disclosure all read the same value and
     // no invisible padding travels into the trailer as a caller's "spelling".
-    const stationIds = input.station_ids?.map((id) => id.trim());
+    const stationIds = input.station_ids?.flatMap((id) =>
+      id.split(',').map((token) => token.trim()),
+    );
 
     if (!stationIds?.length && !input.bbox && !input.state) {
       throw ctx.fail(
@@ -419,6 +447,13 @@ export const aviationFindStations = tool('aviation_find_stations', {
       );
     }
 
+    if (stationIds && (stationIds.length > 20 || stationIds.some((id) => id.length === 0))) {
+      throw ctx.fail(
+        'invalid_station_ids',
+        'station_ids must expand to 1–20 nonempty identifiers; remove empty comma-separated tokens.',
+      );
+    }
+
     ctx.log.info('Finding aviation stations', {
       stationIds,
       hasBbox: !!input.bbox,
@@ -428,9 +463,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
 
     const mode = stationIds?.length ? 'station_ids' : input.bbox ? 'bbox' : 'state';
     const svc = getAviationWeatherService();
-    // Reported only by the state mode, which filters its draw inside the
-    // service; the other modes return the draw as served.
-    let preFilterRows: number | undefined;
+    let magneticDeclinationUnavailable = false;
     let stations: NormalizedStation[];
     try {
       stations = await svc.fetchStations(
@@ -438,8 +471,8 @@ export const aviationFindStations = tool('aviation_find_stations', {
           ...(stationIds?.length ? { stationIds } : {}),
           ...(input.bbox ? { bbox: input.bbox } : {}),
           ...(input.state ? { state: input.state } : {}),
-          onPreFilterRows: (rows) => {
-            preFilterRows = rows;
+          onMagneticDeclinationUnavailable: () => {
+            magneticDeclinationUnavailable = true;
           },
         },
         ctx,
@@ -484,13 +517,10 @@ export const aviationFindStations = tool('aviation_find_stations', {
     const shown = shownStations.length;
     const limited = input.limit != null && matched > input.limit;
 
-    // The cap applies to the draw, not to what survives the state filter, so a
-    // state query holding 279 stations can still be a cut page.
-    const drawnRows = preFilterRows ?? matched;
-    const capped = isUpstreamCapped(drawnRows);
-    const scope = input.state
-      ? `stations in ${input.state.toUpperCase()} are missing from this result — the state filter left ${matched} of that capped page`
-      : 'stations inside the box are missing from this result';
+    // Complete state snapshots are not subject to stationinfo's row cap.
+    const drawnRows = matched;
+    const capped = !input.state && isUpstreamCapped(drawnRows);
+    const scope = 'stations inside the box are missing from this result';
 
     // The cap, the limit, and the size lever are separate disclosures sharing
     // one notice, and every notice writer is last-wins — so each states its own
@@ -500,7 +530,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
     // excluded from the size sentence.
     const notice = [
       capped
-        ? `AWC served ${drawnRows} rows for this query, its per-request maximum, so ${scope}. Re-run over smaller bbox quadrants and union the results — a smaller box is the only narrowing lever the stationinfo endpoint offers, and it replaces a capped state query too.`
+        ? `AWC served ${drawnRows} rows for this query, its per-request maximum, so ${scope}. Re-run over smaller bbox quadrants and union the results — a smaller box is the only narrowing lever the stationinfo endpoint offers.`
         : null,
       limited ? limitNotice(shown, matched, capped) : null,
       !stationIds?.length && input.limit == null && shown > SIZE_NOTICE_THRESHOLD
@@ -512,8 +542,6 @@ export const aviationFindStations = tool('aviation_find_stations', {
 
     if (capped) {
       ctx.enrich.truncated({ shown, cap: AWC_MAX_ROWS, guidance: notice });
-      // Restating the drawn count is only informative where a filter moved it.
-      if (drawnRows > matched) ctx.enrich({ upstreamRows: drawnRows });
     } else {
       ctx.enrich({ truncated: false, shown });
       if (notice) ctx.enrich.notice(notice);
@@ -531,6 +559,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
     // alphabetical reordering, exact strings break on case folding, counts
     // break on de-duplication, and `icao_id` breaks on the 23% of entries that
     // carry no ICAO, IATA, or FAA identifier at all.
+    let stationMissingNotice: string | undefined;
     if (stationIds?.length) {
       const resolved = new Set(stations.map((s) => s.id.toUpperCase()));
       const returned: string[] = [];
@@ -552,8 +581,14 @@ export const aviationFindStations = tool('aviation_find_stations', {
       });
       if (missing.length > 0) {
         ctx.enrich({ missing });
-        ctx.enrich.notice(unresolvedStationNotice(missing));
+        stationMissingNotice = unresolvedStationNotice(missing);
+        ctx.enrich.notice(stationMissingNotice);
       }
+    }
+    if (magneticDeclinationUnavailable) {
+      const unavailable =
+        'Airport magnetic variation is unavailable because the supplementary AWC airport lookup failed or timed out. Station results remain valid; retry station_ids to request published variation.';
+      ctx.enrich.notice([stationMissingNotice, unavailable].filter(Boolean).join(' '));
     }
 
     ctx.log.info('Stations found', { count: shown, matched, drawnRows });
@@ -584,6 +619,10 @@ export const aviationFindStations = tool('aviation_find_stations', {
       lines.push(
         `**Data types:** ${s.data_types.length > 0 ? s.data_types.join(', ') : 'none listed'}`,
       );
+      if (s.magnetic_declination !== undefined)
+        lines.push(
+          `**Magnetic variation:** ${s.magnetic_declination === null ? 'unknown (not supplied)' : `${s.magnetic_declination.degrees === null ? 'unknown degrees' : `${s.magnetic_declination.degrees}° (east positive)`}; source: ${s.magnetic_declination.source}`}`,
+        );
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

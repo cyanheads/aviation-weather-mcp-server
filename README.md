@@ -38,7 +38,7 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 | `aviation_find_stations` | Resolve airports and weather stations by identifier, bounding box, or US state. Returns ICAO/IATA/FAA IDs, coordinates, elevation, and available data types. |
 | `aviation_get_metar` | Get current weather observations (METARs) for named airports, or survey every reporting station in a bounding box. Returns decoded wind, visibility, ceiling, present weather, temp/dewpoint, altimeter, cloud layers, flight category (VFR/MVFR/IFR/LIFR), and the raw METAR string. |
 | `aviation_get_taf` | Get Terminal Aerodrome Forecasts for one or more airports. Returns each forecast period with valid times, surface wind, low-level wind shear, visibility, decoded weather, cloud layers, and vertical visibility into a forecast obscuration, plus the raw TAF string. |
-| `aviation_get_pireps` | Get recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence, icing, and cloud reports with altitude, aircraft type, intensity, outside air temperature, wind aloft, flight weather, and the raw PIREP string. |
+| `aviation_get_pireps` | Get recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence, icing, clouds, temperature, wind aloft, flight weather, braking action, altitude, aircraft type, and the raw report. |
 | `aviation_get_advisories` | Get domestic/international SIGMETs and Center Weather Advisories. Returns source coverage, hazard, severity, altitude, validity, movement, multipart geometry and original bulletins; omitted facts stay null. |
 
 ### Prompts
@@ -62,9 +62,11 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 - Look up one or more stations by identifier (up to 20 per call) — a lookup matches the registry's own ID, which for an airport is its 4-character ICAO ID (e.g., `KSEA`, `K0S9`); a 3-letter IATA code never resolves, though each record includes its IATA/FAA aliases when available
 - Discover stations within a geographic bounding box, or list stations for one of the 50 US states or DC via two-letter USPS code
 - Returns `data_types` (METAR, TAF, etc.) so agents can confirm what's available before querying
-- Every result states whether the upstream 400-row cap cut it; `limit` (1–400) bounds how many stations a `bbox` or `state` search returns, ordered by ICAO identifier ascending with identifier-less stations last — rejected alongside `station_ids`, since that mode already names the set. An area search returning more than 130 stations with no `limit` says so and names the lever; omitting `limit` still returns every match
+- Every result states whether the upstream 400-row cap cut it; complete state snapshots are outside that cap. `limit` (1–400) bounds how many stations a `bbox` or `state` search returns, ordered by ICAO identifier ascending with identifier-less stations last — rejected alongside `station_ids`, since that mode already names the set. An area search returning more than 110 stations with no `limit` says so and names the lever; omitting `limit` still returns every match
 - An ID lookup names every identifier that resolved to nothing, separating a 3-letter IATA code (never resolves) from an identifier the registry simply does not list
-- Whitespace around an ID is trimmed rather than failing the batch; only an empty or whitespace-only entry is rejected
+- Comma-separated entries are split and each token trimmed once; the expanded list must contain 1–20 identifiers, with no empty tokens
+- State searches select US registry membership from a complete station snapshot refreshed on demand after 24 hours, including offshore and eastern-longitude Alaska records. Expired snapshots are never served after a failed refresh; retry or use `bbox`/`station_ids`. Geographic searches retain the stationinfo endpoint and its row cap
+- Named lookups also return nullable `magnetic_declination`: signed degrees (east positive) and exact source text from one supplementary airport batch. Unrecognized syntax keeps the text with unknown degrees. Missing airport data and area searches return null; a failed supplementary request adds a notice while preserving station results. This is published variation without an epoch, not a current geomagnetic model or a correction for every PIREP location
 
 ---
 
@@ -96,11 +98,13 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 ### `aviation_get_pireps` <sub>tool</sub>
 
 - `station_id` (4 ASCII letters or digits in either case, normalized to uppercase) + `distance_nm` (10–500 nm, 100 when omitted) for radial search, or `bbox` for area search — mutually exclusive; a `station_id` AWC does not recognize as a search center returns a typed error pointing to `aviation_find_stations` or `bbox`
+- Resolved station searches select a true nautical-mile circle from enclosing candidates, splitting antimeridian envelopes into two draws. Missing coordinates or an unavailable coordinate lookup retain the legacy AWC search with an explicit unverified-radius notice; use `bbox` for explicit geographic bounds
 - `altitude_min_ft` / `altitude_max_ft` filter to a cruise-altitude band in feet MSL, from 0 to 60000 ft (min must not exceed max); a report with unknown altitude is dropped once either bound is set
 - `min_intensity` (`lgt` / `mod` / `sev`) restricts to reports carrying a turbulence or icing layer at that intensity or above — a matching report still carries its lighter layers
 - Turbulence and icing arrays include up to two layers per report; icing layers the API synthesized for a report that never mentioned ice are dropped
-- Outside air temperature (`temp_c`), wind aloft (`wind`), and the `/WX` flight weather decoded beside its raw groups (`weather`), for PIREPs and AIREPs alike. The wind direction is published as reported, with no conversion — a PIREP `/WV` direction is magnetic, unlike the true-north METAR and TAF winds
-- Every result states whether the upstream 400-row cap cut it, naming only the narrowing levers the call can still use, and `limit` (1–400) bounds how many reports come back, ordered by recency. A result of more than 50 reports with no `limit` says so and names the lever; omitting `limit` still returns every match
+- Source report types remain open strings, including `PIREP`, `Urgent PIREP`, `AIREP`, and `AMDAR`. Outside air temperature (`temp_c`), wind aloft (`wind`), and decoded `/WX` flight weather (`weather`) preserve available readings. Ordinary and urgent PIREP wind directions are magnetic and unconverted; other report types receive no unverified reference label
+- Nullable `braking_action` preserves AWC's decoded `brkAction` (e.g., `MED`), including unfamiliar codes, without parsing remarks or inferring runway conditions
+- Every result states whether any candidate draw reached the upstream 400-row cap before radius and altitude filtering. Capped draws remain partial even when filtering leaves no reports. `limit` (1–400) selects the most recent matches independently of that cap. A result of more than 50 reports with no `limit` names the lever; omitting `limit` still returns every match
 - PIREPs are sparse by nature — absence of reports does not mean smooth conditions
 
 ---
@@ -140,7 +144,7 @@ Aviation-weather-specific:
 - Keyless — no API key or authentication required; all data is from the public AWC Data API
 - Single service (`aviation-weather-service`) with retry + exponential backoff for the keyless public endpoint
 - Raw coded strings (`raw_metar`, `raw_taf`, `raw_pirep`, `raw_text`) surfaced alongside decoded fields so agents have both layers
-- State→bbox table enables US-state station queries that the AWC API doesn't natively support
+- Complete in-memory station registry snapshots provide US-state membership without geographic approximations
 - Server-level `instructions` field surfaces the "not an official briefing" safety disclaimer to all clients on `initialize`
 
 Agent-friendly output:

@@ -6,6 +6,7 @@
  * @module tests/services/aviation-weather/aviation-weather-service.test
  */
 
+import { gzipSync } from 'node:zlib';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
@@ -1502,6 +1503,38 @@ describe('AviationWeatherService PIREP temperature, wind, and weather', () => {
     return report! as typeof report & Record<string, unknown>;
   }
 
+  it('preserves urgent report identity and raw text before adding braking', async () => {
+    const report = await normalize({ pirepType: 'Urgent PIREP', rawOb: 'SEA UUA /FL000' });
+    expect(report.pirep_type).toBe('Urgent PIREP');
+    expect(report.raw_pirep).toBe('SEA UUA /FL000');
+  });
+
+  it.each([undefined, null, '', '   ', 'MED', 'FUTURE'])(
+    'preserves sparse decoded braking %p',
+    async (brkAction) => {
+      expect((await normalize(brkAction === undefined ? {} : { brkAction })).braking_action).toBe(
+        brkAction?.trim() ? brkAction : null,
+      );
+    },
+  );
+
+  it('renders urgent magnetic wind and decoded braking on both surfaces', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([
+        { ...rawPirep, pirepType: 'Urgent PIREP', wdir: 255, wspd: 56, brkAction: 'MED' },
+      ]),
+    );
+    initAviationWeatherService({} as AppConfig, {} as StorageService);
+    const result = await runToolContract(aviationGetPireps, {
+      bbox: { minLat: 40, minLon: -125, maxLat: 50, maxLon: -115 },
+    });
+    expect(result.structuredContent).toMatchObject({
+      pireps: [{ pirep_type: 'Urgent PIREP', braking_action: 'MED' }],
+    });
+    expect(JSON.stringify(result.content)).toContain('255° magnetic at 56 kt');
+    expect(JSON.stringify(result.content)).toContain('**Braking action:** MED');
+  });
+
   it('leaves every other field of a normalized report as it was', async () => {
     // Characterization — the three fields are additions and a rename, so the
     // rest of the record has to come through unchanged.
@@ -1518,7 +1551,7 @@ describe('AviationWeatherService PIREP temperature, wind, and weather', () => {
       tbType1: 'CAT',
       tbFreq1: 'OCNL',
     });
-    const { temp_c, wind, weather, remarks, ...rest } = report;
+    const { temp_c, wind, weather, remarks, braking_action, ...rest } = report;
 
     expect(rest).toEqual({
       observed_at: new Date(rawPirep.obsTime * 1000).toISOString(),
@@ -1640,6 +1673,398 @@ describe('AviationWeatherService PIREP temperature, wind, and weather', () => {
 // ---------------------------------------------------------------------------
 
 describe('AviationWeatherService request construction', () => {
+  it('rounds generated candidate bounds outward to accepted AWC decimal precision', async () => {
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(
+        jsonResponse([
+          { ...rawStationKSEA, id: 'KORD', icaoId: 'KORD', lat: 41.96017, lon: -87.93161 },
+        ]),
+      )
+      .mockResolvedValueOnce(jsonResponse([]));
+    await svc.fetchPireps({ stationId: 'KORD', distanceNm: 100, hours: 12 }, createMockContext());
+    expect(new URL(lastRequestUrl()).searchParams.get('bbox')).toBe(
+      '40.2946,-90.1717,43.6258,-85.6915',
+    );
+  });
+  it.each([
+    [10, 0, 0, 0.16, 0, 0.17, 0, 1],
+    [100, 0, 0, 1.66, 0, 1.67, 0, 1],
+    [500, 0, 0, 8.32, 0, 8.34, 0, 1],
+    [100, 80, 0, 80, 9, 80, 10, 1],
+    [100, 89, 0, 90, 180, 87, 0, 1],
+    [100, 0, 179.5, 0, -179.5, 0, -178, 2],
+    [100, 0, -179.5, 0, 179.5, 0, 178, 2],
+  ])(
+    'selects %inm circle at %i,%i including polar and wrapped candidates',
+    async (distanceNm, lat, lon, inLat, inLon, outLat, outLon, draws) => {
+      const station = { ...rawStationKSEA, lat, lon };
+      vi.mocked(fetchWithTimeout).mockImplementation(async (url) =>
+        jsonResponse(
+          String(url).includes('/stationinfo?')
+            ? [station]
+            : [
+                { ...rawPirep, lat: inLat, lon: inLon, rawOb: 'inside' },
+                { ...rawPirep, lat: outLat, lon: outLon, rawOb: 'outside' },
+              ],
+        ),
+      );
+      const counts = vi.fn();
+      const result = await svc.fetchPireps(
+        {
+          stationId: 'KSEA',
+          distanceNm,
+          hours: 12,
+          level: 0,
+          minIntensity: 'sev',
+          onCandidateRows: counts,
+        },
+        createMockContext(),
+      );
+      expect(result.map((report) => report.raw_pirep)).toEqual(['inside']);
+      expect(counts).toHaveBeenCalledWith(2 * draws, false, draws);
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(1 + draws);
+      for (const [url] of vi.mocked(fetchWithTimeout).mock.calls.slice(1)) {
+        const query = new URL(String(url)).searchParams;
+        expect(query.get('age')).toBe('12');
+        expect(query.get('level')).toBe('0');
+        expect(query.get('inten')).toBe('sev');
+        const box = query.get('bbox')!.split(',').map(Number);
+        expect(box[0]).toBeLessThanOrEqual(box[2]!);
+        expect(box[1]).toBeLessThanOrEqual(box[3]!);
+        if (Math.abs(lon) > 179) expect(box[3]! - box[1]!).toBeLessThan(3);
+      }
+    },
+  );
+
+  it.each([
+    [250, 250, false],
+    [400, 1, true],
+  ])('reads caps per antimeridian draw (%i + %i)', async (firstRows, secondRows, capped) => {
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(jsonResponse([{ ...rawStationKSEA, lat: 0, lon: 179.5 }]))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          Array.from({ length: firstRows }, (_, i) => ({
+            ...rawPirep,
+            lat: 0,
+            lon: 179.9,
+            rawOb: `east${i}`,
+          })),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          Array.from({ length: secondRows }, (_, i) => ({
+            ...rawPirep,
+            lat: 0,
+            lon: -179.9,
+            rawOb: `west${i}`,
+          })),
+        ),
+      );
+    const counts = vi.fn();
+    const result = await svc.fetchPireps(
+      { stationId: 'KSEA', distanceNm: 100, hours: 3, onCandidateRows: counts },
+      createMockContext(),
+    );
+    expect(counts).toHaveBeenCalledWith(firstRows + secondRows, capped, 2);
+    expect(result).toHaveLength(firstRows + secondRows);
+  });
+
+  it.each([false, true])(
+    'discloses capped candidates even when radius removes every row (%p)',
+    async (empty) => {
+      vi.mocked(fetchWithTimeout).mockImplementation(async (url) =>
+        jsonResponse(
+          String(url).includes('/stationinfo?')
+            ? [rawStationKSEA]
+            : Array.from({ length: 400 }, (_, i) => ({
+                ...rawPirep,
+                lat: !empty && i === 0 ? 47.5 : 50,
+                rawOb: `report${i}`,
+              })),
+        ),
+      );
+      initAviationWeatherService({} as AppConfig, {} as StorageService);
+      const result = await runToolContract(aviationGetPireps, { station_id: 'KSEA', limit: 1 });
+      expect(result.structuredContent).toMatchObject(
+        empty
+          ? { error: { data: { reason: 'no_pireps_found', truncated: true, upstreamRows: 400 } } }
+          : { truncated: true, upstreamRows: 400, shown: 1, limited: false },
+      );
+      expect(JSON.stringify(result.content)).toContain('400');
+      expect(JSON.stringify(result.content)).toMatch(/radius|capped/);
+    },
+  );
+
+  it('keeps a stationinfo miss available and discloses the unverified radius on both surfaces', async () => {
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(jsonResponse([]))
+      .mockResolvedValueOnce(jsonResponse([rawPirep]));
+    initAviationWeatherService({} as AppConfig, {} as StorageService);
+    const result = await runToolContract(aviationGetPireps, { station_id: 'KSEA' });
+    expect(result.structuredContent).toMatchObject({
+      shown: 1,
+      notice: expect.stringContaining('radius is unverified'),
+    });
+    expect(JSON.stringify(result.content)).toContain('radius is unverified');
+    expect(lastRequestUrl()).toContain('id=KSEA');
+    expect(lastRequestUrl()).toContain('distance=100');
+  });
+
+  it('does not treat a coordinate-provider rejection as a PIREP center rejection', async () => {
+    vi.mocked(fetchWithTimeout)
+      .mockRejectedValueOnce(
+        new McpError(JsonRpcErrorCode.InvalidParams, 'AWC API error: Invalid location specified'),
+      )
+      .mockResolvedValueOnce(jsonResponse([rawPirep]));
+    const unavailable = vi.fn();
+    await expect(
+      svc.fetchPireps(
+        { stationId: 'KSEA', hours: 3, onRadiusUnavailable: unavailable },
+        createMockContext(),
+      ),
+    ).resolves.toHaveLength(1);
+    expect(unavailable).toHaveBeenCalledOnce();
+    expect(lastRequestUrl()).toContain('/pirep?id=KSEA');
+  });
+
+  it('does not degrade caller cancellation during center lookup', async () => {
+    const controller = new AbortController();
+    const reason = new DOMException('cancelled', 'AbortError');
+    vi.mocked(fetchWithTimeout).mockImplementation(async () => {
+      controller.abort(reason);
+      throw reason;
+    });
+    await expect(
+      svc.fetchPireps(
+        { stationId: 'KSEA', hours: 3 },
+        createMockContext({ signal: controller.signal }),
+      ),
+    ).rejects.toBe(reason);
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not degrade programmer errors during center lookup', async () => {
+    const reason = new TypeError('bad implementation');
+    vi.mocked(fetchWithTimeout).mockRejectedValue(reason);
+    await expect(
+      svc.fetchPireps({ stationId: 'KSEA', hours: 3 }, createMockContext()),
+    ).rejects.toBe(reason);
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['node', 'bun'])(
+    'classifies %s response-body transport failures and retries the real PIREP read',
+    async (runtime) => {
+      vi.useFakeTimers();
+      try {
+        const socket = Object.assign(new Error('socket closed'), {
+          code: runtime === 'node' ? 'UND_ERR_SOCKET' : 'ECONNRESET',
+        });
+        const failure =
+          runtime === 'node' ? new TypeError('terminated', { cause: socket }) : socket;
+        const response = jsonResponse([]);
+        vi.spyOn(response, 'text').mockRejectedValue(failure);
+        vi.mocked(fetchWithTimeout).mockResolvedValue(response);
+        initAviationWeatherService({} as AppConfig, {} as StorageService);
+        const pending = runToolContract(aviationGetPireps, {
+          bbox: { minLat: 40, minLon: -125, maxLat: 50, maxLon: -115 },
+        });
+        await vi.runAllTimersAsync();
+        const result = await pending;
+        expect(result.structuredContent).toMatchObject({
+          error: { code: JsonRpcErrorCode.ServiceUnavailable },
+        });
+        expect(JSON.stringify(result.content)).toContain('could not be read');
+        expect(fetchWithTimeout).toHaveBeenCalledTimes(4);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each([
+    JsonRpcErrorCode.RateLimited,
+    JsonRpcErrorCode.ServiceUnavailable,
+    JsonRpcErrorCode.Timeout,
+  ])('degrades optional coordinate outage %i without changing legacy results', async (code) => {
+    vi.mocked(fetchWithTimeout)
+      .mockRejectedValueOnce(new McpError(code, 'lookup unavailable'))
+      .mockResolvedValueOnce(jsonResponse([rawPirep]));
+    const unavailable = vi.fn();
+    const reports = await svc.fetchPireps(
+      { stationId: 'KSEA', hours: 3, onRadiusUnavailable: unavailable },
+      createMockContext(),
+    );
+    expect(reports).toHaveLength(1);
+    expect(unavailable).toHaveBeenCalledOnce();
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds lookup timeout separately and leaves time for the legacy draw', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetchWithTimeout)
+        .mockImplementationOnce(
+          async (_url, _timeout, _ctx, options) =>
+            new Promise((_resolve, reject) =>
+              options!.signal!.addEventListener('abort', () => reject(options!.signal!.reason), {
+                once: true,
+              }),
+            ),
+        )
+        .mockResolvedValueOnce(jsonResponse([rawPirep]));
+      const unavailable = vi.fn();
+      const pending = svc.fetchPireps(
+        { stationId: 'KSEA', hours: 3, onRadiusUnavailable: unavailable },
+        createMockContext(),
+      );
+      const assertion = expect(pending).resolves.toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(3001);
+      await assertion;
+      expect(unavailable).toHaveBeenCalledOnce();
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retains the typed unknown-center reason after a stationinfo miss', async () => {
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(jsonResponse([]))
+      .mockRejectedValueOnce(
+        new McpError(JsonRpcErrorCode.InvalidParams, 'AWC API error: Invalid location specified'),
+      );
+    initAviationWeatherService({} as AppConfig, {} as StorageService);
+    const result = await runToolContract(aviationGetPireps, { station_id: 'Q7Z9' });
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        data: {
+          reason: 'station_not_recognized',
+          recovery: { hint: expect.stringContaining('bbox') },
+        },
+      },
+    });
+    expect(JSON.stringify(result.content)).toContain('station_not_recognized');
+    expect(JSON.stringify(result.content)).toContain('aviation_find_stations');
+  });
+
+  it('includes a point on the spherical 100nm boundary and excludes a square corner', async () => {
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(jsonResponse([{ ...rawStationKSEA, lat: 0, lon: 0 }]))
+      .mockResolvedValueOnce(
+        jsonResponse([
+          { ...rawPirep, lat: 0, lon: 1.6655435148197004, rawOb: 'boundary' },
+          { ...rawPirep, lat: 1.5, lon: 1.5, rawOb: 'corner' },
+        ]),
+      );
+    const reports = await svc.fetchPireps(
+      { stationId: 'KSEA', distanceNm: 100, hours: 3 },
+      createMockContext(),
+    );
+    expect(reports.map((report) => report.raw_pirep)).toEqual(['boundary']);
+  });
+
+  it('preserves per-attempt timeout while bounding the combined lookup and draw deadline', async () => {
+    vi.useFakeTimers();
+    const nativeTimeout = AbortSignal.timeout;
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException('deadline', 'TimeoutError')), ms);
+      return controller.signal;
+    });
+    try {
+      vi.mocked(fetchWithTimeout)
+        .mockResolvedValueOnce(jsonResponse([rawStationKSEA]))
+        .mockImplementation(async (_url, timeoutMs, _context, options) => {
+          expect(timeoutMs).toBe(10000);
+          return new Promise((_resolve, reject) =>
+            options!.signal!.addEventListener('abort', () => reject(options!.signal!.reason), {
+              once: true,
+            }),
+          );
+        });
+      initAviationWeatherService({} as AppConfig, {} as StorageService);
+      const pending = runToolContract(aviationGetPireps, { station_id: 'KSEA' });
+      await vi.advanceTimersByTimeAsync(45001);
+      const result = await pending;
+      expect(result.structuredContent).toMatchObject({ error: { code: JsonRpcErrorCode.Timeout } });
+      expect(JSON.stringify(result.content)).toMatch(/deadline|timeout|timed out/i);
+      expect(timeoutSpy).toHaveBeenCalledWith(45000);
+      expect(fetchWithTimeout).toHaveBeenCalledTimes(2);
+    } finally {
+      timeoutSpy.mockRestore();
+      vi.useRealTimers();
+      expect(AbortSignal.timeout).toBe(nativeTimeout);
+    }
+  });
+
+  it('cancels both antimeridian legs when the caller abandons the draw', async () => {
+    const caller = new AbortController();
+    const reason = new DOMException('stop both legs', 'AbortError');
+    const legSignals: AbortSignal[] = [];
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(jsonResponse([{ ...rawStationKSEA, lat: 0, lon: 179.5 }]))
+      .mockImplementation(async (_url, _timeout, _ctx, options) => {
+        const signal = options!.signal!;
+        legSignals.push(signal);
+        const pending = new Promise<Response>((_resolve, reject) =>
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+        );
+        if (legSignals.length === 2) caller.abort(reason);
+        return pending;
+      });
+    await expect(
+      svc.fetchPireps(
+        { stationId: 'KSEA', hours: 3 },
+        createMockContext({ signal: caller.signal }),
+      ),
+    ).rejects.toBe(reason);
+    expect(legSignals).toHaveLength(2);
+    expect(legSignals.every((signal) => signal.aborted)).toBe(true);
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not count candidates outside the circle as altitude mismatches', async () => {
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(jsonResponse([rawStationKSEA]))
+      .mockResolvedValueOnce(
+        jsonResponse([
+          { ...rawPirep, lat: 47.5, fltLvl: 100 },
+          { ...rawPirep, lat: 50, fltLvl: 100 },
+        ]),
+      );
+    initAviationWeatherService({} as AppConfig, {} as StorageService);
+    const result = await runToolContract(aviationGetPireps, {
+      station_id: 'KSEA',
+      altitude_min_ft: 20000,
+    });
+    expect(JSON.stringify(result.content)).toContain(
+      '1 report(s) were found at other or unreported altitudes',
+    );
+    expect(JSON.stringify(result.content)).not.toContain('2 report(s) were found');
+  });
+  it('trims station-centered candidates to a nautical circle', async () => {
+    vi.mocked(fetchWithTimeout).mockImplementation(async (url) =>
+      jsonResponse(
+        String(url).includes('/stationinfo?')
+          ? [rawStationKSEA]
+          : [
+              { ...rawPirep, lat: 48.9, lon: -122.3117, rawOb: 'inside' },
+              { ...rawPirep, lat: 49.3, lon: -122.3117, rawOb: 'outside' },
+            ],
+      ),
+    );
+    const reports = await svc.fetchPireps(
+      { stationId: 'KSEA', distanceNm: 100, hours: 3 },
+      createMockContext(),
+    );
+    expect(reports.map((report) => report.raw_pirep)).toEqual(['inside']);
+    expect(lastRequestUrl()).toContain('bbox=');
+    expect(lastRequestUrl()).not.toContain('distance=');
+    expect(vi.mocked(fetchWithTimeout).mock.calls).toHaveLength(2);
+  });
   it('sends hours= for METARs — the metar endpoint has its own hours parameter', async () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawMetarKDEN]));
     await svc.fetchMetar({ stationIds: ['KDEN', 'KSEA'], hours: 6 }, createMockContext());
@@ -1823,30 +2248,42 @@ describe('AviationWeatherService PIREP lookback parameter', () => {
 // ---------------------------------------------------------------------------
 
 describe('AviationWeatherService state station lookup', () => {
+  let svc: AviationWeatherService;
+  beforeEach(() => {
+    svc = new AviationWeatherService({} as AppConfig, {} as StorageService);
+  });
   it('filters a state query down to that state', async () => {
-    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationKSEA, rawStationKBWI]));
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      new Response(gzipSync(JSON.stringify([rawStationKSEA, rawStationKBWI]))),
+    );
     const stations = await svc.fetchStations({ state: 'WA' }, createMockContext());
 
     expect(stations.map((s) => s.state)).toEqual(['WA']);
   });
 
   it('accepts a lowercase state code', async () => {
-    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationKSEA, rawStationKBWI]));
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      new Response(gzipSync(JSON.stringify([rawStationKSEA, rawStationKBWI]))),
+    );
     const stations = await svc.fetchStations({ state: 'wa' }, createMockContext());
 
     expect(stations.map((s) => s.state)).toEqual(['WA']);
   });
 
-  it('resolves DC to a bounding box and filters to DC stations', async () => {
-    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationWASD2, rawStationKBWI]));
+  it('resolves DC from the complete registry and filters to DC stations', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      new Response(gzipSync(JSON.stringify([rawStationWASD2, rawStationKBWI]))),
+    );
     const stations = await svc.fetchStations({ state: 'DC' }, createMockContext());
 
-    expect(lastRequestUrl()).toContain('/stationinfo?bbox=');
+    expect(lastRequestUrl()).toContain('/data/cache/stations.cache.json.gz');
     expect(stations.map((s) => s.state)).toEqual(['DC']);
   });
 
   it('preserves the null identifiers on the identifier-less DC station', async () => {
-    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationWASD2]));
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      new Response(gzipSync(JSON.stringify([rawStationWASD2]))),
+    );
     const [station] = await svc.fetchStations({ state: 'DC' }, createMockContext());
 
     expect(station).toMatchObject({
@@ -2077,49 +2514,46 @@ describe('AviationWeatherService advisory pre-filter row count', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Pre-filter row count (issue #11) — the 400-row cap applies to the draw, and
-// the state mode cuts that draw again in here, so the caller cannot recover the
-// drawn size from what it gets back
+// Station selection — state snapshots filter registry membership; bbox and
+// identifier draws retain every returned station.
 // ---------------------------------------------------------------------------
 
-describe('AviationWeatherService pre-filter row count', () => {
-  it('reports the drawn row count ahead of the state filter', async () => {
-    // KBWI is outside WA and is filtered away, so the returned length is 1
-    // while the draw the cap applied to was 2.
-    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationKSEA, rawStationKBWI]));
-    const onPreFilterRows = vi.fn();
-    const stations = await svc.fetchStations({ state: 'WA', onPreFilterRows }, createMockContext());
-
-    expect(onPreFilterRows).toHaveBeenCalledWith(2);
+describe('AviationWeatherService station selection', () => {
+  let svc: AviationWeatherService;
+  beforeEach(() => {
+    svc = new AviationWeatherService({} as AppConfig, {} as StorageService);
+  });
+  it('does not report the complete snapshot as an API draw subject to the row cap', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      new Response(gzipSync(JSON.stringify([rawStationKSEA, rawStationKBWI]))),
+    );
+    const stations = await svc.fetchStations({ state: 'WA' }, createMockContext());
     expect(stations).toHaveLength(1);
   });
 
-  it('reports a drawn count of zero when the filter empties a non-empty draw', async () => {
-    vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationKBWI]));
-    const onPreFilterRows = vi.fn();
-    const stations = await svc.fetchStations({ state: 'WA', onPreFilterRows }, createMockContext());
-
-    expect(onPreFilterRows).toHaveBeenCalledWith(1);
+  it('keeps an empty state match distinct from a capped API draw', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      new Response(gzipSync(JSON.stringify([rawStationKBWI]))),
+    );
+    const stations = await svc.fetchStations({ state: 'WA' }, createMockContext());
     expect(stations).toHaveLength(0);
   });
 
-  it('stays silent in the bbox mode, whose draw is returned unfiltered', async () => {
+  it('returns the bbox draw unfiltered', async () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationKSEA, rawStationKBWI]));
-    const onPreFilterRows = vi.fn();
-    await svc.fetchStations(
-      { bbox: { minLat: 25, minLon: -125, maxLat: 49, maxLon: -66 }, onPreFilterRows },
+    const stations = await svc.fetchStations(
+      { bbox: { minLat: 25, minLon: -125, maxLat: 49, maxLon: -66 } },
       createMockContext(),
     );
 
-    expect(onPreFilterRows).not.toHaveBeenCalled();
+    expect(stations.map((station) => station.id)).toEqual(['KSEA', 'KBWI']);
   });
 
-  it('stays silent in the station_ids mode, whose draw is returned unfiltered', async () => {
+  it('returns the station_ids draw unfiltered', async () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(jsonResponse([rawStationKSEA]));
-    const onPreFilterRows = vi.fn();
-    await svc.fetchStations({ stationIds: ['KSEA'], onPreFilterRows }, createMockContext());
+    const stations = await svc.fetchStations({ stationIds: ['KSEA'] }, createMockContext());
 
-    expect(onPreFilterRows).not.toHaveBeenCalled();
+    expect(stations.map((station) => station.id)).toEqual(['KSEA']);
   });
 });
 
@@ -2444,7 +2878,10 @@ describe('AviationWeatherService upstream error bodies', () => {
   async function errorFor(
     response: Response,
     call: () => Promise<unknown> = () =>
-      svc.fetchPireps({ stationId: 'KISN', distanceNm: 60, hours: 12 }, createMockContext()),
+      svc.fetchPireps(
+        { bbox: { minLat: 40, minLon: -110, maxLat: 50, maxLon: -100 }, hours: 12 },
+        createMockContext(),
+      ),
   ): Promise<McpError> {
     http.route({ match: /^https:\/\/aviationweather\.gov\/api\/data\//, respond: response });
     try {
@@ -2549,7 +2986,11 @@ describe('AviationWeatherService upstream error bodies', () => {
     ['fetchTaf', () => svc.fetchTaf(['K36U'], createMockContext())],
     [
       'fetchPireps',
-      () => svc.fetchPireps({ stationId: 'KISN', distanceNm: 60, hours: 12 }, createMockContext()),
+      () =>
+        svc.fetchPireps(
+          { bbox: { minLat: 40, minLon: -110, maxLat: 50, maxLon: -100 }, hours: 12 },
+          createMockContext(),
+        ),
     ],
     ['fetchStations', () => svc.fetchStations({ stationIds: ['KSEA'] }, createMockContext())],
   ])('surfaces the AWC text through %s, whichever tool made the call', async (_method, call) => {
