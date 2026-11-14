@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.2](changelog/0.7.x/0.7.2.md) — 2026-11-13
+
+Retrieve historical aviation weather and page through regional weather draws.
+
 ## [0.7.1](changelog/0.7.x/0.7.1.md) — 2026-10-31
 
 Correct station discovery and PIREP radius filtering
