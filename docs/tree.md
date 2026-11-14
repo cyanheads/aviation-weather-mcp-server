@@ -1,6 +1,6 @@
 # aviation-weather-mcp-server - Directory Structure
 
-Generated on: 2026-11-01 06:00:46
+Generated on: 2026-11-14 06:18:36
 
 ```text
 aviation-weather-mcp-server/
@@ -150,8 +150,9 @@ aviation-weather-mcp-server/
 │   │   └── server-config.ts
 │   ├── mcp-server/
 │   │   ├── prompts/
-│   │   │   └── definitions/
-│   │   │       └── aviation-preflight-brief.prompt.ts
+│   │   │   ├── definitions/
+│   │   │   │   └── aviation-preflight-brief.prompt.ts
+│   │   │   └── route-weather-boxes.ts
 │   │   ├── resources/
 │   │   │   └── definitions/
 │   │   └── tools/
@@ -162,13 +163,15 @@ aviation-weather-mcp-server/
 │   │       │   ├── aviation-get-pireps.tool.ts
 │   │       │   └── aviation-get-taf.tool.ts
 │   │       ├── format-degrees.ts
-│   │       └── format-sky-condition.ts
+│   │       ├── format-sky-condition.ts
+│   │       └── result-page.ts
 │   ├── services/
 │   │   └── aviation-weather/
 │   │       ├── advisory-products.ts
 │   │       ├── aviation-weather-service.ts
 │   │       ├── awc-limits.ts
 │   │       ├── bbox.ts
+│   │       ├── history-anchor.ts
 │   │       ├── station-magnetic-declination.ts
 │   │       ├── station-snapshot.ts
 │   │       ├── supported-states.ts

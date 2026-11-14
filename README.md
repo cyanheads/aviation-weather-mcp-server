@@ -36,9 +36,9 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 | Tool | Description |
 |:-----|:------------|
 | `aviation_find_stations` | Resolve airports and weather stations by identifier, bounding box, or US state. Returns ICAO/IATA/FAA IDs, coordinates, elevation, and available data types. |
-| `aviation_get_metar` | Get current weather observations (METARs) for named airports, or survey every reporting station in a bounding box. Returns decoded wind, visibility, ceiling, present weather, temp/dewpoint, altimeter, cloud layers, flight category (VFR/MVFR/IFR/LIFR), and the raw METAR string. |
-| `aviation_get_taf` | Get Terminal Aerodrome Forecasts for one or more airports. Returns each forecast period with valid times, surface wind, low-level wind shear, visibility, decoded weather, cloud layers, and vertical visibility into a forecast obscuration, plus the raw TAF string. |
-| `aviation_get_pireps` | Get recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence, icing, clouds, temperature, wind aloft, flight weather, braking action, altitude, aircraft type, and the raw report. |
+| `aviation_get_metar` | Get current or historical observations for named airports, a bounding box, or a US state. Returns decoded conditions, flight category, and the raw METAR. |
+| `aviation_get_taf` | Get current or historically issued forecasts for named airports, a bounding box, or a US state. Returns decoded forecast periods and the raw TAF. |
+| `aviation_get_pireps` | Get current or historical pilot reports near an airport or within a bounding box. Returns decoded conditions aloft, aircraft type, and the raw report. |
 | `aviation_get_advisories` | Get domestic/international SIGMETs and Center Weather Advisories. Returns source coverage, hazard, severity, altitude, validity, movement, multipart geometry and original bulletins; omitted facts stay null. |
 
 ### Prompts
@@ -57,12 +57,16 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 
 ## Capability reference
 
+METARs, TAFs and PIREPs accept an optional UTC `as_of` timestamp within the past 30 days. Use `YYYY-MM-DDTHH:mm:ssZ` or `YYYY-MM-DDTHH:mm:ss.sssZ`. Omit the anchor for a current lookup.
+
+Area METAR and TAF surveys, PIREPs, area station searches and advisories accept a zero-based `offset` and optional `limit`. Repeat the same query with the returned `nextOffset` to continue. Each call uses the currently available draw, which may change between pages. Paging cannot recover rows AWC withheld. Omitting `limit` returns every remaining match. Explicit limits above 400 are clamped with a notice on METAR and TAF surveys, PIREPs and area station searches. Set `AWC_CLAMP_LIMITS=false` to reject them.
+
 ### `aviation_find_stations` <sub>tool</sub>
 
 - Look up one or more stations by identifier (up to 20 per call) — a lookup matches the registry's own ID, which for an airport is its 4-character ICAO ID (e.g., `KSEA`, `K0S9`); a 3-letter IATA code never resolves, though each record includes its IATA/FAA aliases when available
 - Discover stations within a geographic bounding box, or list stations for one of the 50 US states or DC via two-letter USPS code
 - Returns `data_types` (METAR, TAF, etc.) so agents can confirm what's available before querying
-- Every result states whether the upstream 400-row cap cut it; complete state snapshots are outside that cap. `limit` (1–400) bounds how many stations a `bbox` or `state` search returns, ordered by ICAO identifier ascending with identifier-less stations last — rejected alongside `station_ids`, since that mode already names the set. An area search returning more than 110 stations with no `limit` says so and names the lever; omitting `limit` still returns every match
+- A `bbox` search reports when the draw reaches AWC's 400-row cap. Station pages order by ICAO identifier with identifier-less sites last. Named lookups reject `offset` and `limit`.
 - An ID lookup names every identifier that resolved to nothing, separating a 3-letter IATA code (never resolves) from an identifier the registry simply does not list
 - Comma-separated entries are split and each token trimmed once; the expanded list must contain 1–20 identifiers, with no empty tokens
 - State searches select US registry membership from a complete station snapshot refreshed on demand after 24 hours, including offshore and eastern-longitude Alaska records. Expired snapshots are never served after a failed refresh; retry or use `bbox`/`station_ids`. Geographic searches retain the stationinfo endpoint and its row cap
@@ -72,10 +76,10 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 
 ### `aviation_get_metar` <sub>tool</sub>
 
-- `station_ids` (1–10 per call — 4 ASCII letters or digits, case-insensitive and normalized to uppercase, so `ksea` and `K0S9` work) for named airports, or `bbox` to survey every reporting station in an area — mutually exclusive
-- `hours` (1–12) is a lookback window, not a row limit: with `station_ids` every observation inside it is returned, and with `bbox` the result is the latest observation per station
-- `flight_category` (e.g., `["IFR", "LIFR"]`) narrows a `bbox` survey to the stations in those categories — judged on each station's latest observation, applied before `limit`, and disclosed with the count surveyed before it; a station AWC could not rate never matches, and a survey the filter empties returns an empty result that says so. Rejected alongside `station_ids`
-- A `bbox` survey states whether the upstream 400-row cap cut it and, above `hours: 1`, names `hours` as the first lever — a wide window spends the cap on repeat readings rather than on more stations; `limit` (1–400) bounds how many stations come back, ordered by station ID ascending, and is rejected alongside `station_ids`. A survey returning more than 40 stations with no `limit` says so and names the levers; omitting `limit` still returns every station
+- Choose one of `station_ids` (1–10 ICAO IDs), `bbox`, or `state` (a two-letter US state or DC code). Surveys report the latest drawn observation per station, ordered by station ID. Named lookups return every observation drawn and reject survey filters and paging.
+- `hours` is a 1–720 hour lookback ending at `as_of` or the current time. It defaults to one hour.
+- `flight_category` (for example, `["IFR", "LIFR"]`) filters a survey by each station's latest observation before paging. Unrated observations never match. An empty filtered survey reports the count it examined.
+- Either mode can reach the upstream 400-row cap. Shorten the lookback or use successive earlier anchors to recover separate time windows. For bbox surveys, smaller boxes can recover geographic omissions. Treat missing named stations as unresolved when the draw is capped.
 - Flight category (VFR/MVFR/IFR/LIFR) returned directly from the AWC API; decodes wind, visibility, present weather, and cloud layers alongside the raw METAR string
 - Ceiling reports both height and kind (measured, or indefinite for vertical visibility into an obscuration) — `sky_condition` distinguishes a reported clear sky from an unreported one when `clouds` is empty
 - `metar_type` distinguishes routine `METAR` from special `SPECI` observations
@@ -85,8 +89,11 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 
 ### `aviation_get_taf` <sub>tool</sub>
 
-- Accepts 1–4 ICAO station IDs per call: 4 ASCII letters or digits in either case, normalized to uppercase
-- Structured forecast periods with change types (`FM`, `TEMPO`, `BECMG`) and probabilities; weather decoded group by group beside the raw groups
+- Choose one of `station_ids` (1–4 ICAO IDs), `bbox`, or `state` (a two-letter US state or DC code). Search a nearby bbox if a named airport has no forecast. Named lookups reject paging.
+- METAR and TAF state surveys use AWC's weather selector. Use `aviation_find_stations` for state registry membership.
+- An anchored lookup requests AWC's selection by issuance time. The selected forecast can start after the anchor. Check `valid_from` and `valid_to` before interpreting its periods.
+- Structured periods preserve change groups and probabilities. `transition_end` is when a BECMG transition is expected to finish. Decoded fields include altimeter pressure in hPa, separately timed temperature extrema, and icing/turbulence layers with their source intensity codes and available altitude bounds.
+- Each forecast includes source remarks. `amended` is true for an AMD header marker, false for a recognized header without it, and null when the header cannot be classified.
 - Forecast obscurations keep their layer and carry the vertical visibility into them, rather than reading as clear sky; `sky_condition` distinguishes an unamended period from a stated clear sky
 - Text the upstream decoder left undecoded — often a fourth cloud layer — is surfaced per period in `not_decoded` rather than dropped
 - Low-level wind shear (`WS020/20040KT`) decoded to the shear-layer top and forecast wind at that height
@@ -98,13 +105,14 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 ### `aviation_get_pireps` <sub>tool</sub>
 
 - `station_id` (4 ASCII letters or digits in either case, normalized to uppercase) + `distance_nm` (10–500 nm, 100 when omitted) for radial search, or `bbox` for area search — mutually exclusive; a `station_id` AWC does not recognize as a search center returns a typed error pointing to `aviation_find_stations` or `bbox`
+- `hours` is a 1–48 hour lookback ending at `as_of` or the current time. It defaults to three hours.
 - Resolved station searches select a true nautical-mile circle from enclosing candidates, splitting antimeridian envelopes into two draws. Missing coordinates or an unavailable coordinate lookup retain the legacy AWC search with an explicit unverified-radius notice; use `bbox` for explicit geographic bounds
 - `altitude_min_ft` / `altitude_max_ft` filter to a cruise-altitude band in feet MSL, from 0 to 60000 ft (min must not exceed max); a report with unknown altitude is dropped once either bound is set
 - `min_intensity` (`lgt` / `mod` / `sev`) restricts to reports carrying a turbulence or icing layer at that intensity or above — a matching report still carries its lighter layers
 - Turbulence and icing arrays include up to two layers per report; icing layers the API synthesized for a report that never mentioned ice are dropped
 - Source report types remain open strings, including `PIREP`, `Urgent PIREP`, `AIREP`, and `AMDAR`. Outside air temperature (`temp_c`), wind aloft (`wind`), and decoded `/WX` flight weather (`weather`) preserve available readings. Ordinary and urgent PIREP wind directions are magnetic and unconverted; other report types receive no unverified reference label
 - Nullable `braking_action` preserves AWC's decoded `brkAction` (e.g., `MED`), including unfamiliar codes, without parsing remarks or inferring runway conditions
-- Every result states whether any candidate draw reached the upstream 400-row cap before radius and altitude filtering. Capped draws remain partial even when filtering leaves no reports. `limit` (1–400) selects the most recent matches independently of that cap. A result of more than 50 reports with no `limit` names the lever; omitting `limit` still returns every match
+- Every result states whether any candidate draw reached the upstream 400-row cap before radius and altitude filtering. Capped draws remain partial even when filtering leaves no reports. Pages start with the most recent matching reports.
 - PIREPs are sparse by nature — absence of reports does not mean smooth conditions
 
 ---
@@ -117,7 +125,7 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 - `altitude_ft` optionally selects a cruise altitude in nonnegative finite feet MSL. It rounds to the nearest 100 ft (half steps upward) and echoes `altitude_selection`: requested feet, effective integer flight level, and ±3,000 ft band with lower edge clamped to zero. SIGMET products use AWC's documented `level`; CWA uses inclusive interval overlap locally. Either unknown CWA bound retains the row conservatively. Per-source `altitude_filter` identifies `upstream` or `client`; `altitude_unknown` counts retained unknown bounds before bbox, describing only returned upstream data, not proven altitude matches. Both are null without an altitude filter or available coverage
 - CWA cancellation notices are excluded before active counts; `coverage[].cancelled` discloses their number (zero on readable feeds with none, null when unavailable). Cancellation and unknown altitude alone do not make coverage partial
 - `bbox` uses each intact geometry part's bounding envelope, including date-line crossings, rather than exact polygon intersection. Finite extended source longitudes wrap into [-180,180]; canonical coordinates remain unchanged. Input remains ordered (`minLat <= maxLat`, `minLon <= maxLon`). With bbox, `drawn` counts rows after cancellation removal and product/hazard/altitude selection, `matched` counts geographic matches, `returned` counts rows after any limit, and `unlocated` separately counts rows without decoded geometry
-- `limit` is optional with no default: omitted means every available match. An explicit limit orders by source, issuer, series and validity, reports `total`/`returned`/`truncated`, and explains how to retrieve withheld matches by omitting or raising it
+- Pages order by source, issuer, series, validity and bulletin text. `total`, `returned` and `truncated` describe paging over the available matches. Advisory limits have no automatic 400-row clamp.
 - Missing issuer, series, hazard, validity and raw text stay null. `geometry.parts` preserves separate rings/lines and source-native `kind` (including null); compatibility `polygon` is null for multipart, line or missing geometry. Domestic numeric severity/movement stay source-native; finite primary altitude bounds precede alternate bounds. International movement preserves `direction_text` (including `-`) and decoded knots on one line; nullable `stationary` is true only for explicit unquoted standalone `STNR`, false for a non-sentinel direction with positive speed, otherwise null. International `tendency` and CWA `issued_by_name` retain source tokens/names or null. CWA severity/movement remain null, and altitudes are never inferred from bulletin text
 - Original bulletins render in safe code fences preserving blank lines and embedded backticks. An empty result names readable sources and filtering stage; unavailable sources never establish fair weather
 - AIRMETs are not served. Requests for one (or `MTN OBSCN` / `SURFACE WIND` / `LLWS`) are rejected with guidance to separate AIRMET products
@@ -129,8 +137,9 @@ Aviation weather from the NWS Aviation Weather Center — METARs, TAFs, PIREPs, 
 - Arguments: `departure_icao` and `destination_icao` required; `alternates` (comma-separated ICAOs), `departure_time` (ISO 8601 UTC), `cruise_altitude` (feet MSL), and `route_waypoints` (semicolon-separated `lat,lon` pairs) optional
 - Every ICAO argument accepts 4 ASCII letters or digits in either case and generates uppercase IDs. For an IATA/FAA code, use `aviation_find_stations` with `state` or `bbox` to find the ICAO ID; no mapping is inferred. Direct IDs reject surrounding whitespace; comma-separated alternates allow it
 - Calls `aviation_get_metar`, `aviation_get_taf`, `aviation_get_pireps`, and `aviation_get_advisories` in sequence, chunked to each tool's station-per-call limit
-- `departure_time` selects the TAF forecast period the briefing is read against; `cruise_altitude` bounds the PIREP search to a ±3,000 ft band and forwards `altitude_ft` to advisories, including explicit zero; `route_waypoints` become the advisories `bbox`, widened by 1° on each side and retained alongside altitude selection
-- Omitting any of the three still generates the briefing, naming the assessment it could not make
+- `departure_time` sets the time to compare against TAF validity, prevailing conditions, BECMG transitions and active TEMPO or PROB overlays.
+- The prompt requests PIREPs and advisories per route box, splitting at the date line where needed. Without waypoints, it builds an airport-based approximation from METAR positions when both endpoints are located. If an endpoint is unlocated, it retains separate endpoint PIREP searches and reports the missing advisory area assessment.
+- `cruise_altitude` sets a ±3,000 ft PIREP band and forwards `altitude_ft` to advisory calls, including explicit zero.
 - Reports weather risk rather than a go/no-go recommendation — that decision needs pilot, aircraft, and operational-minima context this server does not hold
 
 ---
@@ -238,7 +247,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 - No API key required — the AWC Data API is fully public and keyless.
 
 ### Installation
@@ -265,7 +274,7 @@ bun install
 
 ```sh
 cp .env.example .env
-# edit .env if you need to override AWC_BASE_URL or AWC_TIMEOUT_MS
+# edit .env to override AWC settings
 ```
 
 ---
@@ -276,6 +285,7 @@ cp .env.example .env
 |:---------|:------------|:--------|
 | `AWC_BASE_URL` | Base URL for the NWS AWC Data API. | `https://aviationweather.gov/api/data` |
 | `AWC_TIMEOUT_MS` | Per-request timeout in milliseconds (1000–60000). | `10000` |
+| `AWC_CLAMP_LIMITS` | Clamp explicit result limits above 400. Set to `false` to enforce 400 in the input schema. | `true` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
 | `MCP_SESSION_MODE` | HTTP session handling: `auto` (resolves to `stateful`), `stateful`, or `stateless`. The server declares `stateless` in code — no tool here needs a multi-round-trip input — and the shipped `.env.example` and Docker image pin the same value. Setting this overrides the declaration. | `stateless` |
@@ -324,7 +334,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | Directory | Purpose |
 |:----------|:--------|
 | `src/index.ts` | `createApp()` entry point — registers tools/prompts and inits services. |
-| `src/config` | Server-specific env var parsing (`AWC_BASE_URL`, `AWC_TIMEOUT_MS`). |
+| `src/config` | AWC URL, timeout and result-limit configuration. |
 | `src/services/aviation-weather` | AWC Data API client — HTTP fetch, retry with exponential backoff, response normalization. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). |
 | `src/mcp-server/prompts` | Prompt definitions (`*.prompt.ts`). |

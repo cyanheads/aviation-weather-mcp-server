@@ -4,12 +4,12 @@ description: Use aviation_* tools for regional weather surveys, airport comparis
 license: Apache-2.0
 metadata:
   author: "cyanheads"
-  version: "1.0"
+  version: "1.1"
 ---
 
 ## Scope
 
-Use this guide when combining aviation weather results into an assessment. The server supplies recent observations, forecasts, pilot reports, and active advisories; it does not provide a historical archive.
+Use this guide to combine observations, forecasts, pilot reports, and active advisories. METAR, TAF and PIREP lookups accept a UTC `as_of` within the past 30 days. Include seconds and a trailing `Z`.
 
 ## Identifiers
 
@@ -30,15 +30,19 @@ Resolve the airport and available products with aviation_find_stations when need
 
 ### Regional survey
 
-Use aviation_get_metar for current conditions across an area. If the task needs broader station coverage, repeat the survey with smaller boxes and combine stations across the results; this can recover stations a dense parent box omitted, but does not prove completeness. For overlapping results, compare observation timestamps before selecting a station's current reading. Station registry discovery can identify candidates for named-station follow-up. aviation_find_stations state searches select every US registry member assigned to that state or DC from a complete snapshot fresh for up to 24 hours; a supplied limit can withhold matches. Membership follows source assignments, including offshore sites and questionable coordinates, and does not establish weather-report coverage. Bbox registry draws remain subject to the upstream row cap.
+Use aviation_get_metar and aviation_get_taf with `bbox` or `state` for conditions and forecasts across an area. If an airport has no TAF, query a nearby bbox and retain the original forecast gap. Weather state searches use AWC's weather selector. Use aviation_find_stations for registry membership or to identify candidates for named follow-up. Its US state snapshot refreshes on demand after 24 hours.
 
-When a draw reaches the upstream cap, narrow the search rather than treating a larger response limit as recovery. Distinguish results withheld by a caller-selected limit from records the upstream never returned. A condition filter selects from the available draw and cannot recover omitted stations.
+To continue a limited response, reuse its search arguments and set `offset` to `nextOffset`. Later pages use the currently available draw. Preserve upstream-cap and partial-coverage notices across calls, and account for possible overlap or gaps if the draw changes. A condition filter and paging both operate on available matches. Use smaller boxes to recover geographic omissions or shorter METAR lookbacks with successive earlier anchors to collect separate time windows. Compare timestamps before selecting the latest overlapping METAR.
+
+### Past conditions
+
+Anchor METAR and PIREP lookbacks at the assessment time with `as_of`. A historical TAF lookup selects by issuance time. Check the returned issue time and forecast validity separately, since the forecast may have been issued by the anchor and begin later. Carry a retention rejection or an in-range data gap into the assessment.
 
 ### Airport comparison and route assessment
 
 With direct tool calls, separate current conditions from trends: aviation_get_metar can return several observations per named station. Use their timestamps to select the current reading and retain earlier readings only when evaluating change.
 
-Read aviation_get_taf against the relevant flight times, using the returned period boundaries and change groups. Do not substitute current METAR conditions for a future forecast or imply a forecast covers a time outside its validity. Retain missing forecasts as gaps.
+Read aviation_get_taf at the relevant flight time. Start with the prevailing conditions inside `[valid_from, valid_to)`, then report each active TEMPO or PROB overlay, including combined PROB TEMPO, separately. Treat BECMG as a transition until `transition_end`. If that time is unknown, leave the establishment time unresolved. Carry forward prevailing elements unaffected by a conditional change. Retain missing or out-of-validity forecasts as gaps.
 
 Named aviation_find_stations lookups supply source-published airport magnetic_declination when available, with east-positive signed degrees and exact source text. A null value is unknown; a supplementary lookup failure adds a notice without invalidating station identity. The source supplies no epoch, so do not describe this as a current geomagnetic model or apply an airport value to every PIREP report location.
 

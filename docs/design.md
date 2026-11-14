@@ -6,11 +6,11 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `aviation_get_metar` | Current weather observations for named airports, or an area survey of every reporting station in a bounding box. Returns decoded fields (wind direction/speed/gusts, visibility, ceiling and its kind, present weather, temp/dewpoint, altimeter, cloud layers) plus the computed flight category (VFR/MVFR/IFR/LIFR) and the raw METAR string. Accepts 1–10 ICAO station IDs, or a bbox. | `station_ids?: string[]`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `hours?: number (1–12 lookback window, default 1)`, `limit?: number (1–400 response bound, bbox only)`, `flight_category?: ('VFR' \| 'MVFR' \| 'IFR' \| 'LIFR')[] (bbox only)` | `readOnlyHint: true, idempotentHint: true` |
-| `aviation_get_taf` | Terminal Aerodrome Forecast for one or more airports. Returns each forecast period with valid times, wind, visibility, decoded weather, and cloud layers, plus the raw TAF string. Accepts 1–4 ICAO station IDs. | `station_ids: string[]` | `readOnlyHint: true, idempotentHint: true` |
-| `aviation_get_pireps` | Recent Pilot Reports near an airport or within a bounding box. Returns decoded turbulence/icing/cloud reports with altitude, aircraft type, intensity, outside air temperature, wind aloft, flight weather, and the raw pirep string. | `station_id?: string`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `distance_nm?: number (station_id only, 100 when omitted)`, `hours?: number (1–12, default 3)`, `altitude_min_ft?: number`, `altitude_max_ft?: number`, `min_intensity?: 'lgt' \| 'mod' \| 'sev'`, `limit?: number (1–400 response bound)` | `readOnlyHint: true, idempotentHint: true` |
-| `aviation_get_advisories` | Domestic/international SIGMETs and CWAs with independent source coverage, nullable decoded fields, multipart geometry and original bulletins. AIRMET requests are rejected. | `hazard?: enum`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `advisory_type?: 'sigmet' \| 'isigmet' \| 'cwa' \| 'airmet' \| 'all'`, `limit?: positive integer` | `readOnlyHint: true, idempotentHint: true` |
-| `aviation_find_stations` | Resolve an airport or weather reporting station by ICAO ID, or discover stations within a bounding box or US state. Returns ICAO/IATA/FAA IDs, coordinates, elevation, and available data types. | `station_ids?: string[]`, `bbox?: {minLat, minLon, maxLat, maxLon}`, `state?: string (2-letter)`, `limit?: number (1–400 response bound, bbox/state only)` | `readOnlyHint: true, idempotentHint: true, openWorldHint: false` |
+| `aviation_get_metar` | Current or historical observations. Surveys retain the latest observation per drawn station. | `station_ids` (1–10), `bbox`, or `state`. Optional `as_of` and `hours`. Surveys also accept `flight_category`, `offset`, and `limit`. | `readOnlyHint: true, idempotentHint: true` |
+| `aviation_get_taf` | Current or historically issued forecasts with decoded periods and the raw bulletin. | `station_ids` (1–4), `bbox`, or `state`. Optional `as_of`. Surveys also accept `offset` and `limit`. | `readOnlyHint: true, idempotentHint: true` |
+| `aviation_get_pireps` | Current or historical pilot reports near an airport or within a bounding box. | `station_id` with optional `distance_nm`, or `bbox`. Optional `as_of`, `hours`, `altitude_min_ft`, `altitude_max_ft`, `min_intensity`, `offset`, and `limit`. | `readOnlyHint: true, idempotentHint: true` |
+| `aviation_get_advisories` | Domestic/international SIGMETs and CWAs with independent coverage, decoded fields, geometry and original bulletins. | Optional `advisory_type`, `hazard`, `bbox`, `altitude_ft`, `offset`, and `limit`. | `readOnlyHint: true, idempotentHint: true` |
+| `aviation_find_stations` | Resolve a registry identifier or discover stations by location. | `station_ids`, `bbox`, or `state`. Area modes accept `offset` and `limit`. | `readOnlyHint: true, idempotentHint: true, openWorldHint: false` |
 
 ### Resources
 
@@ -65,6 +65,7 @@ Single service, single upstream. The service handles HTTP fetch with timeout, re
 |:--------|:---------|:------------|
 | `AWC_BASE_URL` | No | Override for base URL (default: `https://aviationweather.gov/api/data`). Useful for testing against a mock or staging instance. |
 | `AWC_TIMEOUT_MS` | No | Request timeout in milliseconds (default: `10000`). |
+| `AWC_CLAMP_LIMITS` | No | Clamp explicit limits above 400 where the response has a served maximum (default: `true`). |
 
 No API key required. Config schema is minimal.
 
@@ -72,7 +73,7 @@ No API key required. Config schema is minimal.
 
 ## Implementation Order
 
-1. **Config** — `src/config/server-config.ts` with `AWC_BASE_URL` and `AWC_TIMEOUT_MS`
+1. **Config** — `src/config/server-config.ts` validates the AWC URL, timeout and limit policy.
 2. **Service** — `src/services/aviation-weather/aviation-weather-service.ts` with `fetchMetar`, `fetchTaf`, `fetchPireps`, `fetchAdvisories`, `fetchStations` methods; retry + timeout via `withRetry`/`fetchWithTimeout`
 3. **Service types** — `src/services/aviation-weather/types.ts` (raw API response shapes + normalized output types)
 4. **Tools** — in this order: `aviation_find_stations` → `aviation_get_metar` → `aviation_get_taf` → `aviation_get_pireps` → `aviation_get_advisories`
@@ -88,9 +89,9 @@ Each step is independently testable.
 | Noun | Operations | API Endpoint |
 |:-----|:-----------|:-------------|
 | Station | find by ICAO IDs, find by bbox, find by US state | `GET /stationinfo` |
-| METAR | get current/recent by ICAO IDs, or survey a bounding box | `GET /metar?ids=&format=json&hours=` · `GET /metar?bbox=&format=json&hours=` |
-| TAF | get current by ICAO IDs | `GET /taf?ids=&format=json` |
-| PIREP | list recent by station + distance, or by bbox; narrowed upstream by altitude band and minimum intensity | `GET /pirep?id=&format=json&distance=&age=&level=&inten=` |
+| METAR | observations by station IDs, bbox, or state selector | `GET /metar` with `ids` or `bbox`, plus `hours` and optional `date` |
+| TAF | forecasts by station IDs, bbox, or state selector | `GET /taf` with `ids` or `bbox`, plus optional `date` with `time=issue` |
+| PIREP | reports by radial search or bbox, with supported altitude and intensity selection | `GET /pirep` with `bbox` or legacy `id` and `distance`, plus `age` and optional `date`, `level`, and `inten` |
 | AIRSIGMET | list active, narrowed upstream by hazard and client-side by bbox | `GET /airsigmet?format=json&hazard=` |
 | International SIGMET | list active, narrowed upstream by hazard and client-side by bbox | `GET /isigmet?format=json&hazard=` |
 | CWA | list active, narrowed upstream by hazard and client-side by bbox | `GET /cwa?format=json&hazard=` |
@@ -99,18 +100,25 @@ Each step is independently testable.
 
 ## Tool Design Details
 
+**Historical anchors.** METAR, TAF, and PIREP accept `as_of` as an ISO 8601 UTC calendar timestamp with seconds, optional milliseconds and a required `Z`. The service sends the validated anchor as AWC's `date`. `future_as_of` and `outside_retention` distinguish invalid time ranges from an in-range empty draw. The 30-day anchor window is checked before upstream work, and an explicit upstream retention rejection retains the same reason. Omitted anchors keep current queries and their existing defaults.
+
+**Weather state selection.** METAR and TAF send `ids=@ST` for the 50 US states and DC, with case-independent input. They report the available weather draw. The complete state member list comes from the separate station registry.
+
 ### `aviation_get_metar`
 
 **Input schema:**
 ```
 station_ids: z.array(z.string().regex(/^[A-Za-z0-9]{4}$/).describe('ICAO station ID')).min(1).max(10).optional()   // ASCII letters or digits, normalized to uppercase in the handler (decision 31)
 bbox: z.object({ minLat, minLon, maxLat, maxLon }).optional()   // area survey — the latest observation per station in the box (decision 34)
-hours: z.number().int().min(1).max(12).default(1)   // a lookback window, not a row limit; with station_ids every observation inside it is returned, and with bbox it shapes the draw the row cap applies to
-limit: z.number().int().min(1).max(400).optional()   // bbox mode only — a response bound, not an area narrowing; ordered by station_id ascending
-flight_category: z.array(z.enum(['VFR', 'MVFR', 'IFR', 'LIFR'])).min(1).optional()   // bbox mode only — keeps the stations in these categories, after the reduction to one per station and before limit; 'unknown' never matches (decision 37)
+state?: string   // US state or DC
+as_of?: string
+hours: integer   // 1–720, default 1, ending at as_of or the current time
+offset?: nonnegative integer   // area modes only
+limit?: positive integer       // area modes only, served maximum 400 (decision 36)
+flight_category?: ('VFR' | 'MVFR' | 'IFR' | 'LIFR')[]   // area modes only, after latest-per-station reduction
 ```
 
-Exactly one of `station_ids` or `bbox` is required, mutually exclusive.
+Exactly one of `station_ids`, `bbox`, or `state` is required.
 
 **Output schema (per station):**
 ```
@@ -140,45 +148,51 @@ An empty `clouds` array and `sky_condition` are read together: the array empties
 
 `wind.direction_deg` is null in two cases, and `speed_kt` is what separates them — the same pair `aviation_get_taf` carries. A variable wind arrives as `wdir: "VRB"` beside a real speed; an observation with no wind group at all (a sensor that sent none) arrives as `wdir: null, wspd: null`. `content[]` renders the first `variable at N kt` and the second `not reported`, never `variable`, and a calm `00000KT` stays `0° at 0 kt`.
 
-**Design note:** a `bbox` survey returns one observation per station — the latest inside the `hours` window — reduced in the tool after the draw, because `/metar` windows on `hours` alone and rejects any other key. Cap detection reads the pre-reduction row count, and the truncation notice names `hours` as its first lever above `hours: 1`; at the minimum of 1 it leads with the quadrants. See decision 34.
+**Design note:** Area surveys reduce the draw to the latest observation per station. Cap detection uses the pre-reduction row count. A shorter `hours` window reduces repeated observations. Successive earlier anchors divide time, and smaller bboxes divide area. See decision 34.
 
 **Design note:** `flight_category` narrows a survey by condition, client-side: `/metar` takes no category parameter, so the draw and its cap are untouched. The filter reads each station's latest observation and runs before `limit`; a survey it empties is returned as an empty result whose notice names the filter, not as `no_stations_found`. See decision 37.
 
 **Error contract:**
 ```
 { reason: 'no_stations_found', code: NotFound, when: 'No station returned data — none of the requested IDs, or none inside the box', recovery: mode-agnostic in the contract; the throw site sends a hint branched on the mode that drew nothing — see decision 34 }
-{ reason: 'missing_location', code: ValidationError, when: 'Neither station_ids nor bbox provided', recovery: 'Provide station_ids for named airports or bbox for an area survey.' }
-{ reason: 'conflicting_location', code: ValidationError, when: 'Both station_ids and bbox provided', recovery: 'Provide station_ids OR bbox, not both.' }
+{ reason: 'missing_location', code: ValidationError, when: 'No location selector provided', recovery: 'Provide station_ids, bbox, or state.' }
+{ reason: 'conflicting_location', code: ValidationError, when: 'Multiple location selectors provided', recovery: 'Choose one location selector.' }
 { reason: 'invalid_bbox', code: ValidationError, when: 'The bounding box is inverted', recovery: 'Ensure minLat <= maxLat and minLon <= maxLon.' }
 { reason: 'conflicting_limit', code: ValidationError, when: 'limit provided together with station_ids', recovery: 'Drop limit, or replace station_ids with bbox.' }
 { reason: 'conflicting_flight_category', code: ValidationError, when: 'flight_category provided together with station_ids', recovery: "Drop flight_category and read each named station's flight_category, or replace station_ids with bbox." }
 ```
 
-Guard order is `missing_location` → `conflicting_location` → `invalid_bbox` → `conflicting_limit` → `conflicting_flight_category`, so a location-mode mistake is always reported ahead of a filter mistake — the order `aviation_find_stations` and `aviation_get_pireps` use.
+Location guards precede named-mode conflicts for paging or category selection. An unsupported state raises `invalid_state`.
 
-**Enrichment contract** — two disclosures on disjoint modes (decisions 17, 18, 24, 34, 36, and 37):
+**Enrichment contract** (decisions 17, 18, 24, 34, 36, and 37):
 ```
 requested:    string[]        // station_ids mode — station IDs as requested
 returned:     string[]        // station_ids mode — distinct station IDs present in the result, counted per station not per row
 partial:      boolean         // station_ids mode — true when a requested station returned nothing
 missing:      string[]        // station_ids mode — only when non-empty
-truncated:    boolean         // bbox mode — true when the draw hit the 400-row upstream cap
-shown:        number          // bbox mode — stations returned, after the reduction to one row each, any flight_category filter, and any limit
-surveyed:     number          // only when a bbox call supplied flight_category — stations before the filter selected from them
+truncated:    boolean         // area modes, and capped named draws
+shown:        number          // stations returned after selection and paging
+surveyed:     number          // area calls with flight_category, before that filter
 cap:          number          // only when truncated — the upstream row maximum applied
-upstreamRows: number          // only when the reduction narrowed a truncated draw
-limited:      boolean         // only when a bbox call supplied a limit — true when it withheld matching stations
-matched:      number          // only when limited — stations the draw held before the limit selected from them, after any flight_category filter
+upstreamRows: number          // raw capped rows where disclosed
+limited:      boolean         // area calls with limit, whether it withheld matches
+matched:      number          // pre-page matches when matches were withheld or offset was supplied
+nextOffset?:  number          // only when more matches remain in the available draw
 notice:       string          // whichever disclosures fired, in pipeline order — the narrowing levers, what the filter kept or that it emptied the result, what a limit withheld, the limit lever on a survey of more than 40 stations that set none; or the IDs that returned nothing
 ```
 
-Only `bbox` reaches the row cap (`station_ids` is bounded at 10 by the input schema) and accepts a filter or a `limit`, and only `station_ids` has a request to reconcile, so the reconciliation never co-occurs with the rest and `notice` is shared without conflating anything. The survey statements *can* co-occur, and there the notice states each in turn — cap, filter, limit, size — see decisions 24 and 36.
+Wide windows can reach the upstream cap in every mode. Named lookups return all drawn observations and reconcile distinct stations. When capped, missing named stations remain unresolved. Surveys reduce to the latest drawn observation per station, then apply the category filter and paging. The notice carries each applicable disclosure.
 
 ### `aviation_get_taf`
 
 **Input schema:**
 ```
-station_ids: z.array(z.string().regex(/^[A-Za-z0-9]{4}$/).describe('ICAO station ID')).min(1).max(4)   // ASCII letters or digits, normalized to uppercase in the handler (decision 31)
+station_ids?: string[]   // 1–4 ICAO IDs, normalized to uppercase
+bbox?: { minLat, minLon, maxLat, maxLon }
+state?: string           // US state or DC
+as_of?: string           // requests issuance-time selection
+offset?: nonnegative integer   // area modes only
+limit?: positive integer       // area modes only, served maximum 400 (decision 36)
 ```
 
 **Output schema (per station):**
@@ -186,11 +200,14 @@ station_ids: z.array(z.string().regex(/^[A-Za-z0-9]{4}$/).describe('ICAO station
 station_id: string
 name: string
 issued_at: string            // ISO 8601 from issueTime
+remarks: string | null       // source remarks
+amended: boolean | null      // explicit AMD in recognizable bulletin header, null if unclassifiable
 valid_from: string           // ISO 8601 from validTimeFrom
 valid_to: string             // ISO 8601 from validTimeTo
 forecast_periods: [{
   from: string,              // ISO 8601 from timeFrom
   to: string,                // ISO 8601 from timeTo
+  transition_end: string | null // ISO 8601 from timeBec
   change_type: string | null // fcstChange: 'FM', 'TEMPO', 'BECMG', 'PROB' (a standalone probability group), null
   probability: number | null // probability
   wind: { direction_deg: number | null, speed_kt: number | null, gust_kt: number | null }
@@ -201,9 +218,14 @@ forecast_periods: [{
   clouds: { cover: string, base_ft: number, type: string | null }[]   // base_ft is feet AGL; at most three layers, AWC's decode limit; empty whenever the period published no layer heights
   sky_condition: string | null   // the group the period forecast when its cover carries no height (SKC/NSC, or OVX for an obscuration with no vertical visibility); null when clouds carries layers, and when the period carried no cloud element
   not_decoded: string | null     // notDecoded, trimmed — text AWC attached to the period without decoding it; null when empty or whitespace-only; never reassigned or parsed into clouds
+  altimeter_hpa: number | null
+  temperature_forecasts: { valid_at, temperature_c, kind }[]
+  icing_turbulence: { kind, intensity_code, min_altitude_ft, max_altitude_ft }[]
 }]
 raw_taf: string              // rawTAF
 ```
+
+Exactly one location selector is required. Historical TAF requests pair `date` with `time=issue`. A forecast can be issued by the anchor and begin after it. The returned validity window and period boundaries are preserved. `transition_end` gives the end of a BECMG transition independently of the period's `to`. Temperature extrema retain their own timestamps. Icing and turbulence preserve source kind and intensity codes, with null for missing altitude bounds. Empty arrays mean AWC supplied no decoded elements.
 
 `wind.speed_kt` is null when the period carries no wind element — a TEMPO or PROB group amending only visibility, weather, or cloud, which is 13% of live CONUS forecast periods. `wdir` is null on exactly those, and the string `VRB` on a variable wind that does carry a speed; both normalize to `direction_deg: null`, so `speed_kt` is what separates "no wind forecast" from "variable". 0 kt stays a forecast calm.
 
@@ -217,10 +239,10 @@ raw_taf: string              // rawTAF
 
 **Error contract:**
 ```
-{ reason: 'no_taf_available', code: NotFound, when: 'Station does not issue TAFs (not a TAF-capable station)', recovery: 'Not all airports have TAFs. Check siteType from aviation_find_stations. VFR advisory airports may only have METARs.' }
+{ reason: 'no_taf_available', code: NotFound, when: 'The selected draw returned no forecast', recovery: 'For a named lookup, search a nearby bbox for alternate forecasts.' }
 ```
 
-**Enrichment contract** (see decision 17 — the same shape on `aviation_get_metar`):
+**Named enrichment** (decision 17):
 ```
 requested: string[]           // always — station IDs as requested
 returned:  string[]           // always — distinct station IDs present in the result
@@ -229,6 +251,8 @@ missing:   string[]           // only when non-empty
 notice:    string             // only on a partial result — recovery guidance
 ```
 
+Surveys report the upstream cap separately from paging. Unpaged products retain source order. Paged products order by station ID, descending issue time, then raw bulletin text. `nextOffset` is available only while selected products remain.
+
 ### `aviation_get_pireps`
 
 **Input schema:**
@@ -236,11 +260,13 @@ notice:    string             // only on a partial result — recovery guidance
 station_id: z.string().regex(/^[A-Za-z0-9]{4}$/).optional().describe('Center ICAO station for radial search.')   // ASCII letters or digits, normalized to uppercase in the handler (decision 31)
 bbox: z.object({ minLat, minLon, maxLat, maxLon }).optional()
 distance_nm: z.number().int().min(10).max(500).optional().describe('Search radius in nautical miles around station_id. 100 when omitted.')
-hours: z.number().int().min(1).max(12).default(3).describe('How far back to look.')
+as_of?: string
+hours: integer   // 1–48, default 3, ending at as_of or the current time
 altitude_min_ft: z.number().int().min(0).max(60000).optional().describe('Filter by minimum altitude in feet MSL (e.g., 18000 for FL180).')   // 0 ft to FL600 — decision 33
 altitude_max_ft: z.number().int().min(0).max(60000).optional().describe('Filter by maximum altitude in feet MSL (e.g., 35000 for FL350).')   // 0 ft to FL600 — decision 33
 min_intensity: z.enum(['lgt', 'mod', 'sev']).optional().describe('Return only reports carrying at least one turbulence or icing layer at this intensity or above. Selects reports, not layers.')
-limit: z.number().int().min(1).max(400).optional()   // a response bound, not a search narrowing — applied last, after the sort
+offset?: nonnegative integer
+limit?: positive integer   // served maximum 400 (decision 36)
 ```
 
 Note: `station_id` or `bbox` is required (mutually exclusive, validate in handler).
@@ -304,11 +330,12 @@ shown:        number          // always — reports returned after geographic se
 cap:          number          // only when truncated — the upstream row maximum applied
 upstreamRows: number          // when geographic selection or altitude filtering narrowed capped candidate draws; sum before filtering/deduplication
 limited:      boolean         // only when the call supplied a limit — true when it withheld matching reports
-matched:      number          // only when limited — reports that matched before the limit selected from them
+matched:      number          // pre-page matches when matches were withheld or offset was supplied
+nextOffset?:  number          // only when more matches remain in the available draw
 notice:       string          // whichever disclosures fired — the narrowing levers, what a limit withheld, and the limit lever on a result of more than 50 reports that set none
 ```
 
-Detection reads each candidate draw before geographic selection and altitude filtering. The service supplies the sum of raw rows and whether any individual draw reached 400; two uncapped antimeridian draws totaling over 400 are not truncated. The service deduplicates wrapped draws and selects the nautical circle before the handler filters altitude, sorts, and applies `limit`. Both successful and emptied capped draws disclose partial coverage. `level`, `inten`, and `age` remain upstream filters on every candidate request.
+Detection reads each candidate draw before geographic selection and altitude filtering. The service supplies the sum of raw rows and whether any individual draw reached 400. The service deduplicates wrapped draws and selects the nautical circle before the handler filters altitude, orders by descending observation time, and pages. Both candidate draws and the legacy fallback use the same `as_of` anchor. `level`, `inten`, and `age` remain upstream filters on every candidate request.
 
 When a capped page is then emptied by the altitude filter, `no_pireps_found` says the area was searched only in part and points at the same narrowing levers. It does not report the capped page's row count as the reports present in the area — that count describes the page, not the area, and the filter never saw beyond it. An empty draw under an upstream narrowing gets its own message, since the query never asked for the whole area to begin with.
 
@@ -321,6 +348,7 @@ hazard: z.enum(['CONVECTIVE', 'TURBULENCE', 'ICING', 'IFR', 'TS', 'MTW', 'DS', '
 bbox: z.object({ minLat, minLon, maxLat, maxLon }).optional() // ordered input; bounding-envelope overlap on every source geometry part
 altitude_ft: z.number().min(0).optional() // finite feet MSL, nearest-100-ft rounding
 limit: z.number().int().min(1).optional() // no default or automatic cap
+offset: z.number().int().min(0).optional()
 ```
 
 **Output schema (per advisory):**
@@ -354,13 +382,14 @@ Independent applicable products run concurrently under one 45-second deadline sp
 coverage: { source, status: 'ok' | 'failed' | 'not_applicable', drawn: number | null, cancelled: number | null, altitude_filter: 'upstream' | 'client' | null, altitude_unknown: number | null, message?: string }[]
 altitude_selection?: { requested_ft, level, band_low_ft, band_high_ft } // rounded integer level and effective feet-MSL band
 partial: boolean // failed source or skipped unreadable rows
-drawn / matched / returned / unlocated: number // bbox only; returned also present with explicit limit
-total: number // explicit limit only, matches before limit
-truncated: boolean // explicit limit only, true if matches withheld
+drawn / matched / returned / unlocated: number // bbox only; returned also present with explicit paging
+total: number // explicit paging only, matches before offset and limit
+truncated: boolean // explicit paging only, true if paging omitted matches
+nextOffset?: number // only when more matches remain in the available draw
 notice?: string // readable coverage, empty/filter stage, partial coverage and limit recovery
 ```
 
-Source `drawn` and bbox `drawn` count decoded active rows after product/hazard/altitude selection and before bbox; `matched` precedes limit and `returned` follows it. `unlocated` is separate from proven-outside rows. No bbox means no bbox-specific counts/notices. An explicit limit sorts by source/issuer/series/validity (raw text breaks remaining ties), discloses totals and offers omission/raising as recovery. It has no default and no upstream cap claim. Empty hazard-scoped notices never assert other hazards are active; altitude-scoped empty notices name altitude selection before bbox.
+Source `drawn` and bbox `drawn` count decoded active rows after product, hazard and altitude selection and before bbox. `matched` precedes paging and `returned` follows it. `unlocated` is separate from proven-outside rows. Paged results order by source, issuer, series, validity and raw text, with the remaining decoded fields breaking ties. The caller can continue through available matches independently of source coverage. Empty hazard-scoped notices leave other hazards unknown. Altitude-scoped empty notices name altitude selection before bbox.
 
 `TS` and `CONVECTIVE` are aliases at the query boundary: domestic sends `conv`, international and CWA send `ts`. Output hazards remain source-native; matching stays upstream. Finite primary domestic altitude bounds take precedence, falling back to alternate bounds only when unavailable. This preserves existing finite values and zero rather than asserting an unsupported alternate precedence. Finite source longitudes outside [-180,180] wrap modulo 360 before storage and shortest-arc envelope matching; already canonical coordinates, including 180, stay unchanged. Malformed vertices still invalidate all parts.
 
@@ -377,7 +406,8 @@ International `tendency` preserves `chng` as an open nullable token; CWA `issued
 station_ids: z.array(z.string().regex(/\S/)).min(1).max(20).optional()   // comma-split and token-trimmed handler-side, 1–20 expanded tokens; empty tokens rejected; registry IDs retain their broader grammar
 bbox: z.object({ minLat, minLon, maxLat, maxLon }).optional().describe('Return all stations in bounding box.')
 state: z.string().length(2).optional().describe('Two-letter USPS code for one of the 50 US states or DC (e.g., "WA").')
-limit: z.number().int().min(1).max(400).optional()   // bbox and state modes only — a response bound, not an area narrowing; rejected alongside station_ids. Ordered by icao_id asc, identifier-less last, tiebroken by registry id — see decision 26
+offset?: nonnegative integer   // bbox and state only
+limit?: positive integer       // bbox and state only, served maximum 400 (decision 36)
 ```
 
 Exactly one of `station_ids`, `bbox`, or `state` is required.
@@ -419,7 +449,8 @@ shown:        number          // always — stations returned, after any state f
 cap:          number          // only when truncated — the upstream row maximum applied
 upstreamRows: number          // retained optional compatibility field; complete state mode does not emit it
 limited:      boolean         // only when the call supplied a limit — true when it withheld matching stations
-matched:      number          // only when limited — stations that matched before the limit selected from them
+matched:      number          // pre-page matches when matches were withheld or offset was supplied
+nextOffset?:  number          // only when more matches remain in the available draw
 requested:    string[]        // station_ids mode — the identifiers as the caller spelled them, trimmed
 returned:     string[]        // station_ids mode — the requested identifiers that resolved
 partial:      boolean         // station_ids mode — true when a requested identifier resolved to nothing
@@ -464,7 +495,7 @@ The hazard axis is not in the same position — `/airsigmet` does define a `haza
 **7. Prompt included despite read-only server.**
 The `aviation_preflight_brief` prompt earns its place: a preflight briefing has a well-established structure (METAR → TAF → PIREPs → advisories) that agents frequently get wrong by omitting steps. The prompt encodes the correct sequence and synthesis pattern.
 
-It is also the only place the flight itself can be described. Every tool here is keyed to a station, a box, or a hazard class — none of them takes a departure time, a cruise level, or a route — so an agent asked for "a briefing for this flight" has nowhere to put that context and answers with station weather instead. The prompt collects it and spends it on the steps that can use it: a cruise altitude becomes the PIREP altitude band, route waypoints become the advisory bbox, and a departure time becomes the instruction to read the TAF period whose valid window covers it. What it does not do is convert the result into a Go/No-Go verdict — that decision needs pilot currency, aircraft capability, and operational minima, none of which this server holds. See decision 30.
+The prompt collects flight context and applies it to the relevant steps. Cruise altitude sets the PIREP band and advisory altitude. Route boxes bound both searches. Departure time guides interpretation of the prevailing and conditional TAF periods. The prompt reports weather risk and assessment gaps. A go/no-go verdict requires pilot currency, aircraft capability and operational minima. See decision 30.
 
 **8. The PIREP lookback parameter is `age`, not `hours`.**
 `/pirep` declares `id, distance, bbox, format, age, level, inten, date` — no `hours`. The endpoint returns HTTP 200 and silently drops query keys it does not recognize, so sending `hours` produced the same fixed window for every value in both query modes. `/metar` and `/taf` do define a separate, correctly-named `hours` parameter, so the mismatch is specific to `/pirep`. The tool's public `hours` input keeps its name; only the outgoing key differs.
@@ -529,14 +560,14 @@ This lives in `enrichment`, not `output`: it is agent-facing context about the r
 *One missing state, not several.* A station can go missing because the ID is unknown, because it issues no such product, or because it reported nothing inside the lookback, and the weather response cannot tell them apart — AWC omits the row identically in all three cases. Resolving them would take a second `/stationinfo` request per call and still fail, because a registered station with no recent observation is listed as fully capable. So `missing` is flat and the notice names the candidate causes without asserting one, which is the same rule that keeps normalization from fabricating facts out of absent upstream data.
 
 **18. A capped result says so; it does not quietly reassemble itself.**
-Stationinfo bbox, METAR bbox and PIREP queries can reach AWC's 400-row ceiling, and the OpenAPI schema exposes no pagination. Detection reads the draw before any local reduction or limit; a returned count below 400 cannot prove the draw was uncapped. State membership instead comes from the complete registry (decision 39), outside this API cap.
+Stationinfo bbox, METAR, area TAF and PIREP queries can reach AWC's 400-row ceiling. Detection reads the draw before any local reduction or paging. A returned count below 400 does not establish the upstream count. State registry membership comes from the complete snapshot outside this API cap (decision 39).
 
 Cap disclosure does not automatically reassemble bbox or weather queries. The caller paces smaller queries and unions their results; a larger response limit cannot recover rows the upstream never served. Complete state membership uses a separate metadata snapshot because registry state assignments cannot be inferred reliably from geography.
 
 *Every suggestion names only levers the same call can use.* This holds for cap guidance, empty-result hints and notices, partial-batch notices, and declared recoveries alike. A lever the call cannot pull sends the caller into a rejection or a no-op, so a suggestion is scoped by the search mode and by the schema bounds of the value it moves:
 - `distance_nm` is offered only on a `station_id` search, since it is `conflicting_distance` beside a `bbox`.
 - A different `bbox` is offered only on an area search.
-- A shorter `hours` is offered only above the minimum of 1, and a longer one only below the maximum of 12.
+- A shorter `hours` is offered only above the minimum of 1, and a longer one only below the product's maximum.
 - A smaller `distance_nm` is offered only above the minimum of 10, and a larger one only below the maximum of 500.
 - A widened `flight_category` is offered only while some category is still unnamed.
 
@@ -549,7 +580,7 @@ What the rule changed:
 | `aviation_get_pireps` | Cap guidance, and the recovery for an altitude-emptied capped page | Scoped by mode and by the `hours` minimum |
 | `aviation_get_pireps` | `no_pireps_found` hints (plain, upstream-narrowed, altitude-emptied) and its contract recovery | Scoped by mode and by the `hours` and `distance_nm` maxima; the radial hint with both levers usable is unchanged |
 | `aviation_get_metar` | Cap guidance | Leads with the quadrants at `hours: 1` |
-| `aviation_get_metar` | Empty-box hint, the missing-station notice, and the `no_stations_found` contract | Drop "raise hours" / "Widen hours" at the maximum of 12 |
+| `aviation_get_metar` | Empty-area hint, the missing-station notice, and the `no_stations_found` contract | Drop "raise hours" / "Widen hours" at the maximum of 720 |
 | `aviation_get_metar` | Filter-emptied notice | Says only "Drop" when all four categories were named |
 | `aviation_find_stations` | `station_not_found` | Branched by mode: an area search is told to widen the box or use an explicit bbox, not to "use bbox or state"; an identifier lookup keeps its hint |
 
@@ -658,7 +689,7 @@ Every parameter on `aviation_get_pireps` and `aviation_find_stations` before thi
 
 *`limited` is emitted only when a limit was supplied.* Decision 17's affirmative-completeness rule earns its place where a count cannot establish the fact; here a caller who set no limit already knows none applied, and `truncated: false` already affirms the draw was whole. Emitting it unconditionally would also add a field to every existing caller's response, which this addition should not do. A caller who *did* set one is owed the affirmative: `limited: false` separates a limit that withheld nothing from one that bit.
 
-*Without a limit, the source order is retained.* Large area results get the size notice defined in decision 36. `shown` counts rows after any filter and limit; a cap notice describes the source draw independently of that returned count.
+*Unpaged calls retain their established order.* Large unpaged results get the size notice defined in decision 36. `shown` counts rows after selection and paging. The cap notice describes the draw independently.
 
 **25. What a limit omits is answered with a lever, not with a summary of the omissions.**
 Returning fewer PIREPs discards a severity signal a pilot is asking about, and the tempting fix is to summarize what was dropped — a count, an altitude span, the highest intensity present. The count is kept (`matched`). The severity summary is not, and the reason is that this tool deliberately does not rank intensities. `min_intensity` is pushed to AWC's `inten` precisely so AWC does the matching against its own vocabulary (decision 19), and `icgInt`/`tbInt` are open free-text-derived codes — `NEG`, `TRC`, `LGT`, `LGT-MOD`, `MOD`, `SEV`, plus two-part ranges. Deriving "the highest intensity omitted" would introduce a second, client-side ranking of that vocabulary, unvalidated and in a tool whose whole intensity story is that it does not own one. On a capped page the summary would also describe the page rather than the area, which is the conflation decision 24 exists to prevent.
@@ -676,7 +707,7 @@ PIREPs are already ordered by observation time descending, so a limit there mean
 
 *What the caller can and cannot verify.* `icao_id` is published, so the primary ordering is legible in the payload. The tiebreak is not: decision 22 deliberately keeps `id` out of the output, so wherever it is the operative key — between two identifier-less rows — the caller cannot see the order they were served, only that it is stable across calls. That is a real limitation of this ordering rather than a gap to paper over; publishing `id` would change the `stations` payload and belongs to its own change.
 
-*The sort runs only when a limit was supplied.* Omitting `limit` returns the draw exactly as it arrives, so no existing caller's ordering moves. Upstream sometimes serves `stationinfo` in that order anyway — `ids=KSEA,KJFK` comes back KJFK first — so the sort can be a near-no-op, but one probe is not a contract, and the buoy case above is precisely where upstream's own order and a useful one diverge.
+*The sort runs only when offset or limit is supplied.* An unpaged call keeps the draw order. AWC can pick a different order from the requested ID list, so named reconciliation uses identifiers.
 
 *`limit` alongside `station_ids` is rejected, not ignored.* The caller has already named the set, and #31's reconciliation covers the gap between what was asked for and what came back. Rejecting follows decision 9's rule for `distance_nm` on a bbox search: a silently inert parameter is one the caller never learns did nothing. It is also what keeps the shared `notice` unambiguous — the reconciliation writes a notice of its own, and with the modes disjoint the two can never overwrite each other.
 
@@ -704,7 +735,7 @@ The tool advertised that station IDs "must be 4-letter ICAO format" and that "th
 **30. Flight context is optional, and an absent one is named in the briefing rather than refused at the schema.**
 `departure_time`, `cruise_altitude`, and `route_waypoints` are the flight context decision 7 describes. All three are optional, and requiring them was rejected: the prompt's three existing args are the only ones any current call sends, so a required field fails every one of them, and it buys nothing the optional form does not. The synthesis step already reports what it could not assess — a missing departure time or cruise altitude is exactly such a gap, and a schema rejection tells the caller strictly less than a briefing that names it.
 
-*Absence is disclosed twice, at the step and in the summary.* The step that would have used the argument says so where the instruction would have gone — the TAF step states no forecast period can be tied to a flight window, the PIREP step that the search cannot be bounded to a cruise level, the advisories step that they cannot be bounded to a route corridor — and each also appears under **Gaps and uncertainty** in the summary, beside the standing instruction to report any station that returned no data and anything the tools flagged as partial, truncated, or limited. The step line is where the model is deciding what to call; the summary line is what the reader ends up holding. One without the other loses half the disclosure.
+*Disclose missing context in the step and in the summary.* Missing time leaves departure-time forecast alignment open. Missing altitude leaves cruise-level filtering open. An airport-based envelope without waypoints approximates the route. Missing endpoint positions leave the area assessment open. Carry missing stations and partial, capped or paged coverage into **Gaps and uncertainty**.
 
 *Identifier arguments enforce the weather tools' shape.* `departure_icao` and `destination_icao` require four ASCII letters or digits, and `alternates` requires a comma-separated list of the same identifiers, with surrounding whitespace allowed. Decision 31 defines the shared case acceptance and normalization. `aviation_find_stations` deliberately does not get this pattern (decision 27): it matches the registry's own `id`, which for a buoy or mesonet site may have another shape.
 
@@ -714,11 +745,11 @@ The tool advertised that station IDs "must be 4-letter ICAO format" and that "th
 
 *Both ends are then clamped to the range the tool accepts* — 0 ft to FL600 (decision 33) — rather than going outside it: the floor is the correct trade against printing `altitude_min_ft: -1500` into a briefing, and the ceiling against printing a top the tool then rejects. Rounding precedes the clamp so the clamp keeps the last word at either end, and neither step can reorder the bounds, since both are derived from one centre and passed through the same monotonic clamp. Clamping both ends rather than one is what keeps the band ordered in the first place: `cruise_altitude` admits six digits, so clamping only the top would leave the floor above it and instruct a band the tool refuses as inverted; the same clamp on both ends collapses that case to a degenerate band at the ceiling, which is valid and pushes as `level=600`. Every band the prompt can derive is therefore ordered, inside the accepted range, and pushable — verified exhaustively against `pushablePirepLevel` across all 1,000,000 cruise altitudes the six-digit input admits, with a sampled sweep over both clamp regions and the rounding boundaries standing guard in the test suite. The prompt mirrors the tool's bound as its own constant, as it already mirrors each station tool's per-call limit, and a test pins the two together so moving one without the other fails there rather than in a briefing.
 
-*A route waypoint is a coordinate, and it reaches the briefing as a bbox or not at all.* Nothing in this server geocodes and `aviation_find_stations` has no lat/lon-plus-radius input (decision 3), so `route_waypoints` takes decimal-degree pairs only — no place names, no identifiers — and the generated text turns them into an `aviation_get_advisories` bbox. A separate bbox argument was rejected as a second way to say one thing: the bbox is the waypoints' envelope, so two corner waypoints express one directly, and one argument leaves no precedence rule to invent. The envelope is widened by 1° per side, because KSEA→KJFK is within half a degree of latitude end to end and a bare envelope of two such points is a sliver no advisory polygon intersects — the margin is what makes the box a corridor rather than a line, and the text says so and tells the reader to widen it further for a route that leaves the box. The margin is also the only thing that can overflow a valid coordinate: waypoints are range-checked at the schema, so the clamp to ±90/±180 exists for a route near a pole or the antimeridian and never to quietly repair a bad input.
+*Waypoints are ordered decimal-degree coordinates.* Shortest consecutive longitude arcs and a 1° margin produce an envelope for PIREPs and advisories. Split wrapped envelopes into ordinary ordered bboxes at the date line. A polar envelope spans all longitudes, and an ambiguous 180° leg requires intermediate coordinates. Send one call per applicable tool and box, preserve altitude filters, and reconcile duplicates alongside coverage for each call. Without waypoints, use current METAR positions for both endpoints and located alternates to approximate the area. Name unlocated stations. When an endpoint is unlocated, retain separate endpoint PIREP calls and report the missing advisory area assessment.
 
 *The station list is chunked to each tool's own limit, because the default route already exceeds one.* `aviation_get_metar` bounds `station_ids` to 10 and `aviation_get_taf` to 4, while `alternates` is unbounded — so departure, destination, and three alternates is five stations and an unchunked instruction walks the model into a schema rejection partway through a brief. The instruction splits into as many calls as the bound requires and states the bound when it does; at or under the limit the single-call wording is unchanged.
 
-*Nothing about the departure time reaches a tool.* No endpoint here takes a time parameter, so alignment is guidance in the generated text: select the `forecast_periods[]` entry whose `from`/`to` window covers the departure time from what `aviation_get_taf` already returned. The argument's ISO 8601 UTC shape is the shape those fields are published in, so a period boundary can be pasted back in verbatim. A UTC offset is rejected rather than converted — aviation time is Zulu, and silently reinterpreting an offset is how a briefing ends up read against the wrong period.
+*Departure time guides interpretation of the current TAF.* Check `valid_from <= departure_time < valid_to`. Within validity, read the prevailing timeline from the initial forecast, FM replacements and completed BECMG transitions. Before `transition_end`, describe the prior prevailing conditions and the transition. At that boundary, the target becomes prevailing and stays so until superseded. An unknown end leaves the transition timing uncertain. Include every active TEMPO or PROB overlay, including combined PROB TEMPO, using half-open windows. Carry forward unaffected prevailing elements and use `raw_taf` and `not_decoded` where decoding is incomplete. Historical `as_of` selects an issued bulletin for an earlier time.
 
 **31. Weather station identifiers are four ASCII letters or digits, accepted in either case and normalized to uppercase.**
 The weather tools and preflight identifier arguments advertise `/^[A-Za-z0-9]{4}$/`. Digits preserve AWC's US airport identifiers (`K0S9`, `KS52`, and TAF station `K36U`); accepting either ASCII case matches AWC's case-insensitive lookup. Validation precedes normalization, so Unicode case expansions such as `kßa` cannot become an accepted `KSSA`. Each handler uppercases before querying or reconciling, and the prompt uppercases before generating every call and header. Exact-string reconciliation therefore compares canonical IDs without reporting a lowercase request as missing.
@@ -758,7 +789,7 @@ AWC answers a request it rejects with HTTP 400 and `{"status":"error","error":"�
 
 *The order is `station_id` ascending, for decision 26's reason.* Observations carry no rank across stations, so a `limit` without a defined order returns a different subset on each identical call. After the reduction the station ID is unique and present on every row, so one key gives a total order with no tiebreak to add, compared code unit by code unit so the order cannot move with the runtime's collation. Unlike `aviation_find_stations` the sort is unconditional rather than limit-gated: the mode is new, so no existing caller's ordering moves.
 
-*The disclosures are mode-exclusive, and that is what made the reconciliation fields optional.* `requested`/`returned`/`partial`/`missing` (decision 17) describe a named batch; `truncated`/`shown`/`cap`/`upstreamRows`/`limited`/`matched` (decisions 18 and 24) describe a drawn area. An enrichment field the handler does not populate fails the effective-output parse if it is required, so the four reconciliation fields are now optional — the advertised `outputSchema` widens every success field regardless, so no existing caller's response changed shape. The `station_ids` mode is otherwise untouched: it returns the draw as served, every observation inside the window, reconciled against the request exactly as before, and rejects a `limit` for decision 26's reason — the caller has already named the set.
+*Reconciliation belongs to named lookups.* `requested`, `returned`, `partial` and `missing` describe distinct named stations. An upstream cap can coexist with those counts because named lookbacks can reach 400 observations. Surveys have their own paging and category disclosures. Named requests return every observation drawn and reject both paging arguments.
 
 **35. A PIREP publishes the temperature, wind, and weather AWC decodes, and `remarks` is renamed `weather`.**
 AWC decodes `/TA` into `temp`, `/WV` into `wdir`/`wspd`, and `/WX` into `wxString`, and normalization published only the last — as `remarks`. The temperature was recoverable only by re-parsing `raw_pirep`, which matters most on icing reports: rime at −14 °C and at +3 °C are different reports. `temp_c`, `wind`, and `weather` now carry all three. Across a 799-report corpus (780 PIREP, 19 AIREP), 55 of 60 `/TA` groups decoded and the other 5 were `/TA UNKN`, 11 of 12 `/WV` groups decoded, and AIREPs filled `wdir`/`wspd` from their own `291/035KT` groups on 15 reports and `temp` from `MS51` on 2 — so each description names the value, not only the PIREP group.
@@ -778,9 +809,11 @@ Ordinary and urgent PIREP winds receive the magnetic label. AIREP, AMDAR, and un
 
 *One rule produces all three thresholds.* Each is the largest multiple of 10 whose `structuredContent` fits the framework's `DEFAULT_OUTLINE_BUDGET_BYTES` (24,000 bytes) at the measured per-row cost: 443 bytes per report (421 plus the 22-byte nullable braking field) gives 50, 564 per METAR station gives 40, and 207 per registry station (179 plus the 28-byte nullable magnetic variation field) gives 110. Each compares against rows shown after filtering and limits. These thresholds only add guidance; they never truncate results.
 
-*A default `limit` was rejected on all three tools.* It would end the contract that an omitted `limit` returns every match, and it keeps rows the caller never chose: a METAR survey's first stations by ID are the head of the alphabet (the first 50 of one CONUS draw were all Canadian), and a PIREP recency default drops older hazard reports with no summary of what it withheld (decision 25). The first oversized call therefore still costs what it costs, bounded by the upstream cap; the notice makes the second one cheaper.
+*No tool defaults a limit.* A METAR page ordered by station ID can concentrate on one region, and a PIREP page ordered by recency can exclude older hazard reports without summarizing their severity (decision 25). Omit `limit` to see all remaining matches. Use `nextOffset` as the next call's `offset` with the same selectors and filters. Filtering and a deterministic order precede the slice. An offset beyond a nonempty draw returns an empty page with the pre-slice count. Each call uses the currently available draw, so changes between calls can move rows. AWC's own cap applies before paging.
 
-*One notice, written once.* Every notice writer is last-wins, including the one inside `ctx.enrich.truncated()`, so each handler assembles the statements that fired — cap, then filter, then limit, then size — and writes the notice once.
+*Explicit limits have a served maximum.* METAR and TAF surveys, PIREPs and area station searches clamp oversized limits to 400 and report the effective count in the response, a log and a counter. `AWC_CLAMP_LIMITS=false` advertises and enforces 400 during input validation. Advisories combine independent products and retain their existing limit policy. Named batch sizes remain hard bounds.
+
+*One notice, written once.* Every notice writer is last-wins, including the one inside `ctx.enrich.truncated()`, so each handler composes the applicable cap, filter, clamp, paging and size disclosures before writing.
 
 **37. A METAR survey filters by flight category after the reduction and before the limit, and a survey the filter empties is a result.**
 The common reason to survey an area is to find where conditions are poor, and a survey could only return every station — a CONUS box at `hours=1` is about 350 KB across both surfaces, of which 22 of 340 stations were IFR or LIFR in one draw. `limit` cannot answer it, since it selects by station ID. `/metar` takes no category parameter (an unrecognized key answers HTTP 400 `Unexpected query parameter provided`), so `flight_category` is applied in the tool, to AWC's own `fltCat`: the same draw with `["IFR", "LIFR"]` returned those 22 stations in about 26 KB.
@@ -811,7 +844,7 @@ Expired data is never served as fresh: a failed refresh returns an availability 
 Named station lookups request one supplementary airport batch using distinct resolved ICAO IDs. Only magnetic variation joins back; airport coordinates and aliases never replace station data. `16E`, `13W`, `03W` and bare `0` parse to east-positive degrees while preserving exact source text; unrecognized syntax preserves text with null degrees. Missing airport rows or HTTP 204 mean null variation. An operational airport failure leaves all station results and reconciliation intact, with a notice on both surfaces. Caller cancellation and programmer errors propagate. The base stationinfo leg retains its configured per-attempt timeout and gets a total retry deadline of `max(45000, AWC_TIMEOUT_MS)` milliseconds; previously it had no total deadline. The supplementary leg has a three-second total signal, no retries, and at most the configured per-fetch timeout. Default configuration therefore fits within 48 seconds under the default 60-second MCP budget. An operator choosing a 60-second upstream timeout must allow at least 63 seconds in the client. Published variation has no epoch and is not a current geomagnetic model or a correction at every PIREP location.
 
 **40. Station PIREP searches use nautical circles and preserve legacy availability.**
-The service resolves the primary stationinfo position without the optional airport magnetic-variation request, then queries a spherical enclosing bbox and filters by great-circle distance using a mean Earth radius of 3440.065 nautical miles. Generated bounds round outward to four decimal places, which AWC accepts; full double-precision coordinates were rejected. Antimeridian crossings use two concurrent ordinary bboxes, deduplicated by report identity; a circle spanning a pole legitimately spans all longitudes. No tiling, paging, or cap reconstruction runs. The cap is checked per raw draw before any local selection, so filtering cannot turn a partial draw into a complete answer.
+The service resolves the primary stationinfo position without the optional airport magnetic-variation request, then queries a spherical enclosing bbox and filters by great-circle distance using a mean Earth radius of 3440.065 nautical miles. Generated bounds round outward to four decimal places, which AWC accepts. Antimeridian crossings use two concurrent ordinary bboxes and deduplicate by report identity. A circle spanning a pole spans all longitudes. The cap is checked per raw draw before local selection and paging.
 
 Coordinate lookup has one attempt and a three-second total budget. Missing or invalid positions and operational lookup outages keep the existing `id`/integer-`distance` request available with an explicit unverified-radius notice on both response surfaces; stationinfo membership alone never proves a PIREP center invalid. Only the legacy PIREP endpoint's location rejection yields `station_not_recognized`. Caller cancellation and programmer errors propagate. One shared `max(45000, AWC_TIMEOUT_MS)` millisecond deadline includes resolution, candidate draws, retries, backoff, and body reads, preserving configured PIREP per-attempt timeouts. Default configuration stays below the 60-second MCP budget; a configured 60-second attempt requires a corresponding client budget.
 
@@ -819,10 +852,10 @@ Coordinate lookup has one attempt and a three-second total budget. Missing or in
 
 - **Coverage:** METAR/TAF and international SIGMETs are global; PIREPs, domestic SIGMETs and CWAs are US-centric.
 - **Recency:** METARs are typically 20–60 min old. TAFs are 6–30 hour forecasts. PIREPs are real-time but sparse. Advisory set reflects only currently active products.
-- **No historical archive:** The API serves recent observations only (`hours` parameter up to 12 for METAR). No multi-day historical queries.
-- **400-row result cap:** AWC documents that most endpoints return at most 400 entries and exposes no pagination surface. `aviation_find_stations` bbox mode, `aviation_get_pireps`, and `aviation_get_metar`'s bbox mode detect the cap by drawn count and name narrowing levers, with `hours` first on a METAR survey above `hours: 1` (decision 34). Complete state registry snapshots are outside that cap. PIREPs push supported altitude/intensity bounds upstream (decision 19). Named-station batch limits keep their calls small. Advisory coverage describes readable responses, not proof that upstream returned every active bulletin. See decisions 18, 38 and 39.
+- **Historical range:** METAR, TAF and PIREP anchors are limited to the last 30 days. Actual report availability depends on AWC and the selected product. Advisories describe currently active products.
+- **400-row upstream cap:** Cap detection uses the raw draw before selection. METAR applies it even to named lookbacks. Complete state registry snapshots use a separate source. For advisories, inspect per-source coverage. See decisions 18, 34, 38 and 39.
 - **A dense METAR box is thinned by station priority:** `/metar` drops lower-priority stations from a crowded bbox draw independently of the 400-row cap, and marks it nowhere in the response. A live `{40,-10,60,20}` box at `hours=1` drew 316 rows over 159 stations — under the cap, so `truncated: false` — while its four quadrants union to 298 stations; all 139 interior stations the parent draw missed carry AWC `priority: 4`, and the stations it did keep carry 0–3. It is density-driven and it recurses, so a quadrant dense enough is thinned in turn, while a small box is provably complete. No count or field in a single draw detects it, so `truncated: false` claims only that the cap was not reached (decision 34), and tiling the box into smaller ones and unioning the results is what recovers the missing stations.
-- **A `limit` bounds the response, never the search:** Matching rows are counted before a supplied limit. Station results order by ICAO identifier with identifier-less rows last, PIREPs by recency, and METAR surveys by station ID. Omitted rows remain reachable by raising or dropping the limit; there is no pagination. No default limit applies: results above 50 PIREPs, 40 METAR stations or 110 registry stations get guidance instead (decisions 24, 26, 34 and 36).
+- **Paging scope:** `nextOffset` continues through the currently available matches. It cannot reach beyond AWC's cap or guarantee the same draw on the next call. No tool defaults a limit (decision 36).
 - **Not an official briefing:** This data does not constitute a regulatory-compliant preflight weather briefing. Pilots flying IFR or in controlled airspace must use an authorized source.
 - **Advisory scope:** `/airsigmet` domestic SIGMETs, `/isigmet` international SIGMETs and `/cwa` Center Weather Advisories are independent products. SIGMET feeds are deprecated but active; unified `/sigmet` lacks a documented domestic classifier. AIRMETs remain unavailable (#29). Readable empty arrays/204 are valid, while failed sources never establish quiet weather; coverage and filtering stages are explicit (decisions 23 and 38).
 - **Source-native hazard vocabulary:** Domestic turbulence SIGMETs use `TURB`, while convective products use `CONVECTIVE`. Hazard matching stays upstream rather than comparing those record tokens with caller spellings. Domestic finite primary altitude bounds take precedence, with alternate bounds used only when the primary is unavailable; severity remains an uninterpreted domestic source value.
@@ -838,15 +871,17 @@ Coordinate lookup has one attempt and a three-second total budget. Missing or in
 **Common parameters:**
 - `format=json` — required for JSON responses (default is plain text)
 - `ids=KSEA,KJFK` — comma-separated ICAO IDs for station-keyed endpoints
-- `bbox=minLat,minLon,maxLat,maxLon` — area filter on `metar`, `pirep`, and `stationinfo`; `/airsigmet` defines none. On `metar` it draws every observation inside the `hours` window for every station in the box, and no parameter restricts that to the latest per station — unlike the endpoints that silently drop a key they do not recognize, `/metar` answers one with HTTP 400 `{"status":"error","error":"Unexpected query parameter provided"}`
-- `hours=N` — lookback window for `metar` and `taf` (METAR: 1–12 typical)
+- `bbox=minLat,minLon,maxLat,maxLon` — area selector on `metar`, `taf`, `pirep`, and `stationinfo`. METAR survey reduction to the latest observation per station happens after the draw.
+- `ids=@ST` — METAR and TAF state selector
+- `date=...` — UTC anchor for METAR, TAF and PIREP. Historical TAF also sends `time=issue`.
+- `hours=N` — METAR lookback ending at the anchor or the current time
 - `age=N` — lookback window ("Hours Back") for `pirep`; that endpoint has no `hours` parameter and silently ignores one
 - `distance=N` — legacy center-search distance for PIREPs, ignored with bbox. AWC's OpenAPI does not specify its unit or exact geometry; it does not implement this server's nautical-circle contract. Used only when coordinate resolution is unavailable, with an explicit warning
 - `level=N` — for `pirep`, a flight-level centre searched with a fixed ±3,000 ft band ("Level +-3000' to search"), not a range: `level=190` returns FL160–220. Applies in both the radial and bbox modes, and admits reports whose flight level did not parse
 - `inten=lgt|mod|sev` — for `pirep`, minimum hazard intensity. Selects whole reports carrying at least one turbulence or icing layer at that intensity or above, so a matching report still carries its lighter layers
 - `hazard=conv|turb|ice|ifr` — for `airsigmet`, the hazard class. Values are matched case-insensitively; an unrecognized one returns HTTP 400 rather than being dropped, and a recognized one with nothing active returns 204. The tool's own spellings do not substitute: `CONVECTIVE` and `TURBULENCE` return 400, while `ICING` and `IFR` case-fold onto the undocumented `icing` and the documented `ifr` and return 204 — so the mapping in decision 23 is what keeps every outgoing value one this list accepts. `/airsigmet` defines no bbox parameter
 
-**Most endpoints return at most 400 entries**, according to AWC's Restrictions, alongside a request-pacing guideline of no more than 1 request/min per thread. The OpenAPI schema declares no `page`, `offset`, `limit`, or cursor parameter on these endpoints and does not mention the cap. The tested station/METAR/PIREP draws detect it by row count; this generic restriction alone does not establish advisory-product cap behavior. `stationinfo` accepts only `ids`, `bbox`, and `format`, leaving a smaller bounding box as its upstream narrowing lever.
+**Most endpoints return at most 400 entries**, according to AWC's Restrictions, alongside a request-pacing guideline of no more than 1 request/min per thread. AWC exposes no continuation parameter for these draws. The tool's `offset` slices available matches locally. Station, METAR, area TAF and PIREP cap checks use the raw row count. Advisory coverage is tracked per source.
 
 **Timestamp fields are Unix epoch seconds (integers), not ISO strings.** Applies to: METAR `obsTime`, TAF `validTimeFrom`/`validTimeTo`, AIRSIGMET `validTimeFrom`/`validTimeTo`. Convert via `new Date(value * 1000).toISOString()`. METAR `receiptTime`/`reportTime` and TAF `issueTime` are already ISO 8601 strings.
 
