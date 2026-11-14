@@ -8,6 +8,7 @@
  */
 
 import { prompt, z } from '@cyanheads/mcp-ts-core';
+import { routeWeatherBoxes } from '@/mcp-server/prompts/route-weather-boxes.js';
 
 /** Stations `aviation_get_metar` accepts per call — its own `station_ids` bound. */
 const METAR_STATIONS_PER_CALL = 10;
@@ -105,9 +106,6 @@ function bandPhrase(band: { centreFt: number; suppliedFt: number; min: number; m
     : `the ±${CRUISE_BAND_HALF_WIDTH_FT} ft band around ${centrePhrase(band)}, held inside the ${CRUISE_BAND_FLOOR_FT}–${CRUISE_BAND_CEILING_FT} ft range \`aviation_get_pireps\` accepts`;
 }
 
-/** Degrees of margin added to each side of the route-waypoint envelope. */
-const ROUTE_CORRIDOR_MARGIN_DEG = 1;
-
 /**
  * The shape `aviation_get_metar`, `aviation_get_taf`, and `aviation_get_pireps`
  * enforce on a station ID — letters or digits, since a US airport whose FAA
@@ -154,11 +152,6 @@ function parseWaypoints(value: string): [number, number][] {
     const [lat, lon] = pair.split(',');
     return [Number(lat), Number(lon)] as [number, number];
   });
-}
-
-/** Collapses float representation artifacts at the resolution AWC publishes. */
-function round6(value: number): number {
-  return Math.round(value * 1e6) / 1e6;
 }
 
 function chunk(items: string[], size: number): string[][] {
@@ -223,7 +216,7 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
       ])
       .optional()
       .describe(
-        'Optional planned departure time as an ISO 8601 UTC timestamp (e.g., "2026-03-14T15:00Z"). Selects the TAF forecast period the briefing is read against. Omit it and the briefing still generates, stating that no forecast period could be tied to a flight window.',
+        'Optional planned departure time as an ISO 8601 UTC timestamp (e.g., "2026-03-14T15:00Z"). Selects prevailing conditions, transitions and overlapping conditional TAF periods within validity. Omit it and the briefing still generates, stating that no forecast period could be tied to a flight window.',
       ),
     cruise_altitude: z
       .union([
@@ -250,7 +243,7 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
       ])
       .optional()
       .describe(
-        'Optional route waypoints as semicolon-separated "lat,lon" pairs in decimal degrees (e.g., "47.45,-122.31;40.64,-73.78"). Their bounding envelope, widened by 1°, becomes the advisories bbox. Coordinates only — no place names or identifiers, which nothing in this server geocodes. Omit it and the briefing still generates, stating that advisories could not be bounded to a route corridor.',
+        'Optional ordered route waypoints as semicolon-separated "lat,lon" pairs in decimal degrees (e.g., "47.45,-122.31;40.64,-73.78"). Their coordinate envelope plus 1° bounds PIREPs and advisories, split at the date line. Coordinates only — no geocoding. Without waypoints, use available airport METAR coordinates for an explicitly approximate envelope; missing endpoint positions prevent that area assessment.',
       ),
   }),
   generate: (args) => {
@@ -283,50 +276,56 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
     const cruiseBand =
       cruiseAltitudeFt === undefined ? undefined : cruiseAltitudeBand(cruiseAltitudeFt);
 
-    /**
-     * The corridor box is the waypoint envelope plus a margin. Two waypoints on
-     * nearly the same latitude — KSEA to KJFK is within half a degree — would
-     * otherwise envelope to a sliver no advisory polygon intersects, so the
-     * margin is what makes the box a corridor rather than a line. Clamping to
-     * the valid coordinate range catches the margin overflowing near a pole or
-     * the antimeridian; the waypoints themselves are already in range.
-     */
     const waypoints = args.route_waypoints ? parseWaypoints(args.route_waypoints) : [];
-    const routeBbox = waypoints.length
-      ? {
-          minLat: round6(
-            Math.max(-90, Math.min(...waypoints.map(([lat]) => lat)) - ROUTE_CORRIDOR_MARGIN_DEG),
-          ),
-          minLon: round6(
-            Math.max(
-              -180,
-              Math.min(...waypoints.map(([, lon]) => lon)) - ROUTE_CORRIDOR_MARGIN_DEG,
-            ),
-          ),
-          maxLat: round6(
-            Math.min(90, Math.max(...waypoints.map(([lat]) => lat)) + ROUTE_CORRIDOR_MARGIN_DEG),
-          ),
-          maxLon: round6(
-            Math.min(180, Math.max(...waypoints.map(([, lon]) => lon)) + ROUTE_CORRIDOR_MARGIN_DEG),
-          ),
-        }
-      : undefined;
+    const [firstWaypoint, ...remainingWaypoints] = waypoints;
+    const route = firstWaypoint ? routeWeatherBoxes(firstWaypoint, remainingWaypoints) : undefined;
 
     const tafTimingLine = args.departure_time
-      ? `\`aviation_get_taf\` takes no time parameter — from the \`forecast_periods\` it returns, select the period whose \`from\`/\`to\` window covers the planned departure time ${args.departure_time}, and read the departure assessment from that period`
+      ? `For the planned departure time ${args.departure_time}, first check each TAF using \`valid_from <= departure_time < valid_to\`. Before valid_from or at/after valid_to, report that no valid departure-time forecast is available. Build the prevailing timeline from the initial forecast, FM replacements at their from boundary, and completed BECMG changes in chronological order. A completed BECMG target remains prevailing until superseded, including when transition_end equals that row's to. For an ongoing BECMG, before transition_end report prior prevailing conditions plus the changing target as a transition; at transition_end the target becomes prevailing. Include every TEMPO and PROB overlay with from <= departure_time < to, including TEMPO with a non-null probability, and keep conditional scenarios separate. Carry forward elements a change leaves unchanged, never invent an unreported element or treat a sparse overlay as a complete forecast. An unknown transition end means transition timing is uncertain. Check raw_taf and not_decoded for incomplete decoding. Do not infer an arrival time from departure time. as_of selects an earlier issued bulletin for historical review, not a future departure-time forecast; do not pass a future departure time as as_of`
       : 'No departure time was supplied, so no forecast period can be tied to a flight window — cover the whole valid period and state that the departure-time assessment could not be made';
 
     const pirepAltitudeLine = cruiseBand
       ? `Pass \`altitude_min_ft: ${cruiseBand.min}\` and \`altitude_max_ft: ${cruiseBand.max}\` — ${bandPhrase(cruiseBand)}`
       : 'No cruise altitude was supplied, so the search cannot be bounded to a cruise level — report the altitudes as flown and state that the cruise-level hazard assessment could not be made';
 
-    const advisoryAreaCall = routeBbox
-      ? `Call \`aviation_get_advisories\` with \`bbox: { minLat: ${routeBbox.minLat}, minLon: ${routeBbox.minLon}, maxLat: ${routeBbox.maxLat}, maxLon: ${routeBbox.maxLon} }\` — the envelope of the supplied route waypoints widened by ${ROUTE_CORRIDOR_MARGIN_DEG}° on each side. Widen it further if the filed route leaves that box`
-      : 'Call `aviation_get_advisories` unfiltered — no route waypoints were supplied, so advisories cannot be bounded to a route corridor; state that the corridor-scoped assessment could not be made';
-    const advisoriesCall =
+    const advisoryAltitude =
       cruiseAltitudeFt === undefined
-        ? advisoryAreaCall
-        : `${advisoryAreaCall.replace(' unfiltered', ' without a geographic filter')}; include \`altitude_ft: ${cruiseAltitudeFt}\` for the planned cruise altitude. Inspect altitude_selection and per-source altitude_unknown; retained unknown bounds do not prove an altitude match`;
+        ? ''
+        : `; include \`altitude_ft: ${cruiseAltitudeFt}\` for the planned cruise altitude`;
+    const endpointPireps = `Call \`aviation_get_pireps\` centered on ${departure} and ${destination} separately, using each endpoint's station_id`;
+    let pirepsCall: string;
+    let advisoriesCall: string;
+    let routeGap: string | undefined;
+    switch (route?.kind) {
+      case 'bounded': {
+        const boxes = route.boxes.map(
+          ({ minLat, minLon, maxLat, maxLon }) =>
+            `\`bbox: { minLat: ${minLat}, minLon: ${minLon}, maxLat: ${maxLat}, maxLon: ${maxLon} }\``,
+        );
+        const pirepAltitude = cruiseBand
+          ? `; pass \`altitude_min_ft: ${cruiseBand.min}\` and \`altitude_max_ft: ${cruiseBand.max}\``
+          : '';
+        pirepsCall = boxes
+          .map((box) => `Call \`aviation_get_pireps\` with ${box}${pirepAltitude}`)
+          .join('\n   - ');
+        advisoriesCall = boxes
+          .map((box) => `Call \`aviation_get_advisories\` with ${box}${advisoryAltitude}`)
+          .join('\n   - ');
+        break;
+      }
+      case 'ambiguous':
+        pirepsCall = `The supplied 180° leg has no unique shortest direction. Report that route-area weather cannot be bounded without intermediate waypoints. Do not make a worldwide advisory request. ${endpointPireps}`;
+        advisoriesCall =
+          'Do not request a route advisory draw until the route ambiguity is resolved; report the area-assessment gap';
+        routeGap = 'Route direction is ambiguous — area hazards could not be assessed';
+        break;
+      default:
+        pirepsCall = `No route waypoints supplied: derive an airport-based approximation from the METAR coordinates of departure, destination and located alternates. Report each missing alternate position. Both endpoints must have usable positions: if either endpoint is missing, report the area-assessment gap and retain only separate endpoint PIREP searches. Do not make a worldwide advisory request. For located airports, use the smallest circular longitude envelope covering their positions, add 1° on every side, round bounds outward to four decimal places and clamp latitude to [-90,90]. Split a wrapped envelope at ±180° into two ordinary ordered boxes. If the latitude envelope includes a pole, use all longitudes; if equally short longitude envelopes are ambiguous, report the gap rather than choosing one. Call \`aviation_get_pireps\` once per derived box only when both endpoints are located; otherwise ${endpointPireps}`;
+        advisoriesCall = `Call \`aviation_get_advisories\` once per airport-based box from the PIREP step, only when both endpoints are located${advisoryAltitude}. Otherwise report the area-assessment gap`;
+        routeGap =
+          'No route waypoints supplied — airport-based approximation only, with every missing position disclosed';
+        break;
+    }
 
     const gaps = [
       ...(args.departure_time
@@ -335,9 +334,7 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
       ...(cruiseBand
         ? []
         : ['No cruise altitude supplied — PIREPs could not be bounded to a cruise level']),
-      ...(routeBbox
-        ? []
-        : ['No route waypoints supplied — advisories could not be bounded to a route corridor']),
+      ...(routeGap ? [routeGap] : []),
       'Any station that returned no data, and anything the tools reported as partial, truncated, or limited',
     ]
       .map((gap) => `     - ${gap}`)
@@ -351,7 +348,7 @@ export const aviationPreflightBrief = prompt('aviation_preflight_brief', {
       ...(cruiseAltitudeFt === undefined
         ? []
         : [`**Cruise altitude:** ${cruiseAltitudeFt} ft MSL`]),
-      ...(routeBbox
+      ...(waypoints.length
         ? [`**Route waypoints:** ${waypoints.map(([lat, lon]) => `${lat},${lon}`).join('; ')}`]
         : []),
     ].join('\n');
@@ -376,8 +373,11 @@ Follow this sequence:
    - Identify any forecast deterioration or improvement during the planned flight window
    - Flag TEMPO/BECMG/PROB groups that could affect operations
 
-3. **PIREPs** — Call \`aviation_get_pireps\` centered on ${departure} and ${destination}
+3. **PIREPs** — ${pirepsCall}
    - ${pirepAltitudeLine}
+   - On every bbox call omit station_id and distance_nm. Apply the altitude band above to every call, including endpoint fallbacks
+   - Supplied waypoint boxes follow shortest consecutive longitude arcs with a 1° margin; these and airport-derived boxes are coordinate-envelope approximations, not exact filed-track intersections. Widen coverage if the route leaves them
+   - Deduplicate identical records across boxes; keep distinct reports even when their timestamps match. Do not add overlapping coverage counts. Preserve every draw's partial, truncated, limited and unknown coverage; follow nextOffset if present to continue over the available draw, which may have changed
    - Report any significant turbulence (MOD or greater) or icing (LGT or greater)
    - Note altitude ranges where hazards were reported
    - Absence of PIREPs does not guarantee smooth conditions
@@ -385,6 +385,7 @@ Follow this sequence:
 4. **Advisories** — ${advisoriesCall}
    - List active domestic SIGMETs, international SIGMETs (including oceanic products), and Center Weather Advisories; the default advisory_type "all" reads all three
    - Read coverage and partial before interpreting any empty result. Failed sources, unreadable rows and unlocated geometry are assessment gaps; bbox counts apply after cancellation removal and product/hazard/altitude selection. If limit withheld matches, omit or raise it before completing the assessment
+   - Deduplicate identical advisories across boxes; a shared series ID alone does not make two advisories identical. Do not add overlapping coverage counts. Inspect altitude_selection and per-source altitude_unknown; retained unknown bounds do not prove an altitude match
    - Include valid times and affected altitudes
    - AIRMETs are not available from this server; do not request one. Say so plainly rather than implying the route was cleared of AIRMET-class hazards
 

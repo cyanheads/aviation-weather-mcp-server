@@ -273,7 +273,7 @@ describe('aviationPreflightBrief', () => {
   });
 
   describe('departure_time', () => {
-    it('points the agent at the forecast period covering the supplied time', async () => {
+    it('points the agent at the forecast validity and conditions for the supplied time', async () => {
       const text = await render({
         departure_icao: 'KSEA',
         destination_icao: 'KJFK',
@@ -281,10 +281,9 @@ describe('aviationPreflightBrief', () => {
       });
 
       expect(text).toContain('**Departure time:** 2026-03-14T15:00Z');
-      expect(text).toContain('takes no time parameter');
-      expect(text).toContain(
-        '`from`/`to` window covers the planned departure time 2026-03-14T15:00Z',
-      );
+      expect(text).toContain('planned departure time 2026-03-14T15:00Z');
+      expect(text).toContain('valid_from <= departure_time < valid_to');
+      expect(text).toContain('at/after valid_to');
     });
 
     it('accepts a full ISO timestamp with seconds and milliseconds', async () => {
@@ -603,6 +602,138 @@ describe('aviationPreflightBrief', () => {
   });
 
   describe('route_waypoints', () => {
+    it.each([
+      [
+        'date line',
+        '60,170;55,-170',
+        [
+          { minLat: 54, minLon: 169, maxLat: 61, maxLon: 180 },
+          { minLat: 54, minLon: -180, maxLat: 61, maxLon: -169 },
+        ],
+      ],
+      [
+        'reversed date line',
+        '55,-170;60,170',
+        [
+          { minLat: 54, minLon: 169, maxLat: 61, maxLon: 180 },
+          { minLat: 54, minLon: -180, maxLat: 61, maxLon: -169 },
+        ],
+      ],
+      [
+        'point margin',
+        '0,179.75',
+        [
+          { minLat: -1, minLon: 178.75, maxLat: 1, maxLon: 180 },
+          { minLat: -1, minLon: -180, maxLat: 1, maxLon: -179.25 },
+        ],
+      ],
+      [
+        'equivalent seam endpoints',
+        '0,-180;0,180',
+        [
+          { minLat: -1, minLon: 179, maxLat: 1, maxLon: 180 },
+          { minLat: -1, minLon: -180, maxLat: 1, maxLon: -179 },
+        ],
+      ],
+      ['north pole', '89,179.75;90,179.9', [{ minLat: 88, minLon: -180, maxLat: 90, maxLon: 180 }]],
+      [
+        'south pole',
+        '-89,-179.75;-90,-179.9',
+        [{ minLat: -90, minLon: -180, maxLat: -88, maxLon: 180 }],
+      ],
+      [
+        'ordered full circuit',
+        '0,0;0,120;0,-120;0,0',
+        [{ minLat: -1, minLon: -180, maxLat: 1, maxLon: 180 }],
+      ],
+    ])(
+      'uses the same ordered boxes for both weather products on %s',
+      async (_label, route_waypoints, expected) => {
+        const text = await render({
+          departure_icao: 'KSEA',
+          destination_icao: 'KJFK',
+          route_waypoints,
+          cruise_altitude: '0',
+        });
+        for (const tool of ['aviation_get_pireps', 'aviation_get_advisories']) {
+          const lines = callLines(text, tool);
+          const boxes = lines.flatMap((line) =>
+            [
+              ...line.matchAll(
+                /bbox: \{ minLat: (-?[\d.]+), minLon: (-?[\d.]+), maxLat: (-?[\d.]+), maxLon: (-?[\d.]+) \}/g,
+              ),
+            ].map((match) => ({
+              minLat: Number(match[1]),
+              minLon: Number(match[2]),
+              maxLat: Number(match[3]),
+              maxLon: Number(match[4]),
+            })),
+          );
+          expect(boxes).toEqual(expected);
+          for (const line of lines) {
+            if (tool === 'aviation_get_advisories') expect(line).toContain('altitude_ft: 0');
+            else {
+              expect(line).toContain('altitude_min_ft: 0');
+              expect(line).toContain('altitude_max_ft: 3000');
+              expect(line).not.toContain('station_id:');
+              expect(line).not.toContain('distance_nm:');
+            }
+          }
+        }
+        expect(text).toContain('Deduplicate');
+        expect(text).toContain('Do not add overlapping coverage counts');
+      },
+    );
+
+    it('does not choose one of two equally short 180-degree legs', async () => {
+      const text = await render({
+        departure_icao: 'KSEA',
+        destination_icao: 'KJFK',
+        route_waypoints: '0,0;0,180',
+      });
+      expect(text).toContain('180° leg has no unique shortest direction');
+      expect(text).toContain('Do not make a worldwide advisory request');
+      expect(text).not.toContain('bbox: {');
+    });
+
+    it('uses available airport positions and names every missing-coordinate branch', async () => {
+      const text = await render({
+        departure_icao: 'KSEA',
+        destination_icao: 'KJFK',
+        alternates: 'KBOS',
+      });
+      expect(text).toContain('METAR coordinates');
+      expect(text).toContain('airport-based approximation');
+      expect(text).toContain('missing alternate');
+      expect(text).toContain('either endpoint');
+      expect(text).toContain('Do not make a worldwide advisory request');
+      expect(text).not.toContain('Call `aviation_get_advisories` unfiltered');
+    });
+
+    it('separates prevailing, transitioning and conditional forecasts with half-open validity', async () => {
+      const text = await render({
+        departure_icao: 'KSEA',
+        destination_icao: 'KJFK',
+        departure_time: '2026-11-14T09:30:00Z',
+      });
+      for (const instruction of [
+        'valid_from <= departure_time < valid_to',
+        'TEMPO',
+        'PROB',
+        'transition_end',
+        'before transition_end',
+        'at transition_end',
+        'unknown transition end',
+        'FM',
+        'as_of',
+        'arrival time',
+        'completed BECMG',
+        'until superseded',
+      ])
+        expect(text).toContain(instruction);
+      expect(text).not.toContain('takes no time parameter');
+    });
+
     it('threads the padded waypoint envelope into the advisories bbox', async () => {
       const text = await render({
         departure_icao: 'KSEA',
@@ -646,13 +777,13 @@ describe('aviationPreflightBrief', () => {
       expect(text).toContain('maxLon: 180');
     });
 
-    it('still generates a brief and names the gap when omitted', async () => {
+    it('uses an explicit airport approximation when waypoints are omitted', async () => {
       const text = await render({ departure_icao: 'KSEA', destination_icao: 'KJFK' });
 
-      expect(text).toContain('Call `aviation_get_advisories` unfiltered');
-      expect(text).toContain('no route waypoints were supplied');
+      expect(text).toContain('Call `aviation_get_advisories` once per airport-based box');
+      expect(text).toContain('No route waypoints supplied');
       expect(text).toContain(
-        'No route waypoints supplied — advisories could not be bounded to a route corridor',
+        'airport-based approximation only, with every missing position disclosed',
       );
       expect(text).not.toContain('bbox:');
     });
@@ -681,7 +812,7 @@ describe('aviationPreflightBrief', () => {
         route_waypoints: '',
       });
 
-      expect(text).toContain('no route waypoints were supplied');
+      expect(text).toContain('No route waypoints supplied');
     });
 
     it('never instructs aviation_find_stations to resolve raw coordinates', async () => {
