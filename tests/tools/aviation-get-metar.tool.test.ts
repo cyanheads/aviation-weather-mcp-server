@@ -54,6 +54,60 @@ const ksea: NormalizedMetar = {
   raw_metar: 'KSEA 151853Z 18010KT 10SM FEW045 08/03 A3001 RMK AO2',
 };
 
+it('discloses the named METAR cap without attributing missing stations to no weather', async () => {
+  mockFetchMetar.mockResolvedValue(Array.from({ length: 400 }, () => ksea));
+  const as_of = '2026-11-12T05:30:37.123Z';
+  const result = await runToolContract(aviationGetMetar, {
+    station_ids: ['KSEA', 'KPDX'],
+    hours: 720,
+    as_of,
+  });
+  expect(mockFetchMetar).toHaveBeenCalledWith(
+    { stationIds: ['KSEA', 'KPDX'], hours: 720, asOf: as_of },
+    expect.anything(),
+  );
+  expect(result.structuredContent).toMatchObject({
+    truncated: true,
+    cap: 400,
+    shown: 1,
+    upstreamRows: 400,
+    requested: ['KSEA', 'KPDX'],
+    returned: ['KSEA'],
+    missing: ['KPDX'],
+    partial: true,
+    notice: expect.stringContaining('Missing stations may have observations that the cap excluded'),
+  });
+  expect(
+    result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n'),
+  ).toContain('successive earlier as_of windows');
+  expect(aviationGetMetar.input.safeParse({ station_ids: ['KSEA'], hours: 721 }).success).toBe(
+    false,
+  );
+});
+
+it('filters a state survey after choosing the latest drawn observation per station', async () => {
+  mockFetchMetar.mockResolvedValue([
+    { ...ksea, station_id: 'KBFI' },
+    { ...ksea, observed_at: '2026-01-15T17:53:00.000Z' },
+    { ...ksea, flight_category: 'IFR' },
+  ]);
+  const result = await runToolContract(aviationGetMetar, {
+    state: 'wa',
+    flight_category: ['VFR'],
+    limit: 1,
+  });
+  expect(mockFetchMetar).toHaveBeenCalledWith({ state: 'WA', hours: 1 }, expect.anything());
+  expect(result.structuredContent).toMatchObject({
+    observations: [{ station_id: 'KBFI' }],
+    shown: 1,
+    surveyed: 2,
+    truncated: false,
+    limited: false,
+  });
+  expect(result.structuredContent).not.toHaveProperty('requested');
+  expect(result.content[0]).toMatchObject({ text: expect.stringContaining('KBFI') });
+});
+
 /**
  * An obscured sky — the `VV002` group decodes to an OVX layer at 200 ft, which
  * is an indefinite ceiling rather than no ceiling. Modeled on the live record
@@ -1388,8 +1442,33 @@ describe('aviationGetMetar bbox survey', () => {
     });
   });
 
-  it.each([0, 401])('rejects a limit of %i at the schema', (limit) => {
+  it.each([0, -1, 1.5, '2'])('rejects an invalid limit of %s at the schema', (limit) => {
     expect(aviationGetMetar.input.safeParse({ bbox, limit }).success).toBe(false);
+  });
+
+  it('clamps a survey limit and keeps the selected count on a past-end page', async () => {
+    mockFetchMetar.mockResolvedValue(draw(3, 3));
+    const capped = await runToolContract(aviationGetMetar, { bbox, limit: 400 });
+    const oversized = await runToolContract(aviationGetMetar, { bbox, limit: 401 });
+    expect(oversized.structuredContent).toMatchObject({
+      observations: aviationGetMetar.output!.parse(capped.structuredContent).observations,
+      shown: 3,
+      limited: false,
+      notice: 'Requested limit 401 was clamped to 400.',
+    });
+    expect(JSON.stringify(oversized.content)).toContain('clamped to 400');
+    const empty = await runToolContract(aviationGetMetar, { bbox, offset: 4, limit: 1 });
+    expect(empty.structuredContent).toMatchObject({ observations: [], matched: 3, shown: 0 });
+    expect(empty.structuredContent).not.toHaveProperty('nextOffset');
+    expect(JSON.stringify(empty.content)).toContain('from offset 4');
+  });
+
+  it('rejects an offset on a named batch before fetching', async () => {
+    const result = await runToolContract(aviationGetMetar, { station_ids: ['KSEA'], offset: 0 });
+    expect(result.structuredContent).toMatchObject({
+      error: { data: { reason: 'conflicting_offset' } },
+    });
+    expect(mockFetchMetar).not.toHaveBeenCalled();
   });
 
   // -------------------------------------------------------------------------
@@ -1573,7 +1652,7 @@ describe('aviationGetMetar bbox survey', () => {
     expect(text).not.toContain('## KPWT');
     expect(text).toContain('**Stations returned:** 1');
     expect(text).toContain('**Limited by the request:** true');
-    expect(text).toContain('**Stations matched before the limit:** 2');
+    expect(text).toContain('**Stations matched before paging:** 2');
   });
 
   it('renders a capped survey on the content[] surface', async () => {
@@ -2117,7 +2196,7 @@ describe('aviationGetMetar flight_category filter', () => {
     });
 
     expect(text).toContain('**Stations surveyed before the flight category filter:** 30');
-    expect(text).toContain('**Stations matched before the limit:** 9');
+    expect(text).toContain('**Stations matched before paging:** 9');
   });
 });
 
@@ -2177,7 +2256,7 @@ describe('aviationGetMetar cap guidance levers', () => {
 
 // ---------------------------------------------------------------------------
 // Empty-result and partial-batch hints name only usable levers (issue #53) —
-// "raise hours" and "Widen hours" were offered at the maximum of 12
+// "raise hours" and "Widen hours" were offered at the maximum of 720
 // ---------------------------------------------------------------------------
 
 describe('aviationGetMetar empty-result levers', () => {
@@ -2211,8 +2290,8 @@ describe('aviationGetMetar empty-result levers', () => {
     );
   });
 
-  it('drops raise hours from the empty-box hint at the maximum of 12', async () => {
-    expect(await emptyBoxHint(12)).toBe(`Widen the bounding box, then re-run. ${BBOX_HINT_TAIL}`);
+  it('drops raise hours from the empty-box hint at the maximum of 720', async () => {
+    expect(await emptyBoxHint(720)).toBe(`Widen the bounding box, then re-run. ${BBOX_HINT_TAIL}`);
   });
 
   it('keeps the missing-station notice byte-identical below the hours maximum', async () => {
@@ -2221,9 +2300,9 @@ describe('aviationGetMetar empty-result levers', () => {
     );
   });
 
-  it('drops Widen hours from the missing-station notice at the maximum of 12', async () => {
-    expect(await missingNotice(12)).toMatch(
-      /12-hour lookback\. Verify the IDs with aviation_find_stations\.$/,
+  it('drops Widen hours from the missing-station notice at the maximum of 720', async () => {
+    expect(await missingNotice(720)).toMatch(
+      /720-hour lookback\. Verify the IDs with aviation_find_stations\.$/,
     );
   });
 
@@ -2231,7 +2310,7 @@ describe('aviationGetMetar empty-result levers', () => {
     const recovery =
       aviationGetMetar.errors?.find((e) => e.reason === 'no_stations_found')?.recovery ?? '';
 
-    expect(recovery).toMatch(/raise hours while it is below 12/);
+    expect(recovery).toMatch(/raise hours while it is below 720/);
   });
 
   it('says only drop, not widen, when the filter already named every category', async () => {
@@ -2259,9 +2338,9 @@ describe('aviationGetMetar empty-result levers', () => {
     expect(String(enrichment.notice)).toMatch(/Widen or drop flight_category to see them\.$/);
   });
 
-  it('carries both hints on both surfaces at hours=12', async () => {
+  it('carries both hints on both surfaces at hours=720', async () => {
     mockFetchMetar.mockResolvedValue([]);
-    const empty = await runToolContract(aviationGetMetar, { bbox: surveyBox, hours: 12 });
+    const empty = await runToolContract(aviationGetMetar, { bbox: surveyBox, hours: 720 });
     const emptyText = empty.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
     expect(empty.isError).toBe(true);
     expect(
@@ -2273,7 +2352,7 @@ describe('aviationGetMetar empty-result levers', () => {
     mockFetchMetar.mockResolvedValue([ksea]);
     const partial = await runToolContract(aviationGetMetar, {
       station_ids: ['KSEA', 'KZZZ'],
-      hours: 12,
+      hours: 720,
     });
     const partialText = partial.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
     expect(String((partial.structuredContent as { notice?: string }).notice)).toMatch(

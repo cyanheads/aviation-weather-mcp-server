@@ -6,6 +6,12 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
+import {
+  cappedLimitSchema,
+  clampResultLimit,
+  continuationNotice,
+  pageResults,
+} from '@/mcp-server/tools/result-page.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 import {
   AWC_MAX_ROWS,
@@ -14,6 +20,7 @@ import {
   pushablePirepLevel,
 } from '@/services/aviation-weather/awc-limits.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
+import { HistoryAnchorSchema } from '@/services/aviation-weather/history-anchor.js';
 import type { NormalizedPirep } from '@/services/aviation-weather/types.js';
 
 const BboxSchema = z
@@ -101,7 +108,7 @@ const MIN_DISTANCE_NM = 10;
 
 /** The schema ceilings of the two widening levers — past them, neither widens. */
 const MAX_DISTANCE_NM = 500;
-const MAX_HOURS = 12;
+const MAX_HOURS = 48;
 
 /**
  * The parameters that widen an empty PIREP search, naming only the ones this
@@ -287,7 +294,10 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       .min(1)
       .max(MAX_HOURS)
       .default(3)
-      .describe('How many hours of history to return. Default 3.'),
+      .describe(
+        'Lookback window of 1–48 hours ending at as_of, or the current time when omitted. Default 3.',
+      ),
+    as_of: HistoryAnchorSchema.optional(),
     altitude_min_ft: z
       .number()
       .int()
@@ -312,15 +322,17 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       .describe(
         'Return only reports carrying at least one turbulence or icing layer at this intensity or above. The filter selects reports, not layers — a matching report still carries its lighter layers, so a result may include NEG, TRC, or LGT entries alongside the layer that matched. Optional.',
       ),
-    limit: z
+    offset: z
       .number()
       .int()
-      .min(1)
-      .max(AWC_MAX_ROWS)
+      .min(0)
       .optional()
       .describe(
-        `Maximum reports to return, applied last — after every filter and after ordering by observation time descending, so a limited result is the most recent reports rather than an arbitrary slice. It bounds the response without changing what is searched, which every other parameter does. Distinct from the ${AWC_MAX_ROWS}-row upstream cap: a limited result examined every report it counted and withheld some, while a capped one never drew the rest. Selection is by recency alone, so pair it with min_intensity to bound a result by severity. Omit to return every match. Optional.`,
+        'Zero-based start among matching reports ordered by observation time descending, then raw bulletin and coordinates.',
       ),
+    limit: cappedLimitSchema().describe(
+      `Maximum reports to return from offset after selection. The served maximum is ${AWC_MAX_ROWS} when limit is supplied. Omit to return all remaining matches.`,
+    ),
   }),
   output: z.object({
     pireps: z
@@ -419,6 +431,20 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
   }),
   errors: [
     {
+      reason: 'future_as_of',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The historical reference time is in the future.',
+      recovery: 'Use a UTC timestamp at or before the current time.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'outside_retention',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The historical reference time predates the AWC retention window.',
+      recovery: 'Use a UTC timestamp within the past 30 days.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'no_pireps_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'No pilot reports found in the search area and time window.',
@@ -426,7 +452,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       // rather than an incident.
       severity: 'notice',
       recovery:
-        'Widen the search — a larger distance_nm (up to 500) on a station_id search, a larger bbox on an area search, or a longer hours while it is below 12 — or try a different region. PIREPs are sparse; absence of reports does not mean smooth conditions.',
+        'Widen the search — a larger distance_nm (up to 500) on a station_id search, a larger bbox on an area search, or a longer hours while it is below 48 — or try a different region. PIREPs are sparse; absence of reports does not mean smooth conditions.',
     },
     {
       reason: 'station_not_recognized',
@@ -476,6 +502,13 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
   ],
 
   enrichment: {
+    nextOffset: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'Offset for the next page of the currently available draw. Present only while matches remain.',
+      ),
     truncated: z
       .boolean()
       .describe(
@@ -496,7 +529,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       .number()
       .optional()
       .describe(
-        'Reports that matched this query before the limit selected from them. Present only on a limited result. Where the result is also truncated this counts the capped page and not the search area — the reports the cap dropped were never examined, so no count can include them.',
+        'Reports that matched this query before paging. Present when offset was supplied or limit withheld matches. Upstream truncation can exclude reports from this count.',
       ),
     cap: z
       .number()
@@ -519,12 +552,13 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
   },
 
   enrichmentTrailer: {
+    nextOffset: { label: 'Next offset' },
     truncated: { label: 'Truncated at the upstream row cap' },
     shown: { label: 'Reports returned' },
     cap: { label: 'Upstream row maximum' },
     upstreamRows: { label: 'Reports returned before radius and altitude filters' },
     limited: { label: 'Limited by the request' },
-    matched: { label: 'Reports matched before the limit' },
+    matched: { label: 'Reports matched before paging' },
   },
 
   async handler(input, ctx) {
@@ -597,6 +631,7 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
           ...(stationId ? { stationId, distanceNm: radiusNm } : {}),
           ...(input.bbox ? { bbox: input.bbox } : {}),
           hours: input.hours,
+          ...(input.as_of !== undefined ? { asOf: input.as_of } : {}),
           ...(level != null ? { level } : {}),
           ...(input.min_intensity ? { minIntensity: input.min_intensity } : {}),
           onCandidateRows: (rows, capped, draws) => {
@@ -653,7 +688,12 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     }
 
     // Sort by observation time descending
-    pireps.sort((a, b) => new Date(b.observed_at).getTime() - new Date(a.observed_at).getTime());
+    const paging = input.limit !== undefined || input.offset !== undefined;
+    pireps.sort((a, b) => {
+      const observed = new Date(b.observed_at).getTime() - new Date(a.observed_at).getTime();
+      if (observed || !paging) return observed;
+      return a.raw_pirep.localeCompare(b.raw_pirep) || a.lat - b.lat || a.lon - b.lon;
+    });
 
     /** Each raw candidate draw has its own cap, before radius or altitude selection. */
     const capped = candidateCapped ?? isUpstreamCapped(rawCount);
@@ -715,10 +755,10 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
         message = `No PIREPs in the search area matched the altitude filter (${altRange}). ${radialCount} report(s) were found at other or unreported altitudes.`;
         recovery = `Remove or adjust altitude_min_ft / altitude_max_ft. ${radialCount} PIREP(s) exist in the area at other or unreported altitudes.`;
       } else if (drawScope) {
-        message = `No PIREPs matching ${drawScope} were found in the search area for the past ${input.hours} hour(s). That narrowing was applied upstream, so reports outside it were never drawn.`;
+        message = `No PIREPs matching ${drawScope} were found in the search area for the ${input.as_of ? '' : 'past '}${input.hours} hour(s). That narrowing was applied upstream, so reports outside it were never drawn.`;
         recovery = `Relax ${relaxable}${widen ? `, or ${widen}` : ''}. ${sparse}`;
       } else {
-        message = `No PIREPs found in the search area for the past ${input.hours} hour(s).`;
+        message = `No PIREPs found in the search area for the ${input.as_of ? '' : 'past '}${input.hours} hour(s).`;
         recovery = widen
           ? `${widen.charAt(0).toUpperCase()}${widen.slice(1)}, or try a different region. ${sparse}`
           : `Try a different region. ${sparse}`;
@@ -728,10 +768,15 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
         message = `No PIREPs matched inside the capped candidate draws. AWC returned ${rawCount} candidate row(s), with at least one draw reaching its ${AWC_MAX_ROWS}-report cap before radius and altitude filtering; the search area was searched only in part.`;
         recovery = `Narrow the search — ${levers} — and retry. ${sparse}`;
       }
-      throw ctx.fail('no_pireps_found', [message, radiusNotice()].filter(Boolean).join(' '), {
-        recovery: { hint: recovery },
-        ...(capped ? { truncated: true, cap: AWC_MAX_ROWS, upstreamRows: rawCount } : {}),
-      });
+      const anchor = input.as_of ? `The lookback ends at ${input.as_of}.` : '';
+      throw ctx.fail(
+        'no_pireps_found',
+        [message, anchor, radiusNotice()].filter(Boolean).join(' '),
+        {
+          recovery: { hint: recovery },
+          ...(capped ? { truncated: true, cap: AWC_MAX_ROWS, upstreamRows: rawCount } : {}),
+        },
+      );
     }
 
     // Reports that matched the query — everything the limit selects from, and
@@ -739,9 +784,14 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     // The limit runs last, after the sort, so a bounded result is the most
     // recent matches rather than an arbitrary slice.
     const matched = pireps.length;
-    const shownReports = input.limit != null ? pireps.slice(0, input.limit) : pireps;
+    const { limit, notice: clampNotice } = clampResultLimit(
+      input.limit,
+      'aviation_get_pireps',
+      ctx.log,
+    );
+    const { rows: shownReports, nextOffset } = pageResults(pireps, input.offset, limit);
     const shown = shownReports.length;
-    const limited = input.limit != null && matched > input.limit;
+    const limited = limit !== undefined && nextOffset !== undefined;
 
     // The cap, the limit, and the size lever are separate disclosures sharing
     // one notice, and every notice writer is last-wins — so each states its own
@@ -755,7 +805,13 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
       capped
         ? `${candidateDraws > 1 ? `AWC served ${rawCount} candidate rows across ${candidateDraws} antimeridian draws; at least one reached its ${AWC_MAX_ROWS}-row per-request maximum` : `AWC served ${rawCount} reports for this query, its per-request maximum`}, so reports inside the search area and the ${input.hours}-hour window are missing from this result${narrowed}. Narrow the search — ${levers} — and re-run. ${altitudeLeverNote(level)}`
         : null,
-      limited ? limitNotice(shown, matched, capped, input.min_intensity) : null,
+      input.offset !== undefined
+        ? `Returned ${shown} of ${matched} matches from offset ${input.offset} in this draw.`
+        : limited
+          ? limitNotice(shown, matched, capped, input.min_intensity)
+          : null,
+      clampNotice,
+      nextOffset === undefined ? null : continuationNotice(nextOffset),
       input.limit == null && shown > SIZE_NOTICE_THRESHOLD
         ? sizeNotice(shown, input.min_intensity)
         : null,
@@ -777,7 +833,8 @@ export const aviationGetPireps = tool('aviation_get_pireps', {
     // `limited: false` is only owed to one who did — where it separates a limit
     // that bit from one that had nothing to withhold.
     if (input.limit != null) ctx.enrich({ limited });
-    if (limited) ctx.enrich({ matched });
+    if (limited || input.offset !== undefined) ctx.enrich({ matched });
+    if (nextOffset !== undefined) ctx.enrich({ nextOffset });
 
     ctx.log.info('PIREPs retrieved', { count: shown, matched, rawCount });
     return { pireps: shownReports };

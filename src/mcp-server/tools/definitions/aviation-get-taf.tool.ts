@@ -6,7 +6,17 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { formatSkyLine } from '@/mcp-server/tools/format-sky-condition.js';
+import {
+  cappedLimitSchema,
+  clampResultLimit,
+  continuationNotice,
+  pageResults,
+} from '@/mcp-server/tools/result-page.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
+import { AWC_MAX_ROWS, isUpstreamCapped } from '@/services/aviation-weather/awc-limits.js';
+import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
+import { HistoryAnchorSchema } from '@/services/aviation-weather/history-anchor.js';
+import { isSupportedState } from '@/services/aviation-weather/supported-states.js';
 
 /**
  * Change indicators that amend a prevailing forecast rather than replacing it.
@@ -48,6 +58,49 @@ const ForecastPeriodSchema = z
   .object({
     from: z.string().describe('Period start time in ISO 8601 format (UTC).'),
     to: z.string().describe('Period end time in ISO 8601 format (UTC).'),
+    transition_end: z
+      .string()
+      .nullable()
+      .describe(
+        'BECMG transition end in ISO 8601 UTC, independently of the period end. Null when AWC did not supply it.',
+      ),
+    altimeter_hpa: z
+      .number()
+      .nullable()
+      .describe('Forecast altimeter setting in hPa. Null when AWC did not supply it.'),
+    temperature_forecasts: z
+      .array(
+        z
+          .object({
+            kind: z.string().describe('AWC extremum code, typically MAX or MIN.'),
+            valid_at: z
+              .string()
+              .describe(
+                'Time of the extremum in ISO 8601 UTC, which can fall outside this period.',
+              ),
+            temperature_c: z.number().describe('Forecast surface temperature in degrees Celsius.'),
+          })
+          .describe('One decoded temperature extremum.'),
+      )
+      .describe('Temperature extrema attached by AWC. Empty when AWC supplied none.'),
+    icing_turbulence: z
+      .array(
+        z
+          .object({
+            kind: z.string().describe('AWC layer code, typically ICE or TURB.'),
+            intensity_code: z.number().int().describe('Intensity code as decoded by AWC.'),
+            min_altitude_ft: z
+              .number()
+              .nullable()
+              .describe('Lower bound in feet as reported by AWC. Null when unspecified.'),
+            max_altitude_ft: z
+              .number()
+              .nullable()
+              .describe('Upper bound in feet as reported by AWC. Null when unspecified.'),
+          })
+          .describe('One decoded icing or turbulence layer.'),
+      )
+      .describe('Icing and turbulence layers attached by AWC. Empty when AWC supplied none.'),
     change_type: z
       .string()
       .nullable()
@@ -147,7 +200,7 @@ const ForecastPeriodSchema = z
 export const aviationGetTaf = tool('aviation_get_taf', {
   title: 'Get Terminal Aerodrome Forecast (TAF)',
   description:
-    'Get the Terminal Aerodrome Forecast (TAF) for one or more airports. Returns each forecast period with valid times, surface wind, low-level wind shear, visibility, decoded weather conditions, cloud layers, and the vertical visibility into a forecast obscuration, plus the raw TAF string. TAFs cover the next 24–30 hours and are issued only for airports with scheduled commercial service; check data_types from aviation_find_stations to confirm TAF availability. Accepts 1–4 ICAO station IDs (e.g., KSEA, KJFK, K36U).',
+    'Get Terminal Aerodrome Forecasts (TAFs) for 1–4 named stations, an area bounding box, or a US state or DC. Returns forecast periods, winds, wind shear, visibility, weather, cloud layers, vertical visibility, and raw TAFs. Check each forecast’s validity window for the time of interest. Use aviation_find_stations to check station forecast capability.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     station_ids: z
@@ -164,7 +217,54 @@ export const aviationGetTaf = tool('aviation_get_taf', {
       )
       .min(1)
       .max(4)
+      .optional()
       .describe('ICAO station IDs to query. 1–4 stations per call.'),
+    bbox: z
+      .object({
+        minLat: z
+          .number()
+          .min(-90)
+          .max(90)
+          .describe('Southern boundary latitude in decimal degrees.'),
+        minLon: z
+          .number()
+          .min(-180)
+          .max(180)
+          .describe('Western boundary longitude in decimal degrees.'),
+        maxLat: z
+          .number()
+          .min(-90)
+          .max(90)
+          .describe('Northern boundary latitude in decimal degrees.'),
+        maxLon: z
+          .number()
+          .min(-180)
+          .max(180)
+          .describe('Eastern boundary longitude in decimal degrees.'),
+      })
+      .optional()
+      .describe('Geographic bounding box for a forecast survey.'),
+    state: z
+      .string()
+      .regex(/^[A-Za-z]{2}$/)
+      .optional()
+      .describe(
+        'Two-letter US state or DC code, case-insensitive. Returns forecasts available through the AWC state selector.',
+      ),
+    limit: cappedLimitSchema().describe(
+      `Maximum forecasts to return from offset in a bbox or state survey. The served maximum is ${AWC_MAX_ROWS} when limit is supplied. Omit to return all remaining matches.`,
+    ),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe(
+        'Zero-based survey start ordered by station ID, issue time descending, then raw bulletin.',
+      ),
+    as_of: HistoryAnchorSchema.optional().describe(
+      'Historical issuance reference as YYYY-MM-DDTHH:mm:ssZ or YYYY-MM-DDTHH:mm:ss.sssZ within the previous 30 days. Check the returned validity window separately. Omit for current forecasts.',
+    ),
   }),
   output: z.object({
     forecasts: z
@@ -177,6 +277,16 @@ export const aviationGetTaf = tool('aviation_get_taf', {
                 'ICAO station identifier, 4 uppercase letters or digits (e.g., KSEA, K36U).',
               ),
             name: z.string().describe('Human-readable station or airport name.'),
+            amended: z
+              .boolean()
+              .nullable()
+              .describe(
+                'Whether the recognizable bulletin header carries AMD. Null when the header cannot be classified.',
+              ),
+            remarks: z
+              .string()
+              .nullable()
+              .describe('AWC bulletin remarks, trimmed. Null when no remarks were decoded.'),
             issued_at: z.string().describe('TAF issue time in ISO 8601 format (UTC).'),
             valid_from: z
               .string()
@@ -193,30 +303,110 @@ export const aviationGetTaf = tool('aviation_get_taf', {
           })
           .describe('A Terminal Aerodrome Forecast for one station.'),
       )
-      .describe('TAF forecasts, one per requested station.'),
+      .describe('TAF products returned for the selected stations or survey.'),
   }),
   errors: [
     {
+      reason: 'missing_location',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'No location selector was provided.',
+      recovery: 'Provide station_ids, bbox, or state to select forecasts.',
+    },
+    {
+      reason: 'conflicting_location',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'More than one location selector was provided.',
+      recovery: 'Choose one selector: station_ids, bbox, or state.',
+    },
+    {
+      reason: 'invalid_bbox',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The bounding box has inverted latitude or longitude bounds.',
+      recovery: 'Set minLat at or below maxLat and minLon at or below maxLon.',
+    },
+    {
+      reason: 'invalid_state',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The state code is outside the 50 US states and DC.',
+      recovery: 'Use a US state or DC code, or provide a bounding box.',
+    },
+    {
+      reason: 'conflicting_offset',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'offset was supplied for a named station lookup.',
+      recovery: 'Drop offset or run a bbox or state survey.',
+    },
+    {
+      reason: 'conflicting_limit',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A caller limit was provided for a named lookup.',
+      recovery: 'Drop limit or select an area with bbox or state.',
+    },
+    {
+      reason: 'future_as_of',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The historical reference time is in the future.',
+      recovery: 'Use a UTC timestamp at or before the current time.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'outside_retention',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The historical reference time predates the AWC retention window.',
+      recovery: 'Use a UTC timestamp within the past 30 days.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'no_taf_available',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Station does not issue TAFs or no TAF is currently available.',
+      when: 'The selected stations or survey returned no forecasts for the requested time.',
       // Most airports issue no TAF at all, so a miss is an ordinary answer to
       // the lookup rather than an incident.
       severity: 'notice',
       recovery:
-        'Not all airports have TAFs — only major airports with scheduled commercial service typically issue them. Check data_types from aviation_find_stations to confirm TAF capability. Smaller airports may only have METARs.',
+        'Check data_types from aviation_find_stations for TAF capability. Use bbox around the airport to look for other reporting stations.',
     },
   ],
 
   enrichment: {
+    nextOffset: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'Offset for the next page of the currently available draw. Present only while matches remain.',
+      ),
+    truncated: z
+      .boolean()
+      .optional()
+      .describe(
+        'Whether a survey reached the upstream row cap. A value of false only says the draw fell below the cap.',
+      ),
+    cap: z.number().optional().describe('Upstream forecast row cap, shown when reached.'),
+    shown: z.number().optional().describe('Forecasts shown from a survey after any limit.'),
+    limited: z
+      .boolean()
+      .optional()
+      .describe(
+        'Whether the caller limit withheld forecasts from this draw. Present when a survey has a limit.',
+      ),
+    matched: z
+      .number()
+      .optional()
+      .describe(
+        'Forecasts in the draw before paging. Present when offset was supplied or limit withheld matches.',
+      ),
     requested: z
       .array(z.string().describe('An ICAO station ID as requested.'))
+      .optional()
       .describe('Station IDs this call asked for, in the order given.'),
     returned: z
       .array(z.string().describe('An ICAO station ID present in the result.'))
+      .optional()
       .describe('Distinct station IDs that produced a forecast.'),
     partial: z
       .boolean()
+      .optional()
       .describe(
         'True when a requested station produced no forecast. False affirms the result covers every requested station, so full coverage is distinguishable from a short batch rather than being inferred from the count.',
       ),
@@ -228,27 +418,115 @@ export const aviationGetTaf = tool('aviation_get_taf', {
       .string()
       .optional()
       .describe(
-        'Recovery guidance naming the missing station IDs. Present only on a partial result. It lists the candidate causes without asserting one — upstream omits the row either way.',
+        'Guidance about missing named stations, a capped survey, or a survey limited by the caller.',
       ),
   },
 
   enrichmentTrailer: {
-    requested: { render: (ids) => `**Requested:** ${ids.join(', ')}` },
-    returned: { render: (ids) => `**Returned:** ${ids.join(', ')}` },
+    nextOffset: { label: 'Next offset' },
+    requested: { render: (ids) => `**Requested:** ${ids?.join(', ')}` },
+    returned: { render: (ids) => `**Returned:** ${ids?.join(', ')}` },
     missing: { render: (ids) => `**No forecast returned for:** ${ids?.join(', ')}` },
     partial: { label: 'Partial result' },
+    truncated: { label: 'Truncated at the upstream row cap' },
+    cap: { label: 'Upstream row maximum' },
+    shown: { label: 'Forecasts returned' },
+    limited: { label: 'Limited by the request' },
+    matched: { label: 'Forecasts matched before paging' },
   },
 
   async handler(input, ctx) {
-    const stationIds = input.station_ids.map((id) => id.toUpperCase());
-    ctx.log.info('Fetching TAFs', { stationIds });
+    const stationIds = input.station_ids?.map((id) => id.toUpperCase());
+    const state = input.state?.toUpperCase();
+    const { bbox, offset, as_of: asOf } = input;
+    const location = stationIds ?? (bbox ? { bbox } : state ? { state } : undefined);
+    if (!location) {
+      throw ctx.fail('missing_location', 'Provide station_ids, bbox, or state.');
+    }
+    if (Number(!!stationIds) + Number(!!bbox) + Number(!!state) > 1) {
+      throw ctx.fail(
+        'conflicting_location',
+        'Provide exactly one of station_ids, bbox, and state.',
+      );
+    }
+    if (bbox && !isBboxOrdered(bbox)) {
+      throw ctx.fail('invalid_bbox', 'Bounding box bounds must be in ascending order.');
+    }
+    if (state && !isSupportedState(state)) {
+      throw ctx.fail('invalid_state', `Unsupported state code: ${state}.`);
+    }
+    if (stationIds && offset !== undefined) {
+      throw ctx.fail('conflicting_offset', 'offset applies only to bbox and state surveys.');
+    }
+    if (stationIds && input.limit !== undefined) {
+      throw ctx.fail('conflicting_limit', 'limit applies to bbox and state surveys.');
+    }
+    ctx.log.info('Fetching TAFs', { location });
     const svc = getAviationWeatherService();
-    const forecasts = await svc.fetchTaf(stationIds, ctx);
+    const forecasts = asOf
+      ? await svc.fetchTaf(location, ctx, asOf)
+      : await svc.fetchTaf(location, ctx);
 
     if (forecasts.length === 0) {
-      throw ctx.fail('no_taf_available', `No TAF data found for: ${stationIds.join(', ')}`, {
-        stationIds,
-      });
+      const anchor = asOf ? ` at the issuance reference ${asOf}` : '';
+      const scope =
+        stationIds?.join(', ') ?? (state ? `AWC's ${state} survey` : 'the bounding box');
+      throw ctx.fail(
+        'no_taf_available',
+        `No TAF data found for: ${scope}${anchor}`,
+        stationIds
+          ? { stationIds }
+          : {
+              ...(state ? { state } : { bbox }),
+              recovery: {
+                hint: 'Try a wider bounding box and check station forecast capability with aviation_find_stations.',
+              },
+            },
+      );
+    }
+    if (!stationIds) {
+      const capped = isUpstreamCapped(forecasts.length);
+      const { limit, notice: clampNotice } = clampResultLimit(
+        input.limit,
+        'aviation_get_taf',
+        ctx.log,
+      );
+      const ordered =
+        limit === undefined && offset === undefined
+          ? forecasts
+          : forecasts.toSorted(
+              (a, b) =>
+                a.station_id.localeCompare(b.station_id) ||
+                b.issued_at.localeCompare(a.issued_at) ||
+                a.raw_taf.localeCompare(b.raw_taf),
+            );
+      const { rows: selected, nextOffset } = pageResults(ordered, offset, limit);
+      const limited = limit !== undefined && nextOffset !== undefined;
+      const capHint = state
+        ? 'Search smaller geographic boxes within the state and combine the results.'
+        : 'Search smaller bounding boxes and combine the results.';
+      const notice = [
+        capped ? `AWC reached its ${AWC_MAX_ROWS}-row cap. ${capHint}` : '',
+        offset !== undefined
+          ? `Returned ${selected.length} of ${forecasts.length} matching forecasts from offset ${offset} in this draw.`
+          : limited
+            ? `The caller limit shows ${selected.length} of ${forecasts.length} forecasts in this draw.`
+            : '',
+        clampNotice,
+        nextOffset === undefined ? null : continuationNotice(nextOffset),
+      ]
+        .filter(Boolean)
+        .join(' ');
+      if (capped) {
+        ctx.enrich.truncated({ shown: selected.length, cap: AWC_MAX_ROWS, guidance: notice });
+      } else {
+        ctx.enrich({ truncated: false, shown: selected.length });
+        if (notice) ctx.enrich.notice(notice);
+      }
+      if (limit !== undefined) ctx.enrich({ limited });
+      if (limited || offset !== undefined) ctx.enrich({ matched: forecasts.length });
+      if (nextOffset !== undefined) ctx.enrich({ nextOffset });
+      return { forecasts: selected };
     }
 
     // Upstream drops a station that issued no forecast without reporting it, so
@@ -269,10 +547,14 @@ export const aviationGetTaf = tool('aviation_get_taf', {
   },
 
   format: (result) => {
+    if (result.forecasts.length === 0)
+      return [{ type: 'text', text: 'No forecast in this result.' }];
     const lines: string[] = [];
     for (const taf of result.forecasts) {
       lines.push(`## ${taf.station_id} — ${taf.name}`);
       lines.push(`**Issued:** ${taf.issued_at} | **Valid:** ${taf.valid_from} → ${taf.valid_to}`);
+      lines.push(`**Amended:** ${taf.amended === null ? 'unknown' : taf.amended ? 'yes' : 'no'}`);
+      if (taf.remarks !== null) lines.push(`**Remarks:** ${taf.remarks}`);
       lines.push('');
 
       for (const period of taf.forecast_periods) {
@@ -281,6 +563,19 @@ export const aviationGetTaf = tool('aviation_get_taf', {
         // guard here would drop it.
         const probLabel = period.probability != null ? ` (${period.probability}%)` : '';
         lines.push(`### ${changeLabel}${period.from} → ${period.to}${probLabel}`);
+        if (period.transition_end !== null)
+          lines.push(`**Transition end:** ${period.transition_end}`);
+        if (period.altimeter_hpa !== null) lines.push(`**Altimeter:** ${period.altimeter_hpa} hPa`);
+        for (const temperature of period.temperature_forecasts) {
+          lines.push(
+            `**Temperature forecast:** ${temperature.kind} ${temperature.temperature_c} °C at ${temperature.valid_at}`,
+          );
+        }
+        for (const layer of period.icing_turbulence) {
+          lines.push(
+            `**Icing or turbulence:** ${layer.kind} code ${layer.intensity_code}, minimum ${layer.min_altitude_ft === null ? 'unknown' : `${layer.min_altitude_ft} ft`}, maximum ${layer.max_altitude_ft === null ? 'unknown' : `${layer.max_altitude_ft} ft`}`,
+          );
+        }
 
         // A period with no wind element has no direction to call variable and
         // no speed to call calm. Both come from the same absent group.

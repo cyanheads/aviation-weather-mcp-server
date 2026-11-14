@@ -6,6 +6,12 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
+import {
+  cappedLimitSchema,
+  clampResultLimit,
+  continuationNotice,
+  pageResults,
+} from '@/mcp-server/tools/result-page.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 import { AWC_MAX_ROWS, isUpstreamCapped } from '@/services/aviation-weather/awc-limits.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
@@ -73,7 +79,7 @@ function unresolvedStationNotice(missing: string[]): string {
 }
 
 /**
- * The ordering a `limit` selects under: `icao_id` ascending, rows carrying none
+ * The paging order: `icao_id` ascending, rows carrying none
  * last, ties broken by the registry `id` ascending.
  *
  * Stations carry no natural rank, so a limit without a defined order returns a
@@ -101,17 +107,13 @@ function byStationIdentifier(a: NormalizedStation, b: NormalizedStation): number
 }
 
 /**
- * What a request-imposed `limit` withheld, stated so it cannot be read as the
- * upstream row cap. The two say opposite things about what was examined: a
- * capped draw is one AWC never served past, while a limited result counted
- * every station it is selecting from. The count is scoped to the draw it was
- * taken from — on a capped draw it describes that draw, not the search area.
+ * Distinguish paging from upstream coverage.
  */
-function limitNotice(shown: number, matched: number, capped: boolean): string {
+function pageNotice(shown: number, matched: number, offset: number, capped: boolean): string {
   const scope = capped
     ? `${matched} station(s) that matched inside the capped draw`
     : `${matched} matching station(s)`;
-  return `The request limited this result to the first ${shown} of ${scope}, ordered by ICAO identifier ascending with identifier-less stations last. That is not the upstream cap — every station counted here was examined, and raising or dropping limit returns the ones it withheld.`;
+  return `The requested offset and limit returned ${shown} of ${scope} starting at offset ${offset}, ordered by ICAO identifier ascending with identifier-less stations last. That is not the upstream cap: every station counted here was examined.`;
 }
 
 /**
@@ -194,14 +196,16 @@ export const aviationFindStations = tool('aviation_find_stations', {
       .describe(
         'Two-letter USPS code for one of the 50 US states or DC (e.g., "WA") to list all stations in that jurisdiction. US territories are not supported — use bbox for those.',
       ),
-    limit: z
+    limit: cappedLimitSchema().describe(
+      `Maximum stations to return from offset. The served maximum is ${AWC_MAX_ROWS} when limit is supplied. Only for bbox or state. Omit to return all remaining matches.`,
+    ),
+    offset: z
       .number()
       .int()
-      .min(1)
-      .max(AWC_MAX_ROWS)
+      .min(0)
       .optional()
       .describe(
-        `Maximum stations to return, applied after ordering by ICAO identifier ascending with identifier-less stations last — so the same query with the same limit returns the same stations, and airports rather than unidentified sites lead the first page. It bounds the response without changing the area searched, which a smaller bbox or a different state would. Distinct from the ${AWC_MAX_ROWS}-row upstream cap: a limited result examined every station it counted and withheld some, while a capped one never drew the rest. Belongs to the bbox and state modes; supplying it alongside station_ids is rejected, since that mode already names the set. Omit to return every match. Optional.`,
+        'Zero-based start among matching stations ordered by ICAO identifier ascending, identifier-less stations last. Only for bbox or state. Use nextOffset to continue over the currently available draw.',
       ),
   }),
   output: z.object({
@@ -313,6 +317,13 @@ export const aviationFindStations = tool('aviation_find_stations', {
         'Drop limit to resolve every identifier you named, or replace station_ids with bbox or state to run an area search the limit can bound.',
     },
     {
+      reason: 'conflicting_offset',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'offset was provided together with station_ids.',
+      recovery:
+        'Drop offset to resolve every named station, or use bbox or state to page through an area search.',
+    },
+    {
       reason: 'upstream_rejected',
       code: JsonRpcErrorCode.InvalidParams,
       when: 'The AWC station registry rejected the request as malformed rather than answering it.',
@@ -333,20 +344,25 @@ export const aviationFindStations = tool('aviation_find_stations', {
     shown: z
       .number()
       .describe(
-        'Stations in this result, counted after any client-side state filter and after any limit.',
+        'Stations in this result, counted after any client-side state filter and request pagination.',
       ),
     limited: z
       .boolean()
       .optional()
       .describe(
-        'True when the requested limit withheld stations that matched — the caller asked to see fewer of them. False affirms the limit did not bite, so every matching station is here. Present only when the call supplied a limit. It never states anything about the upstream cap: a limited result examined every station it counted, while a truncated one never drew the rest.',
+        'True when the limit withheld matches at or after the requested offset. Present only when the call supplied a limit. Upstream coverage is reported separately.',
       ),
     matched: z
       .number()
       .optional()
       .describe(
-        'Stations that matched this query before the limit selected from them. Present only on a limited result. Where the result is also truncated this counts the capped draw and not the search area — the stations the cap dropped were never examined, so no count can include them.',
+        'Stations that matched this query before paging. Present when offset was supplied or limit withheld matches. If upstream was truncated, this counts matches in the capped draw.',
       ),
+    nextOffset: z
+      .number()
+      .int()
+      .optional()
+      .describe('Offset for the next page when more matches remain in the available draw.'),
     cap: z
       .number()
       .optional()
@@ -387,7 +403,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
       .string()
       .optional()
       .describe(
-        'Guidance for bbox row caps, requested limits, area results above 110 stations with no limit, unresolved identifiers, or unavailable supplementary magnetic variation. State snapshots are complete and never reach the stationinfo row cap. A failed airport lookup does not invalidate station identity.',
+        'Guidance for bbox row caps, paging and clamped limits, area results above 110 stations with no limit, unresolved identifiers, or unavailable supplementary magnetic variation. State snapshots are complete and never reach the stationinfo row cap. A failed airport lookup does not invalidate station identity.',
       ),
   },
 
@@ -398,6 +414,7 @@ export const aviationFindStations = tool('aviation_find_stations', {
     upstreamRows: { label: 'Rows drawn before the state filter' },
     limited: { label: 'Limited by the request' },
     matched: { label: 'Stations matched before the limit' },
+    nextOffset: { label: 'Next offset' },
     requested: { render: (ids) => `**Requested:** ${ids?.join(', ')}` },
     returned: { render: (ids) => `**Resolved:** ${ids?.join(', ')}` },
     missing: { render: (ids) => `**Resolved to nothing:** ${ids?.join(', ')}` },
@@ -445,6 +462,9 @@ export const aviationFindStations = tool('aviation_find_stations', {
         'conflicting_limit',
         'limit bounds an area search and has no effect on a named list of identifiers.',
       );
+    }
+    if (stationIds?.length && input.offset !== undefined) {
+      throw ctx.fail('conflicting_offset', 'offset applies only to bbox and state searches.');
     }
 
     if (stationIds && (stationIds.length > 20 || stationIds.some((id) => id.length === 0))) {
@@ -507,15 +527,20 @@ export const aviationFindStations = tool('aviation_find_stations', {
       });
     }
 
-    // Stations that matched the query — everything the limit selects from, and
-    // the count the cap disclosure describes the state filter as leaving. The
-    // limit runs last, over a defined order, so the same query with the same
-    // limit returns the same stations.
     const matched = stations.length;
-    const shownStations =
-      input.limit != null ? stations.toSorted(byStationIdentifier).slice(0, input.limit) : stations;
+    const { limit, notice: clampNotice } = clampResultLimit(
+      input.limit,
+      'aviation_find_stations',
+      ctx.log,
+    );
+    const paging = limit !== undefined || input.offset !== undefined;
+    const { rows: shownStations, nextOffset } = pageResults(
+      paging ? stations.toSorted(byStationIdentifier) : stations,
+      input.offset,
+      limit,
+    );
     const shown = shownStations.length;
-    const limited = input.limit != null && matched > input.limit;
+    const limited = limit !== undefined && nextOffset !== undefined;
 
     // Complete state snapshots are not subject to stationinfo's row cap.
     const drawnRows = matched;
@@ -532,10 +557,12 @@ export const aviationFindStations = tool('aviation_find_stations', {
       capped
         ? `AWC served ${drawnRows} rows for this query, its per-request maximum, so ${scope}. Re-run over smaller bbox quadrants and union the results — a smaller box is the only narrowing lever the stationinfo endpoint offers.`
         : null,
-      limited ? limitNotice(shown, matched, capped) : null,
-      !stationIds?.length && input.limit == null && shown > SIZE_NOTICE_THRESHOLD
-        ? sizeNotice(shown)
+      clampNotice,
+      limited || (input.offset ?? 0) > 0
+        ? pageNotice(shown, matched, input.offset ?? 0, capped)
         : null,
+      nextOffset === undefined ? null : continuationNotice(nextOffset),
+      !stationIds?.length && !paging && shown > SIZE_NOTICE_THRESHOLD ? sizeNotice(shown) : null,
     ]
       .filter(Boolean)
       .join(' ');
@@ -551,7 +578,8 @@ export const aviationFindStations = tool('aviation_find_stations', {
     // `limited: false` is only owed to one who did — where it separates a limit
     // that bit from one that had nothing to withhold.
     if (input.limit != null) ctx.enrich({ limited });
-    if (limited) ctx.enrich({ matched });
+    if (limited || input.offset !== undefined) ctx.enrich({ matched });
+    if (nextOffset !== undefined) ctx.enrich({ nextOffset });
 
     // Upstream omits an identifier that resolved to nothing with no marker at
     // all, so a short list read as a full one. Reconcile against the registry

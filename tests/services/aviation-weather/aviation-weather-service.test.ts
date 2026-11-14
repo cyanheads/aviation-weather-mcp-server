@@ -26,7 +26,9 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async (importActual) => {
 });
 
 import { fetchWithTimeout } from '@cyanheads/mcp-ts-core/utils';
+import { aviationGetMetar } from '@/mcp-server/tools/definitions/aviation-get-metar.tool.js';
 import { aviationGetPireps } from '@/mcp-server/tools/definitions/aviation-get-pireps.tool.js';
+import { aviationGetTaf } from '@/mcp-server/tools/definitions/aviation-get-taf.tool.js';
 import {
   AviationWeatherService,
   initAviationWeatherService,
@@ -59,6 +61,264 @@ function queryParam(key: string, value: number | string): RegExp {
 }
 
 const svc = new AviationWeatherService({} as AppConfig, {} as StorageService);
+
+describe('AWC historical retrieval', () => {
+  it('keeps range and retention reasons distinct from genuine no-data responses', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-14T06:00:00Z'));
+    try {
+      initAviationWeatherService({} as AppConfig, {} as StorageService);
+      const request = (as_of: string) =>
+        runToolContract(aviationGetMetar, { station_ids: ['KDEN'], as_of });
+      for (const [date, reason] of [
+        ['2026-11-14T06:00:00.001Z', 'future_as_of'],
+        ['2026-10-15T05:59:59.999Z', 'outside_retention'],
+      ] as const) {
+        const result = await request(date);
+        expect(result.structuredContent).toMatchObject({ error: { data: { reason } } });
+        expect(result.content[0]).toMatchObject({ text: expect.stringContaining(reason) });
+      }
+      const malformed = await request('2026-02-29T05:30:37.123Z');
+      expect(malformed.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.InvalidParams },
+      });
+      expect(fetchWithTimeout).not.toHaveBeenCalled();
+
+      vi.mocked(fetchWithTimeout)
+        .mockRejectedValueOnce(
+          new McpError(JsonRpcErrorCode.InvalidParams, 'HTTP 400', {
+            status: 400,
+            body: JSON.stringify({
+              status: 'error',
+              error: 'Data is available for up to 30 days for date',
+            }),
+          }),
+        )
+        .mockResolvedValueOnce(new Response(null, { status: 204 }));
+      const boundary = '2026-10-15T06:00:00Z';
+      const rejected = await request(boundary);
+      expect(rejected.structuredContent).toMatchObject({
+        error: {
+          data: {
+            reason: 'outside_retention',
+            recovery: { hint: expect.stringContaining('30 days') },
+          },
+        },
+      });
+      const empty = await request(boundary);
+      expect(empty.structuredContent).toMatchObject({
+        error: { data: { reason: 'no_stations_found' } },
+      });
+      expect(empty.content[0]).toMatchObject({ text: expect.stringContaining(boundary) });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('preserves the issuance and a validity start after the historical TAF anchor', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-14T06:00:00Z'));
+    try {
+      initAviationWeatherService({} as AppConfig, {} as StorageService);
+      const as_of = '2026-11-12T05:30:37.123Z';
+      const issued_at = '2026-11-12T05:20:00.000Z';
+      const valid_from = '2026-11-12T06:00:00.000Z';
+      vi.mocked(fetchWithTimeout).mockResolvedValue(
+        jsonResponse([
+          {
+            ...rawTafKSEA,
+            issueTime: issued_at,
+            validTimeFrom: Date.parse(valid_from) / 1000,
+          },
+        ]),
+      );
+      const result = await runToolContract(aviationGetTaf, { station_ids: ['KSEA'], as_of });
+      expect(result.structuredContent).toMatchObject({ forecasts: [{ issued_at, valid_from }] });
+      expect(result.content[0]).toMatchObject({
+        text: expect.stringContaining(`**Issued:** ${issued_at} | **Valid:** ${valid_from}`),
+      });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each([false, true])('adds the anchor to every radial PIREP draw (split=%s)', async (split) => {
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(
+        jsonResponse(split ? [{ id: 'PASY', icaoId: 'PASY', lat: 52.7, lon: 179.9 }] : []),
+      )
+      .mockImplementation(async () => jsonResponse([]));
+    const asOf = '2026-11-12T05:30:37Z';
+    await svc.fetchPireps({ stationId: 'PASY', hours: 48, asOf }, createMockContext());
+    const [lookup, ...draws] = vi.mocked(fetchWithTimeout).mock.calls.map(([url]) => new URL(url));
+    expect(lookup?.searchParams.get('date')).toBeNull();
+    expect(draws).toHaveLength(split ? 2 : 1);
+    for (const { searchParams } of draws) {
+      expect(searchParams.get('date')).toBe(asOf);
+      expect(searchParams.get('age')).toBe('48');
+      expect(searchParams.has(split ? 'bbox' : 'distance')).toBe(true);
+    }
+  });
+
+  it('adds the exact UTC anchor to observation and forecast queries', async () => {
+    vi.mocked(fetchWithTimeout).mockImplementation(async () => jsonResponse([]));
+    const ctx = createMockContext();
+    const asOf = '2026-11-12T05:30:37.123Z';
+    await svc.fetchMetar({ stationIds: ['KDEN'], hours: 720, asOf }, ctx);
+    await svc.fetchTaf(['KSEA'], ctx, asOf);
+    await svc.fetchPireps(
+      { bbox: { minLat: 47, minLon: -123, maxLat: 49, maxLon: -121 }, hours: 48, asOf },
+      ctx,
+    );
+    const [metar, taf, pirep] = vi
+      .mocked(fetchWithTimeout)
+      .mock.calls.map(([url]) => new URL(url).searchParams);
+    expect([metar?.get('date'), taf?.get('date'), pirep?.get('date')]).toEqual([asOf, asOf, asOf]);
+    expect(taf?.get('time')).toBe('issue');
+    expect(metar?.get('hours')).toBe('720');
+    expect(pirep?.get('age')).toBe('48');
+  });
+
+  it('omits date and issuance mode on current requests', async () => {
+    vi.mocked(fetchWithTimeout).mockImplementation(async () => jsonResponse([]));
+    const ctx = createMockContext();
+    await svc.fetchMetar({ stationIds: ['KDEN'], hours: 1 }, ctx);
+    await svc.fetchTaf(['KSEA'], ctx);
+    await svc.fetchPireps(
+      { bbox: { minLat: 47, minLon: -123, maxLat: 49, maxLon: -121 }, hours: 3 },
+      ctx,
+    );
+    expect(
+      vi.mocked(fetchWithTimeout).mock.calls.map(([url]) => String(url).split('/api/data/')[1]),
+    ).toEqual([
+      'metar?ids=KDEN&format=json&hours=1',
+      'taf?ids=KSEA&format=json',
+      'pirep?bbox=47,-123,49,-121&format=json&age=3',
+    ]);
+  });
+});
+
+describe('AWC weather survey selectors', () => {
+  it('preserves live-shape supplemental TAF fields through both response surfaces', async () => {
+    const period = rawTafKSEA.fcsts[0]!;
+    vi.mocked(fetchWithTimeout).mockResolvedValue(
+      jsonResponse([
+        {
+          ...rawTafKSEA,
+          rawTAF: 'TAF AMD KSEA 140500Z 1405/1511 BECMG 1507/1508 650709 520006',
+          remarks: '',
+          fcsts: [
+            {
+              ...period,
+              fcstChange: 'BECMG',
+              timeFrom: 1794726000,
+              timeTo: 1794740400,
+              timeBec: 1794729600,
+              altim: 1008,
+              temp: [
+                { validTime: 1794632400, surfaceTemp: -2, maxOrMin: 'MIN' },
+                { validTime: 1794664800, surfaceTemp: 0, maxOrMin: 'MAX' },
+              ],
+              icgTurb: [
+                { impactVar: 'ICE', intensity: 5, minAlt: 7000, maxAlt: 16000 },
+                { impactVar: 'TURB', intensity: 2, minAlt: null, maxAlt: 6000 },
+              ],
+            },
+            { ...period, fcstChange: 'BECMG', timeBec: period.timeTo, temp: null, icgTurb: null },
+            period,
+          ],
+        },
+        {
+          ...rawTafKSEA,
+          icaoId: 'KBFI',
+          rawTAF: 'TAF COR KBFI 140530Z 1406/1512',
+          remarks: ' COR',
+        },
+        {
+          ...rawTafKSEA,
+          icaoId: 'KJFK',
+          rawTAF: 'TAF KJFK 140540Z 1406/1512 NO AMDS',
+          remarks: ' RMK NXT FCST BY 140900Z',
+        },
+        { ...rawTafKSEA, icaoId: 'KBOS', rawTAF: 'unrecognized AMD header' },
+      ]),
+    );
+    initAviationWeatherService({} as AppConfig, {} as StorageService);
+    const result = await runToolContract(aviationGetTaf, {
+      station_ids: ['KSEA', 'KBFI', 'KJFK', 'KBOS'],
+    });
+    expect(result.structuredContent).toMatchObject({
+      forecasts: [
+        {
+          amended: true,
+          remarks: null,
+          forecast_periods: [
+            {
+              transition_end: '2026-11-15T08:00:00.000Z',
+              altimeter_hpa: 1008,
+              from: '2026-11-15T07:00:00.000Z',
+              to: '2026-11-15T11:00:00.000Z',
+              temperature_forecasts: [
+                { kind: 'MIN', temperature_c: -2, valid_at: '2026-11-14T05:00:00.000Z' },
+                { kind: 'MAX', temperature_c: 0, valid_at: '2026-11-14T14:00:00.000Z' },
+              ],
+              icing_turbulence: [
+                { kind: 'ICE', intensity_code: 5, min_altitude_ft: 7000, max_altitude_ft: 16000 },
+                { kind: 'TURB', intensity_code: 2, min_altitude_ft: null, max_altitude_ft: 6000 },
+              ],
+            },
+            {
+              transition_end: '2026-01-16T00:00:00.000Z',
+              to: '2026-01-16T00:00:00.000Z',
+              temperature_forecasts: [],
+              icing_turbulence: [],
+            },
+            {
+              transition_end: null,
+              altimeter_hpa: null,
+              temperature_forecasts: [],
+              icing_turbulence: [],
+            },
+          ],
+        },
+        { amended: false, remarks: 'COR' },
+        { amended: false, remarks: 'RMK NXT FCST BY 140900Z' },
+        { amended: null },
+      ],
+    });
+    const text = JSON.stringify(result.content);
+    for (const fragment of [
+      '2026-11-15T08:00:00.000Z',
+      '1008 hPa',
+      'MIN -2 °C',
+      'MAX 0 °C',
+      'TURB code 2, minimum unknown, maximum 6000 ft',
+      'RMK NXT FCST BY 140900Z',
+    ]) {
+      expect(text).toContain(fragment);
+    }
+  });
+
+  it('builds TAF bbox and TAF/METAR state URLs and keeps the returned station identities', async () => {
+    const bbox = { minLat: 47, minLon: -123, maxLat: 48, maxLon: -122 };
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(jsonResponse([rawTafKSEA, { ...rawTafKSEA, icaoId: 'KBFI' }]))
+      .mockResolvedValueOnce(jsonResponse([{ ...rawTafKSEA, icaoId: 'KDCA' }]))
+      .mockResolvedValueOnce(jsonResponse([{ ...rawMetarKDEN, icaoId: 'KSEA' }]));
+    const ctx = createMockContext();
+    const box = await svc.fetchTaf({ bbox }, ctx);
+    const stateTaf = await svc.fetchTaf({ state: 'DC' }, ctx);
+    const stateMetar = await svc.fetchMetar({ state: 'WA', hours: 1 }, ctx);
+    expect(box.map(({ station_id }) => station_id)).toEqual(['KSEA', 'KBFI']);
+    expect(stateTaf.map(({ station_id }) => station_id)).toEqual(['KDCA']);
+    expect(stateMetar.map(({ station_id }) => station_id)).toEqual(['KSEA']);
+    expect(
+      vi.mocked(fetchWithTimeout).mock.calls.map(([url]) => String(url).split('/api/data/')[1]),
+    ).toEqual([
+      'taf?bbox=47,-123,48,-122&format=json',
+      'taf?ids=%40DC&format=json',
+      'metar?ids=%40WA&format=json&hours=1',
+    ]);
+  });
+});
 
 beforeEach(() => {
   // A test that forgets to mock its response fails loudly on this rejection
@@ -1864,9 +2124,20 @@ describe('AviationWeatherService request construction', () => {
         });
         const failure =
           runtime === 'node' ? new TypeError('terminated', { cause: socket }) : socket;
-        const response = jsonResponse([]);
-        vi.spyOn(response, 'text').mockRejectedValue(failure);
-        vi.mocked(fetchWithTimeout).mockResolvedValue(response);
+        const actual = await vi.importActual<typeof import('@cyanheads/mcp-ts-core/utils')>(
+          '@cyanheads/mcp-ts-core/utils',
+        );
+        vi.mocked(fetchWithTimeout).mockImplementation(actual.fetchWithTimeout);
+        const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(
+          async () =>
+            new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.error(failure);
+                },
+              }),
+            ),
+        );
         initAviationWeatherService({} as AppConfig, {} as StorageService);
         const pending = runToolContract(aviationGetPireps, {
           bbox: { minLat: 40, minLon: -125, maxLat: 50, maxLon: -115 },
@@ -1874,11 +2145,15 @@ describe('AviationWeatherService request construction', () => {
         await vi.runAllTimersAsync();
         const result = await pending;
         expect(result.structuredContent).toMatchObject({
-          error: { code: JsonRpcErrorCode.ServiceUnavailable },
+          error: {
+            code: JsonRpcErrorCode.ServiceUnavailable,
+            data: { errorSource: 'FetchNetworkErrorWrapper' },
+          },
         });
-        expect(JSON.stringify(result.content)).toContain('could not be read');
-        expect(fetchWithTimeout).toHaveBeenCalledTimes(4);
+        expect(JSON.stringify(result.content)).toContain('Network error');
+        expect(fetch).toHaveBeenCalledTimes(4);
       } finally {
+        vi.restoreAllMocks();
         vi.useRealTimers();
       }
     },
@@ -2115,9 +2390,9 @@ describe('AviationWeatherService request construction', () => {
     expect(url).not.toContain('bbox=');
   });
 
-  it('rejects a METAR call naming neither mode', async () => {
+  it('rejects a METAR call without any location selector', async () => {
     await expect(svc.fetchMetar({ hours: 1 }, createMockContext())).rejects.toThrow(
-      /stationIds or bbox/,
+      /station list, bounding box or state/,
     );
   });
 

@@ -7,9 +7,17 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
 import { formatSkyLine } from '@/mcp-server/tools/format-sky-condition.js';
+import {
+  cappedLimitSchema,
+  clampResultLimit,
+  continuationNotice,
+  pageResults,
+} from '@/mcp-server/tools/result-page.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 import { AWC_MAX_ROWS, isUpstreamCapped } from '@/services/aviation-weather/awc-limits.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
+import { HistoryAnchorSchema } from '@/services/aviation-weather/history-anchor.js';
+import { isSupportedState } from '@/services/aviation-weather/supported-states.js';
 import type { NormalizedMetar } from '@/services/aviation-weather/types.js';
 
 const BboxSchema = z
@@ -200,7 +208,7 @@ function sizeNotice(shown: number, filtered: boolean): string {
 }
 
 /** The schema ceiling of `hours`, past which raising it cannot draw more. */
-const MAX_HOURS = 12;
+const MAX_HOURS = 720;
 
 /**
  * Recovery guidance for a draw that returned nothing, branched on the mode that
@@ -222,7 +230,7 @@ function noDataHint(mode: 'station_ids' | 'bbox', hours: number): string {
 export const aviationGetMetar = tool('aviation_get_metar', {
   title: 'Get METAR Weather Observations',
   description:
-    'Get current weather observations (METARs) for named airports, or survey every reporting station inside a geographic area. Returns decoded fields — wind direction/speed/gusts, visibility, ceiling with its kind (measured, or indefinite for vertical visibility into an obscuration), present weather, temperature, dewpoint, altimeter, cloud layers — plus the computed flight category (VFR/MVFR/IFR/LIFR) and the raw METAR string. Requires either station_ids (1–10 ICAO IDs, e.g., KSEA, KJFK, K0S9) or bbox (area survey) — not both. station_ids returns every observation inside the hours window; bbox returns the latest observation per station in the box, with flight_category keeping only the stations in the categories named (e.g., IFR and LIFR) and limit bounding how many stations come back. Use aviation_find_stations to resolve or verify an ICAO ID, or to discover nearby stations.',
+    'Get current or historical METAR observations for 1–10 named stations, a bounding box, or a US state or DC. Named lookups keep all observations that AWC drew within the window. Surveys keep the latest observation per station in the draw, with optional flight_category and limit. Results include decoded weather, wind, visibility, ceiling and flight category plus the raw METAR. Use aviation_find_stations to resolve or verify station identifiers.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     station_ids: z
@@ -241,9 +249,17 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       .max(10)
       .optional()
       .describe(
-        'ICAO station IDs to query. 1–10 stations per call, and every observation inside the hours window is returned for each. Supplying it alongside bbox is rejected — use bbox to ask about an area rather than a named set.',
+        'ICAO station IDs to query. 1–10 stations per call. Returns all drawn observations inside hours, subject to the upstream cap. Use bbox or state to search an area.',
       ),
     bbox: BboxSchema.optional(),
+    state: z
+      .string()
+      .regex(/^[A-Za-z]{2}$/)
+      .optional()
+      .describe(
+        'Two-letter US state or DC code, case-insensitive. Returns observations available through the AWC state selector.',
+      ),
+    as_of: HistoryAnchorSchema.optional(),
     hours: z
       .number()
       .int()
@@ -251,23 +267,23 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       .max(MAX_HOURS)
       .default(1)
       .describe(
-        'Lookback window in hours (1–12), not a row limit. With station_ids every observation inside the window is returned, so a station reporting more often than hourly yields more than one row per hour: at the default of 1, half-hourly stations return two observations and SPECI-issuing stations can return more, so budget rows by the station reporting interval, never one per station. With bbox the result is reduced to the latest observation per station, but the window still shapes the draw the upstream row cap applies to — a wide window spends that cap on repeat readings from busy stations instead of on more stations, so lower it before narrowing the box.',
+        'Lookback window in hours (1–720), ending at as_of or the current time when omitted, and not a row limit. With station_ids every observation drawn inside the window is returned, so a station reporting more often than hourly yields more than one row per hour: at the default of 1, half-hourly stations return two observations and SPECI-issuing stations can return more, so budget rows by the station reporting interval, never one per station. With bbox the result is reduced to the latest observation per station, but the window still shapes the draw the upstream row cap applies to — a wide window spends that cap on repeat readings from busy stations instead of on more stations, so lower it before narrowing the box.',
       ),
-    limit: z
+    offset: z
       .number()
       .int()
-      .min(1)
-      .max(AWC_MAX_ROWS)
+      .min(0)
       .optional()
-      .describe(
-        `Maximum stations to return, applied after the draw is reduced to the latest observation per station, after any flight_category filter, and ordered by station ID ascending — so the same query with the same limit returns the same stations. It bounds the response without changing the area searched, which a smaller bbox would, and it keeps an alphabetical slice rather than a region or a condition. Distinct from the ${AWC_MAX_ROWS}-row upstream cap: a limited result examined every station it counted and withheld some, while a capped one never drew the rest. Belongs to the bbox mode; supplying it alongside station_ids is rejected, since that mode already names the set. Omit to return every station in the box. Optional.`,
-      ),
+      .describe('Zero-based start among matching survey stations ordered by station ID.'),
+    limit: cappedLimitSchema().describe(
+      `Maximum stations to return from offset after selection. The served maximum is ${AWC_MAX_ROWS} when limit is supplied. Omit to return all remaining matches.`,
+    ),
     flight_category: z
       .array(z.enum(FLIGHT_CATEGORIES).describe('A flight category: VFR, MVFR, IFR, or LIFR.'))
       .min(1)
       .optional()
       .describe(
-        'Return only the stations whose flight category is one of these (e.g., ["IFR", "LIFR"] to find where conditions are poor). Applied in the tool after the draw is reduced to the latest observation per station and before limit, so it changes which stations come back, not what AWC draws or the upstream row cap. A station AWC could not rate (flight_category "unknown") never matches. Belongs to the bbox mode; supplying it alongside station_ids is rejected, since each named station already reports its own category. Optional.',
+        'In a bbox or state survey, filter after selecting the latest observation per station and before applying limit. Stations with unknown category do not match.',
       ),
   }),
   output: z.object({
@@ -387,10 +403,30 @@ export const aviationGetMetar = tool('aviation_get_metar', {
           .describe('A single weather observation from one station at one time.'),
       )
       .describe(
-        'Weather observations. With station_ids, one per station/time pair — multiple entries per station when the hours window holds more than one observation. With bbox, one per station: the latest observation inside that window.',
+        'Drawn observations. Named stations can have multiple entries. Surveys by bbox or state return the latest observation for each matching station.',
       ),
   }),
   errors: [
+    {
+      reason: 'invalid_state',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The state code is outside the 50 US states and DC.',
+      recovery: 'Use a US state or DC code, or provide a bounding box.',
+    },
+    {
+      reason: 'future_as_of',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The historical reference time is in the future.',
+      recovery: 'Use a UTC timestamp at or before the current time.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'outside_retention',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The historical reference time predates the AWC retention window.',
+      recovery: 'Use a UTC timestamp within the past 30 days.',
+      thrownBy: 'service',
+    },
     {
       reason: 'no_stations_found',
       code: JsonRpcErrorCode.NotFound,
@@ -402,21 +438,20 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       // `noDataHint`. This entry states the mode-agnostic form, which is what a
       // client reading the catalog ahead of a call can act on.
       recovery:
-        'Verify ICAO IDs with aviation_find_stations, or widen the bounding box and raise hours while it is below 12. Not all stations transmit METARs.',
+        'Verify ICAO IDs with aviation_find_stations, or widen the bounding box and raise hours while it is below 720. Not all stations transmit METARs.',
     },
     {
       reason: 'missing_location',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Neither station_ids nor bbox was provided.',
+      when: 'No location selector was provided.',
       recovery:
-        'Provide station_ids for named airports (1–10 ICAO IDs) or bbox for an area survey (minLat, minLon, maxLat, maxLon).',
+        'Provide station_ids for named airports, or provide bbox or state for an area survey.',
     },
     {
       reason: 'conflicting_location',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Both station_ids and bbox were provided.',
-      recovery:
-        'Provide station_ids OR bbox, not both. station_ids returns every observation for the IDs you name; bbox returns the latest observation per station in the box.',
+      when: 'More than one location selector was provided.',
+      recovery: 'Choose one selector: station_ids, bbox, or state.',
     },
     {
       reason: 'invalid_bbox',
@@ -424,6 +459,12 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       when: 'The bounding box is inverted — minLat > maxLat or minLon > maxLon.',
       recovery:
         'Ensure minLat <= maxLat and minLon <= maxLon. Swap the inverted min/max coordinates and retry.',
+    },
+    {
+      reason: 'conflicting_offset',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'offset was supplied for a named station lookup.',
+      recovery: 'Drop offset or run a bbox or state survey.',
     },
     {
       reason: 'conflicting_limit',
@@ -442,6 +483,13 @@ export const aviationGetMetar = tool('aviation_get_metar', {
   ],
 
   enrichment: {
+    nextOffset: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'Offset for the next page of the currently available draw. Present only while matches remain.',
+      ),
     requested: z
       .array(z.string().describe('An ICAO station ID as requested.'))
       .optional()
@@ -468,31 +516,31 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       .boolean()
       .optional()
       .describe(
-        'True when the upstream draw hit the AWC row cap, so stations inside the box are missing from this result. False says the draw did not reach that cap, which a count alone cannot establish — the draw is reduced to one row per station, so the returned count sits far below the cap either way. It is not a completeness claim: AWC also thins a dense box by station priority, independently of the cap and with nothing in the response to mark it, so re-run over smaller quadrants and union the results when the box must be complete. Present only on a bbox survey.',
+        'True when AWC reached the row cap. False is not a completeness claim: AWC can also thin dense bbox draws by station priority. Named lookups emit this flag only when capped.',
       ),
     shown: z
       .number()
       .optional()
       .describe(
-        'Stations in this result, counted after the reduction to one observation per station, after any flight_category filter, and after any limit. Present only on a bbox survey.',
+        'Distinct stations shown after any survey reduction, filter and limit. Also emitted on a capped named lookup.',
       ),
     surveyed: z
       .number()
       .optional()
       .describe(
-        'Stations the survey reached — one per station, the latest observation of each — before the flight_category filter selected from them. Present only when a bbox survey supplied flight_category; the count after the filter is shown, or matched where a limit then withheld stations. Where the result is also truncated this counts the capped draw and not the box.',
+        'Distinct stations reached before the survey flight_category filter. A capped result counts only the upstream draw.',
       ),
     limited: z
       .boolean()
       .optional()
       .describe(
-        'True when the requested limit withheld stations that matched — the caller asked to see fewer of them. False affirms the limit did not bite, so every station drawn is here. Present only when a bbox survey supplied a limit. It never states anything about the upstream cap: a limited result examined every station it counted, while a truncated one never drew the rest.',
+        'Whether the caller limit withheld survey matches from the draw. Present when the survey supplied a limit.',
       ),
     matched: z
       .number()
       .optional()
       .describe(
-        'Stations the draw held before the limit selected from them — after the flight_category filter, where one was supplied. Present only on a limited result. Where the result is also truncated this counts the capped draw and not the box — the observations the cap dropped were never examined, so no count can include them.',
+        'Stations in the draw after any flight_category filter and before paging. Present when offset was supplied or limit withheld matches. Upstream truncation can exclude observations from this count.',
       ),
     cap: z
       .number()
@@ -504,17 +552,18 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       .number()
       .optional()
       .describe(
-        'Observations AWC returned before the reduction to one row per station. Present only on a truncated draw the reduction then narrowed, where the station count sits below the cap and so cannot reveal the truncation on its own.',
+        'Observations AWC returned before the reduction to one row per station. Present on a capped named lookup or when a capped survey was reduced to fewer distinct stations.',
       ),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance for whichever disclosures fired, in this order: the levers that narrow a truncated draw; what the flight_category filter kept of the stations surveyed, or that it emptied the result; what a requested limit withheld; and — on a survey of more than 40 stations from a call that set no limit — that limit bounds the response but keeps an alphabetical slice, not a region. Or, on a station_ids lookup, the station IDs that returned nothing. The survey statements share one notice and the text keeps them apart; the reconciliation cannot join them, since only bbox reaches the row cap or takes a filter or a limit, and only station_ids reconciles a request.',
+        'Guidance for a capped draw, narrowed survey, or named lookup with missing stations. Surveys returning more than 40 stations with no limit also get size guidance.',
       ),
   },
 
   enrichmentTrailer: {
+    nextOffset: { label: 'Next offset' },
     requested: { render: (ids) => `**Requested:** ${ids?.join(', ')}` },
     returned: { render: (ids) => `**Returned:** ${ids?.join(', ')}` },
     missing: { render: (ids) => `**No data returned for:** ${ids?.join(', ')}` },
@@ -523,20 +572,29 @@ export const aviationGetMetar = tool('aviation_get_metar', {
     shown: { label: 'Stations returned' },
     surveyed: { label: 'Stations surveyed before the flight category filter' },
     cap: { label: 'Upstream row maximum' },
-    upstreamRows: { label: 'Observations drawn before the reduction to one per station' },
+    upstreamRows: { label: 'Observations drawn from AWC' },
     limited: { label: 'Limited by the request' },
-    matched: { label: 'Stations matched before the limit' },
+    matched: { label: 'Stations matched before paging' },
   },
 
   async handler(input, ctx) {
     const stationIds = input.station_ids?.map((id) => id.toUpperCase());
+    const state = input.state?.toUpperCase();
 
-    if (!stationIds && !input.bbox) {
-      throw ctx.fail('missing_location', 'Either station_ids or bbox is required.');
+    const locationCount = Number(!!stationIds) + Number(!!input.bbox) + Number(!!state);
+    if (locationCount === 0) {
+      throw ctx.fail('missing_location', 'Provide station_ids, bbox, or state.');
     }
 
-    if (stationIds && input.bbox) {
-      throw ctx.fail('conflicting_location', 'Provide either station_ids or bbox, not both.');
+    if (locationCount > 1) {
+      throw ctx.fail(
+        'conflicting_location',
+        'Provide exactly one of station_ids, bbox, and state.',
+      );
+    }
+
+    if (state && !isSupportedState(state)) {
+      throw ctx.fail('invalid_state', `Unsupported state code: ${state}.`);
     }
 
     if (input.bbox && !isBboxOrdered(input.bbox)) {
@@ -548,6 +606,9 @@ export const aviationGetMetar = tool('aviation_get_metar', {
 
     // A location-mode mistake is reported ahead of this, matching the order the
     // sibling tools use for a filter that belongs to only one mode.
+    if (stationIds && input.offset !== undefined) {
+      throw ctx.fail('conflicting_offset', 'offset applies only to bbox and state surveys.');
+    }
     if (stationIds && input.limit != null) {
       throw ctx.fail(
         'conflicting_limit',
@@ -576,7 +637,9 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       {
         ...(stationIds ? { stationIds } : {}),
         ...(input.bbox ? { bbox: input.bbox } : {}),
+        ...(state ? { state } : {}),
         hours: input.hours,
+        ...(input.as_of !== undefined ? { asOf: input.as_of } : {}),
       },
       ctx,
     );
@@ -584,12 +647,19 @@ export const aviationGetMetar = tool('aviation_get_metar', {
     if (drawn.length === 0) {
       throw ctx.fail(
         'no_stations_found',
-        stationIds
+        (stationIds
           ? `No METAR data found for: ${stationIds.join(', ')}`
-          : `No station inside the bounding box reported a METAR in the past ${input.hours} hour(s).`,
+          : input.as_of
+            ? `No station ${state ? `in AWC's ${state} survey` : 'inside the bounding box'} reported a METAR in the ${input.hours} hour(s)`
+            : `No station ${state ? `in AWC's ${state} survey` : 'inside the bounding box'} reported a METAR in the past ${input.hours} hour(s).`) +
+          (input.as_of ? ` for the window ending at ${input.as_of}.` : ''),
         {
-          ...(stationIds ? { stationIds } : { bbox: input.bbox }),
-          recovery: { hint: noDataHint(stationIds ? 'station_ids' : 'bbox', input.hours) },
+          ...(stationIds ? { stationIds } : state ? { state } : { bbox: input.bbox }),
+          recovery: {
+            hint: state
+              ? `${input.hours < MAX_HOURS ? 'Raise hours or search' : 'Search'} with a bounding box. Check available products with aviation_find_stations.`
+              : noDataHint(stationIds ? 'station_ids' : 'bbox', input.hours),
+          },
         },
       );
     }
@@ -602,8 +672,18 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       const returned = [...new Set(drawn.map((o) => o.station_id))];
       const missing = stationIds.filter((id) => !returned.includes(id));
       ctx.enrich({ requested: stationIds, returned, partial: missing.length > 0 });
+      const capped = isUpstreamCapped(drawn.length);
       if (missing.length > 0) {
         ctx.enrich({ missing });
+      }
+      if (capped) {
+        ctx.enrich.truncated({
+          shown: returned.length,
+          cap: AWC_MAX_ROWS,
+          guidance: `AWC reached its ${AWC_MAX_ROWS}-observation cap. Missing stations may have observations that the cap excluded. ${input.hours > 1 ? 'Use shorter hours and ' : 'Use '}successive earlier as_of windows to retrieve separate time slices.`,
+        });
+        ctx.enrich({ upstreamRows: drawn.length });
+      } else if (missing.length > 0) {
         ctx.enrich.notice(
           `No data returned for ${missing.join(', ')}. Three conditions produce this and the response cannot tell them apart: the ID may not be a known station, the station may transmit no METARs, or it may have reported nothing inside the ${input.hours}-hour lookback. ${input.hours < MAX_HOURS ? 'Widen hours, or verify' : 'Verify'} the IDs with aviation_find_stations.`,
         );
@@ -626,31 +706,43 @@ export const aviationGetMetar = tool('aviation_get_metar', {
       ? stations.filter((s) => (categories as readonly string[]).includes(s.flight_category))
       : stations;
     const matched = selected.length;
-    const shownStations = input.limit != null ? selected.slice(0, input.limit) : selected;
+    const { limit, notice: clampNotice } = clampResultLimit(
+      input.limit,
+      'aviation_get_metar',
+      ctx.log,
+    );
+    const { rows: shownStations, nextOffset } = pageResults(selected, input.offset, limit);
     const shown = shownStations.length;
-    const limited = input.limit != null && matched > input.limit;
+    const limited = limit !== undefined && nextOffset !== undefined;
     const capped = isUpstreamCapped(drawn.length);
-    // `hours` cannot go below 1, so at 1 the quadrants are the only lever left.
+    const split = state
+      ? 'Search smaller geographic boxes within the state and combine the results.'
+      : 'Re-run over smaller bbox quadrants and union the results.';
     const capLevers =
       input.hours > 1
-        ? 'A wide hours spends the cap on repeat readings from the stations it did reach, so lower hours first; then re-run over smaller bbox quadrants and union the results.'
-        : 'Re-run over smaller bbox quadrants and union the results.';
+        ? `A wide hours spends the cap on repeat readings from the stations it did reach, so lower hours first; ${state ? split : 'then re-run over smaller bbox quadrants and union the results.'}`
+        : split;
 
     // The cap, the filter, the limit, and the size lever are separate
     // disclosures sharing one notice, and every notice writer is last-wins —
     // so each states its own case in pipeline order and the notice is written
-    // once. It is safe to own it outright: station_ids rejects a filter and a
-    // limit and cannot reach the cap, so the reconciliation above never runs
-    // on the same call. A filter-emptied survey is still a result, not a
+    // once. Named lookups have a separate cap notice and reconciliation.
+    // A filter-emptied survey is still a result, not a
     // missing station — the box answered, and the filter is what emptied it.
     const notice = [
       capped
-        ? `AWC served ${drawn.length} observations for this query, its per-request maximum, so stations inside the box are missing from this result — the draw reached only ${stations.length} of them. ${capLevers}`
+        ? `AWC served ${drawn.length} observations for this query, its per-request maximum, so stations inside the ${state ? 'state survey' : 'box'} are missing from this result — the draw reached only ${stations.length} of them. ${capLevers} Use successive earlier as_of values to retrieve separate time slices.`
         : null,
       categories && matched < stations.length
         ? categoryNotice(categories, stations, matched, capped)
         : null,
-      limited ? limitNotice(shown, matched, capped, !!categories) : null,
+      input.offset !== undefined
+        ? `Returned ${shown} of ${matched} matches from offset ${input.offset} in this draw.`
+        : limited
+          ? limitNotice(shown, matched, capped, !!categories)
+          : null,
+      clampNotice,
+      nextOffset === undefined ? null : continuationNotice(nextOffset),
       input.limit == null && shown > SIZE_NOTICE_THRESHOLD ? sizeNotice(shown, !!categories) : null,
     ]
       .filter(Boolean)
@@ -673,7 +765,8 @@ export const aviationGetMetar = tool('aviation_get_metar', {
     // `limited: false` is only owed to one who did — where it separates a limit
     // that bit from one that had nothing to withhold.
     if (input.limit != null) ctx.enrich({ limited });
-    if (limited) ctx.enrich({ matched });
+    if (limited || input.offset !== undefined) ctx.enrich({ matched });
+    if (nextOffset !== undefined) ctx.enrich({ nextOffset });
 
     ctx.log.info('METARs retrieved', {
       count: shown,
@@ -685,8 +778,7 @@ export const aviationGetMetar = tool('aviation_get_metar', {
   },
 
   format: (result) => {
-    // Only a flight_category filter can empty a survey — an empty draw is
-    // no_stations_found — and the notice says which stage did it.
+    // Selection or pagination can empty a survey after an upstream draw.
     if (result.observations.length === 0) {
       return [{ type: 'text', text: 'No station in this result.' }];
     }

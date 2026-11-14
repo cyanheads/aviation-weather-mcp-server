@@ -19,7 +19,8 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
-        "NODE_ENV": "production"
+        "NODE_ENV": "production",
+        "AWC_CLAMP_LIMITS": "${user_config.AWC_CLAMP_LIMITS}"
       }
     }
   },
@@ -28,5 +29,12 @@
   },
   "tools_generated": true,
   "prompts_generated": true,
-  "user_config": {}
+  "user_config": {
+    "AWC_CLAMP_LIMITS": {
+      "type": "string",
+      "title": "Clamp oversized result limits",
+      "description": "Set to false to reject oversized result limits. Defaults to true.",
+      "default": ""
+    }
+  }
 }

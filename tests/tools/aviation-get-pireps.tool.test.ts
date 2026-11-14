@@ -982,12 +982,12 @@ describe('aviationGetPireps.input', () => {
     expect(() => aviationGetPireps.input.parse({ station_id: 'KSEA', distance_nm: 501 })).toThrow();
   });
 
-  it('keeps the hours default at 3 and its 1–12 bounds', () => {
+  it('keeps the hours default at 3 and its 1–48 bounds', () => {
     expect(aviationGetPireps.input.parse({ station_id: 'KSEA' }).hours).toBe(3);
     expect(aviationGetPireps.input.parse({ station_id: 'KSEA', hours: 1 }).hours).toBe(1);
-    expect(aviationGetPireps.input.parse({ station_id: 'KSEA', hours: 12 }).hours).toBe(12);
+    expect(aviationGetPireps.input.parse({ station_id: 'KSEA', hours: 48 }).hours).toBe(48);
     expect(() => aviationGetPireps.input.parse({ station_id: 'KSEA', hours: 0 })).toThrow();
-    expect(() => aviationGetPireps.input.parse({ station_id: 'KSEA', hours: 13 })).toThrow();
+    expect(() => aviationGetPireps.input.parse({ station_id: 'KSEA', hours: 49 })).toThrow();
   });
 });
 
@@ -1897,13 +1897,44 @@ describe('aviationGetPireps request limit', () => {
     ['zero', 0],
     ['a negative count', -1],
     ['a fraction', 2.5],
-    ['a value above the upstream row cap', AWC_MAX_ROWS + 1],
+    ['a string count', '2'],
   ])('rejects %s at the schema', (_label, limit) => {
     expect(aviationGetPireps.input.safeParse({ station_id: 'KSEA', limit }).success).toBe(false);
   });
 
   it.each([1, AWC_MAX_ROWS])('accepts a limit of %i', (limit) => {
     expect(aviationGetPireps.input.safeParse({ station_id: 'KSEA', limit }).success).toBe(true);
+  });
+
+  it('pages tied reports with a stable bulletin tie-break while preserving unpaged order', async () => {
+    const reports = ['Z', 'A', 'M'].map((raw_pirep) => ({
+      ...minimalPirep,
+      raw_pirep,
+      altitude_ft: 8000,
+    }));
+    mockFetchPireps.mockResolvedValue(reports);
+    const unrestricted = await runToolContract(aviationGetPireps, { bbox: conus });
+    expect(unrestricted.structuredContent).toMatchObject({
+      pireps: [{ raw_pirep: 'Z' }, { raw_pirep: 'A' }, { raw_pirep: 'M' }],
+    });
+    const page = await runToolContract(aviationGetPireps, {
+      bbox: conus,
+      altitude_min_ft: 7000,
+      offset: 1,
+      limit: 1,
+    });
+    expect(page.structuredContent).toMatchObject({
+      pireps: [{ raw_pirep: 'M' }],
+      matched: 3,
+      nextOffset: 2,
+    });
+    expect(JSON.stringify(page.content)).toContain('offset: 2');
+    const oversized = await runToolContract(aviationGetPireps, { bbox: conus, limit: 401 });
+    expect(oversized.structuredContent).toMatchObject({
+      shown: 3,
+      notice: 'Requested limit 401 was clamped to 400.',
+    });
+    expect(JSON.stringify(oversized.content)).toContain('clamped to 400');
   });
 
   it('names limit in the tool description', () => {
@@ -1931,7 +1962,7 @@ describe('aviationGetPireps request limit', () => {
     // apart, not just that the result is short.
     const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
     expect(text).toContain('**Limited by the request:** true');
-    expect(text).toContain('**Reports matched before the limit:** 400');
+    expect(text).toContain('**Reports matched before paging:** 400');
     expect(text).toContain('**Truncated at the upstream row cap:** true');
     expect(text).toMatch(/not the upstream cap/i);
   });
@@ -2242,17 +2273,17 @@ describe('aviationGetPireps empty-result levers', () => {
     );
   });
 
-  it('drops hours at its maximum of 12', async () => {
-    expect(await hintFor({ station_id: 'KSEA', hours: 12 })).toBe(
+  it('drops hours at its maximum of 48', async () => {
+    expect(await hintFor({ station_id: 'KSEA', hours: 48 })).toBe(
       `Expand the distance_nm parameter, or try a different region. ${SPARSE}`,
     );
-    expect(await hintFor({ bbox: box, hours: 12 })).toBe(
+    expect(await hintFor({ bbox: box, hours: 48 })).toBe(
       `Widen the bbox, or try a different region. ${SPARSE}`,
     );
   });
 
   it('drops distance_nm at its maximum of 500', async () => {
-    expect(await hintFor({ station_id: 'KSEA', distance_nm: 500, hours: 12 })).toBe(
+    expect(await hintFor({ station_id: 'KSEA', distance_nm: 500, hours: 48 })).toBe(
       `Try a different region. ${SPARSE}`,
     );
     expect(await hintFor({ station_id: 'KSEA', distance_nm: 500, hours: 11 })).toBe(
@@ -2273,7 +2304,7 @@ describe('aviationGetPireps empty-result levers', () => {
     // reports it held all sit outside the band.
     const reports = Array.from({ length: 3 }, () => ({ ...minimalPirep, altitude_ft: 30000 }));
     const hint = await hintFor(
-      { bbox: box, hours: 12, altitude_min_ft: 18001, altitude_max_ft: 18049 },
+      { bbox: box, hours: 48, altitude_min_ft: 18001, altitude_max_ft: 18049 },
       reports,
     );
 
@@ -2289,13 +2320,13 @@ describe('aviationGetPireps empty-result levers', () => {
       aviationGetPireps.errors?.find((e) => e.reason === 'no_pireps_found')?.recovery ?? '';
 
     expect(recovery).toMatch(/bbox on an area search/);
-    expect(recovery).toMatch(/below 12/);
+    expect(recovery).toMatch(/below 48/);
     expect(recovery).toMatch(/a larger distance_nm \(up to 500\) on a station_id search/);
   });
 
   it('carries the branched hint on both surfaces', async () => {
     mockFetchPireps.mockResolvedValue([]);
-    const result = await runToolContract(aviationGetPireps, { bbox: box, hours: 12 });
+    const result = await runToolContract(aviationGetPireps, { bbox: box, hours: 48 });
     const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
     const structured = result.structuredContent as {
       error?: { data?: { recovery?: { hint?: string } } };

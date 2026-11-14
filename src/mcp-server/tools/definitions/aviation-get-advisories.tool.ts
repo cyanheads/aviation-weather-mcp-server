@@ -6,13 +6,14 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { formatDegrees } from '@/mcp-server/tools/format-degrees.js';
+import { continuationNotice, pageResults } from '@/mcp-server/tools/result-page.js';
 import {
   isAdvisoryHazard,
   supportsAdvisoryHazard,
 } from '@/services/aviation-weather/advisory-products.js';
 import { getAviationWeatherService } from '@/services/aviation-weather/aviation-weather-service.js';
 import { isBboxOrdered } from '@/services/aviation-weather/bbox.js';
-import type { AdvisorySummary } from '@/services/aviation-weather/types.js';
+import type { AdvisorySummary, NormalizedAdvisory } from '@/services/aviation-weather/types.js';
 
 const BboxSchema = z
   .object({
@@ -52,10 +53,29 @@ function bulletinBlock(raw: string): string {
   return `${fence}text\n${raw}\n${fence}`;
 }
 
+/** Preserve the established paging keys and separate distinct rows with identical keys. */
+function byAdvisory(a: NormalizedAdvisory, b: NormalizedAdvisory): number {
+  for (const key of [
+    'source',
+    'issued_by',
+    'series_id',
+    'valid_from',
+    'valid_to',
+    'raw_text',
+  ] as const) {
+    const left = a[key] ?? '';
+    const right = b[key] ?? '';
+    if (left !== right) return left < right ? -1 : 1;
+  }
+  const left = JSON.stringify(a);
+  const right = JSON.stringify(b);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 export const aviationGetAdvisories = tool('aviation_get_advisories', {
   title: 'Get Active Aviation Advisories',
   description:
-    'Get active domestic SIGMETs, international SIGMETs (including oceanic products), and Center Weather Advisories from the NWS Aviation Weather Center. Filter by advisory_type, hazard, optional altitude_ft, or ordered bbox. Returns source coverage, decoded hazards/altitudes/movement, multipart geometry, and original bulletins; missing facts stay null. CWA cancellations are excluded and counted. Independent source failures retain healthy results with partial coverage. AIRMET requests are rejected; this tool does not retrieve AIRMETs. Omit limit to return every available match; an explicit limit sorts results and discloses withheld matches.',
+    'Get active domestic SIGMETs, international SIGMETs (including oceanic products), and Center Weather Advisories from the NWS Aviation Weather Center. Filter by advisory_type, hazard, optional altitude_ft, or ordered bbox. Returns source coverage, decoded hazards/altitudes/movement, multipart geometry, and original bulletins; missing facts stay null. CWA cancellations are excluded and counted. Independent source failures retain healthy results with partial coverage. AIRMET requests are rejected; this tool does not retrieve AIRMETs. Use offset and limit to page through the available matches. Omit limit to return all remaining matches.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     advisory_type: z
@@ -100,7 +120,15 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
       .min(1)
       .optional()
       .describe(
-        'Optional maximum matches to return, without a default or automatic cap. Sorts by source, issuer, series and validity; omit or raise it to retrieve withheld matches.',
+        'Maximum matches to return from offset. Optional, with no default. Pages are sorted by source, issuer, series, validity and bulletin text.',
+      ),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe(
+        'Zero-based start among selected, ordered advisories. Use nextOffset to continue over the currently available draw.',
       ),
   }),
   output: z.object({
@@ -302,11 +330,11 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
     matched: z
       .number()
       .optional()
-      .describe('With bbox: rows intersecting any geometry part, before limit.'),
+      .describe('With bbox: rows intersecting any geometry part, before paging.'),
     returned: z
       .number()
       .optional()
-      .describe('With bbox or explicit limit: rows returned after limit.'),
+      .describe('With bbox or explicit paging: rows returned after paging.'),
     unlocated: z
       .number()
       .optional()
@@ -314,13 +342,18 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
     total: z
       .number()
       .optional()
-      .describe('With explicit limit: all available matches before limiting.'),
+      .describe('With explicit paging: all available matches before applying offset and limit.'),
     truncated: z
       .boolean()
       .optional()
       .describe(
-        'With explicit limit: whether matches were withheld. Omit or raise limit to retrieve them.',
+        'With explicit paging: whether the response omitted matches from the available draw. Check partial separately to gauge source coverage.',
       ),
+    nextOffset: z
+      .number()
+      .int()
+      .optional()
+      .describe('Offset for the next page when more matches remain in the available draw.'),
     notice: z
       .string()
       .optional()
@@ -330,6 +363,7 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
   },
 
   enrichmentTrailer: {
+    nextOffset: { label: 'Next offset' },
     altitude_selection: {
       render: (selection) =>
         selection === undefined
@@ -423,7 +457,7 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
 
     const svc = getAviationWeatherService();
     let summary: AdvisorySummary | undefined;
-    let advisories = await svc.fetchAdvisories(
+    const selected = await svc.fetchAdvisories(
       {
         advisoryType: input.advisory_type,
         ...(input.hazard ? { hazard: input.hazard } : {}),
@@ -434,6 +468,12 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
         },
       },
       ctx,
+    );
+    const paging = input.limit !== undefined || input.offset !== undefined;
+    const { rows: advisories, nextOffset } = pageResults(
+      paging ? selected.toSorted(byAdvisory) : selected,
+      input.offset,
+      input.limit,
     );
 
     // The count arrives only when AWC served a readable array, so an undefined
@@ -474,29 +514,18 @@ export const aviationGetAdvisories = tool('aviation_get_advisories', {
             `Readable sources (${scope}) drew ${summary.drawn} after cancellation removal and product/hazard/altitude selection; bbox matched ${summary.matched}, excluded ${outside} located advisory(ies), and left ${summary.unlocated} unlocated (unknown intersection). Widen the bbox or drop it to see the full draw.`,
           );
       }
-      if (input.limit !== undefined) {
-        const total = advisories.length;
-        advisories.sort((a, b) => {
-          for (const key of [
-            'source',
-            'issued_by',
-            'series_id',
-            'valid_from',
-            'valid_to',
-            'raw_text',
-          ] as const) {
-            const left = a[key] ?? '';
-            const right = b[key] ?? '';
-            if (left !== right) return left < right ? -1 : 1;
-          }
-          return 0;
-        });
-        advisories = advisories.slice(0, input.limit);
-        ctx.enrich({ total, returned: advisories.length, truncated: total > advisories.length });
-        if (total > advisories.length)
+      if (paging) {
+        const total = selected.length;
+        const returned = advisories.length;
+        ctx.enrich({ total, returned, truncated: total > returned });
+        if (total > returned)
           notices.push(
-            `Returned ${advisories.length} of ${total} available matches; ${total - advisories.length} withheld by limit. Omit limit or raise it to at least ${total} to retrieve all available matches.`,
+            `Offset and limit returned ${returned} of ${total} available matches starting at offset ${input.offset ?? 0}.`,
           );
+        if (nextOffset !== undefined) {
+          ctx.enrich({ nextOffset });
+          notices.push(continuationNotice(nextOffset));
+        }
       }
       if (notices.length) ctx.enrich.notice(notices.join(' '));
     }

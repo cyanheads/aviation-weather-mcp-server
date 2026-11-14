@@ -17,6 +17,7 @@ import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { type AdvisoryParams, fetchAdvisoryProducts } from './advisory-products.js';
 import { isUpstreamCapped } from './awc-limits.js';
+import { historyQuery } from './history-anchor.js';
 import { enrichStationMagneticDeclination } from './station-magnetic-declination.js';
 import { StationSnapshot } from './station-snapshot.js';
 import { isSupportedState } from './supported-states.js';
@@ -392,6 +393,19 @@ function normalizeTafPeriod(p: RawTafForecastPeriod): NormalizedTafPeriod {
   const visib = rawVisib?.trim() ? rawVisib : null;
 
   return {
+    altimeter_hpa: p.altim ?? null,
+    icing_turbulence: (p.icgTurb ?? []).map((layer) => ({
+      kind: layer.impactVar,
+      intensity_code: layer.intensity,
+      min_altitude_ft: layer.minAlt ?? null,
+      max_altitude_ft: layer.maxAlt ?? null,
+    })),
+    temperature_forecasts: (p.temp ?? []).map((temperature) => ({
+      kind: temperature.maxOrMin,
+      valid_at: new Date(temperature.validTime * 1000).toISOString(),
+      temperature_c: temperature.surfaceTemp,
+    })),
+    transition_end: p.timeBec == null ? null : new Date(p.timeBec * 1000).toISOString(),
     from: new Date(p.timeFrom * 1000).toISOString(),
     to: new Date(p.timeTo * 1000).toISOString(),
     change_type: p.fcstChange ?? null,
@@ -424,7 +438,13 @@ function normalizeTafPeriod(p: RawTafForecastPeriod): NormalizedTafPeriod {
 }
 
 function normalizeTaf(raw: RawTaf): NormalizedTaf {
+  const header =
+    /^\s*(?:TAF\s+)?(?:(AMD|COR)\s+)?([A-Z0-9]{4})\s+\d{6}Z\s+\d{4}\/\d{4}(?=\s|$)/.exec(
+      raw.rawTAF,
+    );
   return {
+    amended: header?.[2] === raw.icaoId ? header[1] === 'AMD' : null,
+    remarks: strOrNull(raw.remarks),
     station_id: raw.icaoId,
     name: raw.name ?? raw.icaoId,
     issued_at: raw.issueTime,
@@ -692,9 +712,31 @@ function withAwcErrorText(error: unknown): unknown {
   }
   const text =
     isAwcErrorEnvelope(parsed) && typeof parsed.error === 'string' ? strOrNull(parsed.error) : null;
+  if (status === 400 && text === 'Data is available for up to 30 days for date') {
+    return new McpError(
+      JsonRpcErrorCode.ValidationError,
+      'AWC retains up to 30 days of historical weather.',
+      { reason: 'outside_retention', status },
+      { cause: error },
+    );
+  }
   return text
     ? new McpError(error.code, `AWC API error: ${text}`, error.data, { cause: error })
     : error;
+}
+
+type WeatherLocation = {
+  stationIds?: string[];
+  bbox?: { minLat: number; minLon: number; maxLat: number; maxLon: number };
+  state?: string;
+};
+
+/** Encode one selector already validated by the weather tool. */
+function weatherLocation({ stationIds, bbox, state }: WeatherLocation): string {
+  if (stationIds?.length) return `ids=${encodeURIComponent(stationIds.join(','))}`;
+  if (state) return `ids=${encodeURIComponent(`@${state}`)}`;
+  if (bbox) return `bbox=${bbox.minLat},${bbox.minLon},${bbox.maxLat},${bbox.maxLon}`;
+  throw serviceUnavailable('A station list, bounding box or state is required.');
 }
 
 // ---------------------------------------------------------------------------
@@ -744,30 +786,7 @@ export class AviationWeatherService {
         // AWC returns HTTP 204 with empty body when no data matches the query.
         // Treat this as an empty result — callers guard with `if (!Array.isArray(raw)) return []`.
         if (response.status === 204) return [] as T;
-        let text: string;
-        try {
-          text = await response.text();
-        } catch (cause) {
-          attempt.signal.throwIfAborted();
-          const transportError =
-            cause instanceof Error && 'code' in cause
-              ? cause
-              : cause instanceof Error
-                ? cause.cause
-                : undefined;
-          const transportCode =
-            transportError instanceof Error && 'code' in transportError
-              ? transportError.code
-              : undefined;
-          if (
-            typeof transportCode !== 'string' ||
-            !['UND_ERR_SOCKET', 'ECONNRESET', 'ECONNABORTED', 'EPIPE', 'ETIMEDOUT'].includes(
-              transportCode,
-            )
-          )
-            throw cause;
-          throw serviceUnavailable('AWC API response could not be read.', undefined, { cause });
-        }
+        const text = await response.text();
         attempt.signal.throwIfAborted();
         // Detect HTML error pages from upstream
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
@@ -822,23 +841,14 @@ export class AviationWeatherService {
    * the row count served here.
    */
   async fetchMetar(
-    params: {
-      stationIds?: string[];
-      bbox?: { minLat: number; minLon: number; maxLat: number; maxLon: number };
+    params: WeatherLocation & {
       hours: number;
+      asOf?: string;
     },
     ctx: Context,
   ): Promise<NormalizedMetar[]> {
-    let url: string;
-    if (params.stationIds?.length) {
-      const ids = params.stationIds.join(',');
-      url = `${this.baseUrl}/metar?ids=${encodeURIComponent(ids)}&format=json&hours=${params.hours}`;
-    } else if (params.bbox) {
-      const { minLat, minLon, maxLat, maxLon } = params.bbox;
-      url = `${this.baseUrl}/metar?bbox=${minLat},${minLon},${maxLat},${maxLon}&format=json&hours=${params.hours}`;
-    } else {
-      throw serviceUnavailable('Either stationIds or bbox is required for METARs');
-    }
+    const date = historyQuery(params.asOf);
+    const url = `${this.baseUrl}/metar?${weatherLocation(params)}&format=json&hours=${params.hours}${date}`;
     ctx.log.debug('Fetching METARs', {
       stationIds: params.stationIds,
       hasBbox: !!params.bbox,
@@ -849,11 +859,16 @@ export class AviationWeatherService {
     return raw.map(normalizeMetar);
   }
 
-  /** Fetch TAFs for one or more ICAO station IDs. */
-  async fetchTaf(stationIds: string[], ctx: Context): Promise<NormalizedTaf[]> {
-    const ids = stationIds.join(',');
-    const url = `${this.baseUrl}/taf?ids=${encodeURIComponent(ids)}&format=json`;
-    ctx.log.debug('Fetching TAFs', { ids });
+  /** Fetch issued forecasts for named stations or a regional survey. */
+  async fetchTaf(
+    location: string[] | WeatherLocation,
+    ctx: Context,
+    asOf?: string,
+  ): Promise<NormalizedTaf[]> {
+    const selector = weatherLocation(Array.isArray(location) ? { stationIds: location } : location);
+    const date = historyQuery(asOf);
+    const url = `${this.baseUrl}/taf?${selector}&format=json${date}${date ? '&time=issue' : ''}`;
+    ctx.log.debug('Fetching TAFs', { location });
     const raw = await this.fetchJson<RawTaf[]>(url, ctx);
     if (!Array.isArray(raw)) return [];
     return raw.map(normalizeTaf);
@@ -879,6 +894,7 @@ export class AviationWeatherService {
       bbox?: { minLat: number; minLon: number; maxLat: number; maxLon: number };
       distanceNm?: number;
       hours: number;
+      asOf?: string;
       level?: number;
       minIntensity?: 'lgt' | 'mod' | 'sev';
       onCandidateRows?: (rows: number, capped: boolean, draws: number) => void;
@@ -886,6 +902,7 @@ export class AviationWeatherService {
     },
     ctx: Context,
   ): Promise<NormalizedPirep[]> {
+    const date = historyQuery(params.asOf);
     const deadlineMs = Math.max(45_000, this.timeoutMs);
     const requestAbort = new AbortController();
     const signal = AbortSignal.any([
@@ -989,7 +1006,7 @@ export class AviationWeatherService {
       ),
     );
     // FL000 is a real centre, so the level check is against null, not falsiness.
-    const filters = `${params.level != null ? `&level=${params.level}` : ''}${params.minIntensity ? `&inten=${params.minIntensity}` : ''}`;
+    const filters = `${params.level != null ? `&level=${params.level}` : ''}${params.minIntensity ? `&inten=${params.minIntensity}` : ''}${date}`;
     ctx.log.debug('Fetching PIREPs', {
       stationId: params.stationId,
       hasBbox: !!params.bbox,

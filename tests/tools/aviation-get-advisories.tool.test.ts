@@ -457,6 +457,62 @@ describe('aviationGetAdvisories zero-draw disclosure', () => {
     expect(enrichment).not.toHaveProperty('notice');
   });
 
+  it('preserves draw order without pagination', async () => {
+    mockDraw([sparseSigmet, sigmet]);
+    const result = await runToolContract(aviationGetAdvisories, {});
+    expect(result.structuredContent).toMatchObject({ advisories: [sparseSigmet, sigmet] });
+  });
+
+  it('pages selected advisories in a stable order through the contract', async () => {
+    const tied = { ...sigmet, altitude_low_ft: 6000 };
+    const bbox = quietBbox;
+    const query = { bbox, limit: 1 };
+    const pages = [
+      { row: sigmet, offset: 0, nextOffset: 1 },
+      { row: tied, offset: 1, nextOffset: 2 },
+      { row: sparseSigmet, offset: 2, nextOffset: undefined },
+      { row: undefined, offset: 3, nextOffset: undefined },
+    ];
+    for (const { row, offset, nextOffset } of pages) {
+      const draw = offset % 2 ? [sigmet, sparseSigmet, tied] : [sparseSigmet, tied, sigmet];
+      mockDraw(draw, 5);
+      const result = await runToolContract(aviationGetAdvisories, { ...query, offset });
+      expect(result.structuredContent).toMatchObject({
+        advisories: row ? [row] : [],
+        drawn: 5,
+        matched: 3,
+        total: 3,
+        returned: row ? 1 : 0,
+        notice: expect.stringContaining('bbox matched 3, excluded 2'),
+      });
+      if (nextOffset === undefined)
+        expect(result.structuredContent).not.toHaveProperty('nextOffset');
+      else expect(result.structuredContent).toHaveProperty('nextOffset', nextOffset);
+      const text = result.content
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      expect(text).toContain('bbox matched 3, excluded 2');
+      if (nextOffset !== undefined) expect(text).toContain(`offset: ${nextOffset}`);
+      if (row) expect(text).toContain(`## SIGMET: ${row.series_id}`);
+    }
+  });
+
+  it('retains fair-weather guidance for an empty paged draw without a new advisory cap', async () => {
+    mockDraw([], 0);
+    const result = await runToolContract(aviationGetAdvisories, { offset: 5, limit: 401 });
+    expect(result.structuredContent).toMatchObject({
+      advisories: [],
+      total: 0,
+      returned: 0,
+      truncated: false,
+      notice: expect.stringContaining('No decoded active advisories'),
+    });
+    expect(result.structuredContent).not.toHaveProperty('nextOffset');
+    expect(result.content).toContainEqual(
+      expect.objectContaining({ text: expect.stringContaining('No decoded active advisories') }),
+    );
+  });
+
   it('discloses bbox removals even when a match survives', async () => {
     mockDraw([sparseSigmet], 2);
     const enrichment = await enrichmentFor({ bbox: quietBbox });

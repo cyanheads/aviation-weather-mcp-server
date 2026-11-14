@@ -61,10 +61,17 @@ export interface RawTafForecastPeriod {
   altim?: number | null;
   clouds: RawTafCloudLayer[] | null;
   fcstChange: string | null; // 'FM', 'TEMPO', 'BECMG', 'PROB', or null
-  icgTurb?: string | null;
+  icgTurb?:
+    | {
+        impactVar: string;
+        intensity: number;
+        minAlt?: number | null;
+        maxAlt?: number | null;
+      }[]
+    | null;
   notDecoded?: string | null;
   probability: number | null;
-  temp?: number | null;
+  temp?: { validTime: number; surfaceTemp: number; maxOrMin: string }[] | null;
   timeBec?: number | null;
   timeFrom: number; // Unix epoch seconds
   timeTo: number; // Unix epoch seconds
@@ -282,9 +289,16 @@ export interface NormalizedTafWindShear {
 }
 
 export interface NormalizedTafPeriod {
+  altimeter_hpa: number | null;
   change_type: string | null;
   clouds: NormalizedTafCloudLayer[];
   from: string; // ISO 8601
+  icing_turbulence: {
+    kind: string;
+    intensity_code: number;
+    min_altitude_ft: number | null;
+    max_altitude_ft: number | null;
+  }[];
   /**
    * Text AWC attached to this period without decoding it — upstream
    * `notDecoded`, trimmed — or null when it decoded everything. Usually a
@@ -304,7 +318,9 @@ export interface NormalizedTafPeriod {
    * or PROB group that means the prevailing forecast's cloud stands unchanged.
    */
   sky_condition: string | null;
+  temperature_forecasts: { kind: string; valid_at: string; temperature_c: number }[];
   to: string; // ISO 8601
+  transition_end: string | null;
   /**
    * Vertical visibility into a forecast obscuration, in feet AGL — the TAF
    * endpoint publishes this in feet, unlike METAR's hundreds of feet. Null when
@@ -329,10 +345,12 @@ export interface NormalizedTafPeriod {
 }
 
 export interface NormalizedTaf {
+  amended: boolean | null;
   forecast_periods: NormalizedTafPeriod[];
   issued_at: string; // ISO 8601
   name: string;
   raw_taf: string;
+  remarks: string | null;
   station_id: string;
   valid_from: string; // ISO 8601
   valid_to: string; // ISO 8601

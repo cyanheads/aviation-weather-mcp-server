@@ -3,6 +3,7 @@
  * @module tests/tools/aviation-find-stations.tool.test
  */
 
+import { type AnyToolDefinition, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -1432,13 +1433,160 @@ describe('aviationFindStations request limit', () => {
     ['zero', 0],
     ['a negative count', -1],
     ['a fraction', 2.5],
-    ['a value above the upstream row cap', AWC_MAX_ROWS + 1],
+    ['a string', '20'],
   ])('rejects %s at the schema', (_label, limit) => {
     expect(aviationFindStations.input.safeParse({ state: 'WA', limit }).success).toBe(false);
   });
 
   it.each([1, AWC_MAX_ROWS])('accepts a limit of %i', (limit) => {
     expect(aviationFindStations.input.safeParse({ state: 'WA', limit }).success).toBe(true);
+  });
+
+  it('clamps a large limit and reports it on both surfaces', async () => {
+    mockDraw(page(AWC_MAX_ROWS + 2, 'TX'));
+    const ctx = createMockContext({ errors: aviationFindStations.errors });
+    const log = vi.spyOn(ctx.log, 'notice');
+    const clamped = await aviationFindStations.handler(
+      aviationFindStations.input.parse({ state: 'TX', limit: AWC_MAX_ROWS + 1 }),
+      ctx,
+    );
+    const capped = await runFor({ state: 'TX', limit: AWC_MAX_ROWS });
+    expect(clamped.stations.map((station) => station.icao_id)).toEqual(
+      capped.result.stations.map((station) => station.icao_id),
+    );
+    const result = await runToolContract(aviationFindStations, {
+      state: 'TX',
+      limit: AWC_MAX_ROWS + 1,
+    });
+    expect(result.structuredContent).toMatchObject({
+      truncated: false,
+      shown: AWC_MAX_ROWS,
+      limited: true,
+      matched: AWC_MAX_ROWS + 2,
+      nextOffset: AWC_MAX_ROWS,
+      notice: expect.stringContaining('clamped to 400'),
+    });
+    const text = result.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n');
+    expect(text).toContain('clamped to 400');
+    expect(text).toContain('offset: 400');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('clamped to 400'), {
+      tool: 'aviation_find_stations',
+      requestedLimit: 401,
+      servedLimit: 400,
+    });
+  });
+
+  it('advertises a positive integer without a maximum when clamping is enabled', () => {
+    const schema = z.toJSONSchema(aviationFindStations.input, { io: 'input' });
+    expect(schema.properties?.limit).toMatchObject({ type: 'integer', minimum: 1 });
+    expect(JSON.parse(JSON.stringify(schema.properties?.limit))).not.toHaveProperty('maximum');
+  });
+
+  it('advertises and rejects above-cap limits in strict mode before fetching', async () => {
+    vi.stubEnv('AWC_CLAMP_LIMITS', 'false');
+    vi.resetModules();
+    try {
+      const { aviationFindStations: strictTool } = await import(
+        '@/mcp-server/tools/definitions/aviation-find-stations.tool.js'
+      );
+      const schema = z.toJSONSchema(strictTool.input, { io: 'input' });
+      expect(schema.properties?.limit).toMatchObject({ type: 'integer', minimum: 1, maximum: 400 });
+      const result = await runToolContract(strictTool, { state: 'TX', limit: 401 });
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: {
+            reason: 'invalid_arguments',
+            issues: [expect.objectContaining({ maximum: 400 })],
+          },
+        },
+      });
+      expect(result.content).toEqual([
+        expect.objectContaining({ text: expect.stringContaining('<=400') }),
+      ]);
+      expect(mockFetchStations).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  });
+
+  it('pages the sorted station draw, preserves identifier-less rows, and reports past-end counts', async () => {
+    const first = buoy('10001', 'First buoy');
+    const last = buoy('10002', 'Last buoy');
+    mockDraw([last, ksea, first, kbfi]);
+    const expected = [kbfi, ksea, first, last];
+    for (const offset of [0, 1, 2, 3, 4]) {
+      const result = await runToolContract(aviationFindStations, { state: 'WA', limit: 1, offset });
+      const row = expected[offset];
+      const nextOffset = offset < 3 ? offset + 1 : undefined;
+      expect(result.structuredContent).toMatchObject({
+        stations: row ? [expect.objectContaining({ name: row.name })] : [],
+        matched: 4,
+        shown: row ? 1 : 0,
+        truncated: false,
+      });
+      if (nextOffset === undefined)
+        expect(result.structuredContent).not.toHaveProperty('nextOffset');
+      else expect(result.structuredContent).toHaveProperty('nextOffset', nextOffset);
+      const text = result.content
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      if (row) expect(text).toContain(row.name);
+      if (nextOffset !== undefined) expect(text).toContain(`offset: ${nextOffset}`);
+    }
+  });
+
+  it('rejects offset zero for a named station list before fetching', async () => {
+    const result = await runToolContract(aviationFindStations, {
+      station_ids: ['KSEA'],
+      offset: 0,
+    });
+    expect(result.structuredContent).toMatchObject({
+      error: { data: { reason: 'conflicting_offset' } },
+    });
+    expect(result.content).toEqual([
+      expect.objectContaining({ text: expect.stringContaining('Drop offset') }),
+    ]);
+    expect(mockFetchStations).not.toHaveBeenCalled();
+  });
+
+  it('keeps the cap separate when offset without limit passes the last bbox match', async () => {
+    mockDraw(page(AWC_MAX_ROWS));
+    const result = await runToolContract(aviationFindStations, {
+      bbox: { minLat: 30, minLon: -125, maxLat: 45, maxLon: -113 },
+      offset: AWC_MAX_ROWS,
+    });
+    expect(result.structuredContent).toMatchObject({
+      stations: [],
+      matched: AWC_MAX_ROWS,
+      shown: 0,
+      truncated: true,
+      cap: AWC_MAX_ROWS,
+    });
+    expect(result.structuredContent).not.toHaveProperty('nextOffset');
+    expect(result.structuredContent).not.toHaveProperty('limited');
+    expect(result.content).toContainEqual(
+      expect.objectContaining({ text: expect.stringContaining('per-request maximum') }),
+    );
+  });
+
+  it.each([-1, 0.5, 'one'])('rejects invalid offset %o before fetching', async (offset) => {
+    const result = await runToolContract<AnyToolDefinition>(aviationFindStations, {
+      state: 'TX',
+      offset,
+    });
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        data: {
+          reason: 'invalid_arguments',
+          issues: [expect.objectContaining({ path: ['offset'] })],
+        },
+      },
+    });
+    expect(mockFetchStations).not.toHaveBeenCalled();
   });
 
   it('reaches structuredContent and content[] through the real tool pipeline', async () => {

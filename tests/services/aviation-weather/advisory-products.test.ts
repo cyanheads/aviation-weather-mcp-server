@@ -809,11 +809,23 @@ describe('advisory product contracts', () => {
       total: 3,
       returned: 2,
       truncated: true,
+      nextOffset: 2,
       advisories: [{ series_id: 'A' }, { series_id: 'M' }],
     });
     expect(limited.structuredContent).not.toHaveProperty('drawn');
     expect(limited.structuredContent).not.toHaveProperty('matched');
-    expect(textOf(limited)).toContain('Omit limit or raise it to at least 3');
+    expect(textOf(limited)).toContain('Repeat the same search with offset: 2');
+    const last = await runToolContract(aviationGetAdvisories, {
+      advisory_type: 'sigmet',
+      limit: 2,
+      offset: 2,
+    });
+    expect(last.structuredContent).toMatchObject({
+      total: 3,
+      returned: 1,
+      advisories: [{ series_id: 'Z' }],
+    });
+    expect(last.structuredContent).not.toHaveProperty('nextOffset');
     const full = await runToolContract(aviationGetAdvisories, {
       advisory_type: 'sigmet',
       limit: 3,
@@ -828,6 +840,9 @@ describe('advisory product contracts', () => {
     for (const limit of [0, -1, 1.5])
       expect(aviationGetAdvisories.input.safeParse({ limit }).success).toBe(false);
     expect(aviationGetAdvisories.input.safeParse({ offset: 100 })).toMatchObject({
+      success: true,
+    });
+    expect(aviationGetAdvisories.input.safeParse({ offset: -1 })).toMatchObject({
       success: false,
     });
   });

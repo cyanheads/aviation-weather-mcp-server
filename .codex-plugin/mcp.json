@@ -4,6 +4,7 @@
     "args": ["-y", "@cyanheads/aviation-weather-mcp-server"],
     "env": {
       "MCP_TRANSPORT_TYPE": "stdio"
-    }
+    },
+    "env_vars": ["AWC_CLAMP_LIMITS"]
   }
 }

@@ -41,6 +41,13 @@
           "format": "string",
           "isRequired": false,
           "default": "10000"
+        },
+        {
+          "name": "AWC_CLAMP_LIMITS",
+          "description": "Clamp oversized result limits. Set to false to reject them.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         }
       ],
       "transport": {
@@ -108,6 +115,13 @@
           "format": "string",
           "isRequired": false,
           "default": "10000"
+        },
+        {
+          "name": "AWC_CLAMP_LIMITS",
+          "description": "Clamp oversized result limits. Set to false to reject them.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         }
       ],
       "transport": {

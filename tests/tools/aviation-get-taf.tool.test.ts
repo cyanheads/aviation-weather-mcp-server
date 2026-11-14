@@ -20,6 +20,52 @@ import { getAviationWeatherService } from '@/services/aviation-weather/aviation-
 
 const mockFetchTaf = vi.fn<ReturnType<typeof getAviationWeatherService>['fetchTaf']>();
 
+it('keeps the draw order without pagination and continues a tied area draw', async () => {
+  const bbox = { minLat: 40, minLon: -125, maxLat: 50, maxLon: -110 };
+  mockFetchTaf.mockResolvedValue([
+    { ...kseaTaf, raw_taf: 'Z' },
+    { ...kseaTaf, raw_taf: 'A' },
+    { ...kseaTaf, raw_taf: 'M' },
+  ]);
+  const unrestricted = await runToolContract(aviationGetTaf, { bbox });
+  expect(unrestricted.structuredContent).toMatchObject({
+    forecasts: [{ raw_taf: 'Z' }, { raw_taf: 'A' }, { raw_taf: 'M' }],
+  });
+  const first = await runToolContract(aviationGetTaf, { bbox, limit: 1 });
+  expect(first.structuredContent).toMatchObject({
+    forecasts: [{ raw_taf: 'A' }],
+    matched: 3,
+    nextOffset: 1,
+  });
+  const second = await runToolContract(aviationGetTaf, { bbox, offset: 1, limit: 1 });
+  expect(second.structuredContent).toMatchObject({
+    forecasts: [{ raw_taf: 'M' }],
+    matched: 3,
+    nextOffset: 2,
+  });
+  expect(JSON.stringify(second.content)).toContain('offset: 2');
+  const last = await runToolContract(aviationGetTaf, { bbox, offset: 2 });
+  expect(last.structuredContent).toMatchObject({ forecasts: [{ raw_taf: 'Z' }], matched: 3 });
+  expect(last.structuredContent).not.toHaveProperty('nextOffset');
+  const empty = await runToolContract(aviationGetTaf, { bbox, offset: 4 });
+  expect(empty.structuredContent).toMatchObject({ forecasts: [], matched: 3, shown: 0 });
+  expect(JSON.stringify(empty.content)).toContain('No forecast in this result.');
+  const clamped = await runToolContract(aviationGetTaf, { bbox, limit: 401 });
+  expect(clamped.structuredContent).toMatchObject({
+    shown: 3,
+    notice: 'Requested limit 401 was clamped to 400.',
+  });
+  expect(JSON.stringify(clamped.content)).toContain('clamped to 400');
+});
+
+it('rejects an offset on a named TAF batch before fetching', async () => {
+  const result = await runToolContract(aviationGetTaf, { station_ids: ['KSEA'], offset: 0 });
+  expect(result.structuredContent).toMatchObject({
+    error: { data: { reason: 'conflicting_offset' } },
+  });
+  expect(mockFetchTaf).not.toHaveBeenCalled();
+});
+
 beforeEach(() => {
   vi.mocked(getAviationWeatherService).mockReturnValue({
     fetchTaf: mockFetchTaf,
@@ -31,7 +77,15 @@ beforeEach(() => {
 // Fixtures
 // ---------------------------------------------------------------------------
 
+const noSupplementalFields = {
+  transition_end: null,
+  altimeter_hpa: null,
+  temperature_forecasts: [],
+  icing_turbulence: [],
+};
+
 const basePeriod: NormalizedTafPeriod = {
+  ...noSupplementalFields,
   from: '2026-01-15T18:00:00.000Z',
   to: '2026-01-16T00:00:00.000Z',
   change_type: null,
@@ -47,6 +101,7 @@ const basePeriod: NormalizedTafPeriod = {
 };
 
 const tempoPeriod: NormalizedTafPeriod = {
+  ...noSupplementalFields,
   from: '2026-01-15T21:00:00.000Z',
   to: '2026-01-15T23:00:00.000Z',
   change_type: 'TEMPO',
@@ -66,6 +121,8 @@ const tempoPeriod: NormalizedTafPeriod = {
 
 /** TAF with epoch-seconds timestamps (as issued by the service after normalization). */
 const kseaTaf: NormalizedTaf = {
+  amended: false,
+  remarks: null,
   station_id: 'KSEA',
   name: 'Seattle-Tacoma International Airport',
   issued_at: '2026-01-15T17:30:00.000Z',
@@ -77,6 +134,8 @@ const kseaTaf: NormalizedTaf = {
 
 /** Sparse TAF — minimal forecast period with no wx/clouds. */
 const sparseTaf: NormalizedTaf = {
+  amended: false,
+  remarks: null,
   station_id: 'KLAX',
   name: 'Los Angeles International Airport',
   issued_at: '2026-01-15T12:00:00.000Z',
@@ -84,6 +143,7 @@ const sparseTaf: NormalizedTaf = {
   valid_to: '2026-01-16T12:00:00.000Z',
   forecast_periods: [
     {
+      ...noSupplementalFields,
       from: '2026-01-15T12:00:00.000Z',
       to: '2026-01-16T00:00:00.000Z',
       change_type: null,
@@ -107,6 +167,7 @@ const sparseTaf: NormalizedTaf = {
  * forecast periods look like this.
  */
 const windlessPeriod: NormalizedTafPeriod = {
+  ...noSupplementalFields,
   from: '2026-01-15T22:00:00.000Z',
   to: '2026-01-16T02:00:00.000Z',
   change_type: 'TEMPO',
@@ -198,6 +259,55 @@ async function handle(period: NormalizedTafPeriod) {
 // ---------------------------------------------------------------------------
 
 describe('aviationGetTaf', () => {
+  const surveyBox = { minLat: 47, minLon: -123, maxLat: 48, maxLon: -122 };
+
+  it('returns an uncapped bbox draw in source order and reports an empty draw separately', async () => {
+    mockFetchTaf.mockResolvedValueOnce([kseaTaf, sparseTaf]).mockResolvedValueOnce([]);
+    const result = await runToolContract(aviationGetTaf, { bbox: surveyBox });
+    expect(result.structuredContent).toMatchObject({
+      forecasts: [{ station_id: 'KSEA' }, { station_id: 'KLAX' }],
+      truncated: false,
+      shown: 2,
+    });
+    expect(result.structuredContent).not.toHaveProperty('limited');
+    const empty = await runToolContract(aviationGetTaf, { bbox: surveyBox });
+    expect(empty.structuredContent).toMatchObject({
+      error: { data: { reason: 'no_taf_available' } },
+    });
+    expect(empty.content[0]).toMatchObject({ text: expect.stringContaining('the bounding box') });
+  });
+
+  it.each([
+    [{}, 'missing_location'],
+    [{ state: 'wa', bbox: surveyBox }, 'conflicting_location'],
+    [{ state: 'PR' }, 'invalid_state'],
+    [{ bbox: { ...surveyBox, minLon: -121 } }, 'invalid_bbox'],
+    [{ station_ids: ['KSEA'] as string[], limit: 1 }, 'conflicting_limit'],
+  ] as const)('rejects invalid survey input before fetching (%j)', async (input, reason) => {
+    const result = await runToolContract(aviationGetTaf, input);
+    expect(result.structuredContent).toMatchObject({ error: { data: { reason } } });
+    expect(result.content[0]).toMatchObject({ text: expect.stringContaining(reason) });
+    expect(mockFetchTaf).not.toHaveBeenCalled();
+  });
+  it('bounds a state survey in station order while reporting the upstream cap', async () => {
+    mockFetchTaf.mockResolvedValue([...Array.from({ length: 399 }, () => kseaTaf), sparseTaf]);
+    const result = await runToolContract(aviationGetTaf, { state: 'dc', limit: 1 });
+    expect(mockFetchTaf).toHaveBeenCalledWith({ state: 'DC' }, expect.anything());
+    expect(result.structuredContent).toMatchObject({
+      forecasts: [{ station_id: 'KLAX' }],
+      cap: 400,
+      truncated: true,
+      limited: true,
+      matched: 400,
+      shown: 1,
+    });
+    expect(result.structuredContent).not.toHaveProperty('requested');
+    const text = result.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n');
+    expect(text).toContain('KLAX');
+    expect(text).toContain('400');
+  });
   it('returns forecasts for valid station IDs', async () => {
     mockFetchTaf.mockResolvedValue([kseaTaf]);
     const ctx = createMockContext({ errors: aviationGetTaf.errors });
@@ -807,7 +917,9 @@ describe('aviationGetTaf partial-batch disclosure', () => {
   });
 
   it('describes the identifier shape as letters or digits', () => {
-    expect(aviationGetTaf.input.shape.station_ids.element.description ?? '').toMatch(/digit/i);
+    expect(aviationGetTaf.input.shape.station_ids.unwrap().element.description ?? '').toMatch(
+      /digit/i,
+    );
   });
 
   it('rejects an empty batch rather than reconciling nothing', () => {

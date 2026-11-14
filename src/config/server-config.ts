@@ -1,6 +1,6 @@
 /**
  * @fileoverview Server-specific configuration for aviation-weather-mcp-server.
- * Reads AWC_BASE_URL and AWC_TIMEOUT_MS from the environment.
+ * Reads AWC API and result-limit settings from the environment.
  * @module config/server-config
  */
 
@@ -20,6 +20,7 @@ const ServerConfigSchema = z.object({
     .max(60000)
     .default(10000)
     .describe('Request timeout in milliseconds'),
+  awcClampLimits: z.stringbool().default(true).describe('Clamp oversized result limits'),
 });
 
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
@@ -29,6 +30,7 @@ export function getServerConfig(): z.infer<typeof ServerConfigSchema> {
   _config ??= parseEnvConfig(ServerConfigSchema, {
     awcBaseUrl: 'AWC_BASE_URL',
     awcTimeoutMs: 'AWC_TIMEOUT_MS',
+    awcClampLimits: 'AWC_CLAMP_LIMITS',
   });
   return _config;
 }
